@@ -1428,7 +1428,7 @@ export async function getItem(
         raw_url: "",
       },
       provider: resolved.storage.driver,
-      rawUrl: `/api/p${virtualPath.startsWith("/") ? "" : "/"}${virtualPath}`,
+      rawUrl: `/api/raw${virtualPath.startsWith("/") ? "" : "/"}${virtualPath}`,
     }
   }
 
@@ -1451,7 +1451,7 @@ export async function getItem(
   return {
     item,
     provider: driverName,
-    rawUrl: `/api/p${virtualPath.startsWith("/") ? "" : "/"}${virtualPath}`,
+    rawUrl: `/api/raw${virtualPath.startsWith("/") ? "" : "/"}${virtualPath}`,
   }
 }
 

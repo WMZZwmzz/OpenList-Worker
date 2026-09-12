@@ -1263,7 +1263,7 @@ fsRouter.post("/link", async (c) => {
     return c.json({
       code: 200,
       message: "success",
-      data: { url: `/api/p${reqPath.startsWith("/") ? "" : "/"}${reqPath}` },
+      data: { url: `/api/raw${reqPath.startsWith("/") ? "" : "/"}${reqPath}` },
     })
   } catch (e: any) {
     return c.json({ code: 500, message: safeErrorMessage(e), data: null }, 500)
