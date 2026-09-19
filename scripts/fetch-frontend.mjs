@@ -95,6 +95,24 @@ function replaceDist(src) {
   console.log(`✓ Frontend dist ready (${DEST})`)
 }
 
+/**
+ * 解压用的 tar 命令。
+ *
+ * Windows 上不能直接用 PATH 里的 tar：脚本常在 Git Bash 环境下执行，execSync 会
+ * 继承其 PATH 而命中 Git 自带的 GNU tar，GNU tar 把 `C:\...` 里的 `C:` 当成远程
+ * 主机名（`Cannot connect to C: resolve failed`），解压静默失败 —— 表现就是语言包
+ * 没落地、产物悄悄变成纯英文界面。Win10+ 自带的 System32\tar.exe 是 bsdtar，能正确
+ * 处理 Windows 绝对路径，故显式指定它。
+ */
+function tarBin() {
+  if (process.platform === "win32") {
+    const sys = process.env.SystemRoot || "C:\\Windows"
+    const bsdtar = path.join(sys, "System32", "tar.exe")
+    if (fs.existsSync(bsdtar)) return `"${bsdtar}"`
+  }
+  return "tar"
+}
+
 /** src/lang 下除英文外还解出了哪些语言目录 */
 function extraLangs(langDir) {
   if (!fs.existsSync(langDir)) return []
@@ -203,7 +221,7 @@ function fetchI18n(repo) {
   const tmpTar = path.join(os.tmpdir(), `openlist-i18n-${process.pid}.tar.gz`)
   const fetchOnce = () => {
     run(`curl -fL --retry 3 -o "${tmpTar}" "${I18N_TAR_URL}"`)
-    run(`tar -xzf "${tmpTar}" -C "${langDir}"`)
+    run(`${tarBin()} -xzf "${tmpTar}" -C "${langDir}"`)
   }
   console.log(`  Fetching i18n translations: ${I18N_TAR_URL}`)
   try {
