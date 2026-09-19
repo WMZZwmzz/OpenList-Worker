@@ -1,7 +1,31 @@
 /* 本站自定义样式：加载在 OpenList Moe 之后，用于覆盖主题与官方前端的个别表现。
    与 theme/openlist-moe/ 分开存放，保证上游产物可原样更新。 */
 
-/* 首页面包屑的第一项（根目录）用 🏠 代替 "Home / 首页" 文字。
+/* ── 界面字体 ───────────────────────────────────────────────────────────
+   Zen Maru Gothic Medium（SIL Open Font License 1.1），由 applyTheme() 从
+   theme/zenmarugothic/ 拷到站点根目录同源提供。
+   只有 Medium 一个字重：粗体交给浏览器合成加粗，避免中途换成别的字体。
+   代码/等宽区不在选择器列表里，官方样式会保留它自己的等宽字体。 */
+@font-face {
+  font-family: "Zen Maru Gothic";
+  src: url("/ZenMaruGothic-Medium.woff2") format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+
+body,
+.markdown-body,
+.aplayer,
+.art-video-player,
+[class*="hint--"]:after {
+  font-family: "Zen Maru Gothic", -apple-system, BlinkMacSystemFont, "Segoe UI",
+    Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji",
+    "Segoe UI Emoji" !important;
+}
+
+/* ── 面包屑 ─────────────────────────────────────────────────────────────
+   首页面包屑的第一项（根目录）用 🏠 代替 "Home / 首页" 文字。
    只改首项，子目录面包屑仍显示目录名。 */
 .hope-breadcrumb__list > .hope-breadcrumb__item:first-child > .hope-breadcrumb__link {
   font-size: 0;
@@ -13,9 +37,9 @@
   line-height: 1;
 }
 
-/* 目录内容区里的居中提示卡（如 "failed get storage"、空目录提示）：
-   官方样式给它一层不透明底色，会挡住毛玻璃背景，这里去掉，
-   只保留外层 .obj-box 的半透明玻璃面板。 */
+/* ── 提示卡 ─────────────────────────────────────────────────────────────
+   目录内容区里的居中提示卡（如 "failed get storage"、空目录提示）：官方样式给
+   它一层不透明底色，会挡住毛玻璃背景，这里去掉，只留外层 .obj-box 的玻璃面板。 */
 .obj-box .hope-center > div {
   background-color: transparent !important;
 }
