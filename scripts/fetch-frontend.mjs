@@ -27,6 +27,19 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(__dirname, "..")
 const DEST = path.join(ROOT, "dist")
 
+// ── OpenList Moe 主题（构建期注入，详见 theme/openlist-moe/UPSTREAM.md）────
+const THEME_DIR = path.join(ROOT, "theme", "openlist-moe")
+const THEME_ASSETS = ["OpenList-Moe.min.css", "OpenList-Moe.min.js"]
+// 本站覆盖样式（非上游产物）：加载在主题 CSS 之后，用于微调面包屑/提示卡等表现
+const SITE_CSS = "site-overrides.css"
+// 官方前端 index.html 自带的占位注释（上游 Go 版在此处做运行时替换）。
+// 注入时保留注释本身，后续若实现运行时 customize_head 注入仍能定位锚点。
+const MARK_HEAD = "<!-- customize head -->"
+const MARK_BODY = "<!-- customize body -->"
+// 主题强调色兜底值（OpenList 默认主色 #1890ff → "24 144 255"，见
+// src/backend/internal/model/db.ts 的 main_color 默认项）。
+const THEME_COLOR_RGB = "24 144 255"
+
 const OFFICIAL_REPO_URL =
   process.env.FRONTEND_GIT_URL ||
   "https://github.com/OpenListTeam/OpenList-Frontend.git"
@@ -78,6 +91,7 @@ function replaceDist(src) {
   console.log(`  Copying frontend dist: ${src} -> ${DEST}`)
   fs.rmSync(DEST, { recursive: true, force: true })
   fs.cpSync(src, DEST, { recursive: true })
+  applyTheme()
   console.log(`✓ Frontend dist ready (${DEST})`)
 }
 
@@ -88,6 +102,80 @@ function extraLangs(langDir) {
     .readdirSync(langDir, { withFileTypes: true })
     .filter((d) => d.isDirectory() && d.name !== "en")
     .map((d) => d.name)
+}
+
+/**
+ * 把 OpenList Moe 主题产物拷进 dist 并注入 dist/index.html。
+ *
+ * 为什么在构建期做，而不是走后台的「自定义头部 / 自定义内容」设置：
+ *   1. Worker 版没有实现上游 Go 的占位符运行时替换（那两个设置项目前只是被
+ *      /api/public/settings 回显，写进去不会生效）；
+ *   2. 实测 `/` 与 SPA 深链由静态资源层直接吐出 index.html（响应带 ETag /
+ *      CF-Cache-Status，且没有 Worker 注入的任何响应头），请求根本不进 Worker，
+ *      运行时替换在首页上不可靠；
+ *   3. 首页 HTML 不受 CSP 约束（`Content-Security-Policy` 只在 setupRouter 里
+ *      设置，而它挂在 /api 下），外链脚本会被浏览器直接执行 —— 把主题的可用性
+ *      与代码完整性押在第三方 GitHub 镜像站上并不划算，故同源托管。
+ * 三者共同决定了：产物同源 + 构建期写进 HTML，是唯一在所有平台都成立的做法。
+ *
+ * 换行统一用 \n：build-edge.mjs 会把 dist/index.html 内联进提交到仓库的
+ * cloud-functions 产物，插入 CRLF 会让该产物在 Windows / Linux 间来回抖动。
+ */
+function applyTheme() {
+  if (process.env.THEME_MOE === "off") {
+    console.log("  [theme] THEME_MOE=off，跳过 OpenList Moe 注入")
+    return
+  }
+
+  const htmlPath = path.join(DEST, "index.html")
+  const html = fs.readFileSync(htmlPath, "utf-8")
+  if (html.includes(THEME_ASSETS[0])) {
+    console.log("  [theme] index.html 已包含 OpenList Moe，跳过注入")
+    return
+  }
+  // 占位符缺失说明上游前端产物结构变了。宁可构建失败，也不要产出一个
+  // 「以为装了主题、实际静默没装」的产物。
+  for (const mark of [MARK_HEAD, MARK_BODY]) {
+    if (!html.includes(mark)) {
+      throw new Error(
+        `[theme] dist/index.html 缺少占位符 ${mark}，无法注入 OpenList Moe（上游前端结构变更？如不需要主题请设 THEME_MOE=off）`,
+      )
+    }
+  }
+  const files = [
+    ...THEME_ASSETS.map((f) => [path.join(THEME_DIR, f), f]),
+    [path.join(ROOT, "theme", SITE_CSS), SITE_CSS],
+  ]
+  for (const [from, name] of files) {
+    if (!fs.existsSync(from)) {
+      throw new Error(`[theme] 缺少主题样式文件: ${from}`)
+    }
+    // 放 dist 根目录（单段路径）：/theme/xxx.css 这类两段路径会被
+    // src/backend/server/assets.ts 的 /:folder/:filepath* 在配置了 ASSET_URLS
+    // 时 302 到 CDN，导致主题样式丢失。
+    fs.copyFileSync(from, path.join(DEST, name))
+  }
+
+  // --moe-color-theme 兜底：上游 JS 由 window.OPENLIST_CONFIG.main_color 推导该
+  // 变量，而只有 Go 后端会在输出 index.html 时填这个字段。实测本仓库下它为空，
+  // 上游 JS 抛 TypeError（documentElement 上不会留下行内变量），CSS 里所有
+  // rgb(var(--moe-color-theme)/…) 的强调色随之失效，故在 :root 给一个静态默认值。
+  // 反过来不能把 main_color 烤进 index.html —— 前端 getMainColor() 优先读该字段，
+  // 烤死会让后台「主色调」设置失效。
+  const head =
+    `${MARK_HEAD}\n` +
+    `    <link rel="stylesheet" href="/${THEME_ASSETS[0]}">\n` +
+    `    <style>:root{--moe-color-theme:${THEME_COLOR_RGB}}</style>\n` +
+    // 覆盖样式必须排在主题 CSS 之后才能在级联中胜出
+    `    <link rel="stylesheet" href="/${SITE_CSS}">`
+  const body = `${MARK_BODY}\n    <script src="/${THEME_ASSETS[1]}"></script>`
+
+  fs.writeFileSync(
+    htmlPath,
+    html.replace(MARK_HEAD, head).replace(MARK_BODY, body),
+    "utf-8",
+  )
+  console.log("  [theme] OpenList Moe 已注入（无备案信息）")
 }
 
 /**
