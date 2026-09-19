@@ -9,5 +9,3 @@ pnpm-lock.yaml
 *.ttf
 *.otf
 *.woff2
-# 上游构建产物需保持字节原样（lint-staged 会对暂存的 css/js 跑 prettier --write）
-theme/
