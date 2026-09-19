@@ -81,31 +81,65 @@ function replaceDist(src) {
   console.log(`✓ Frontend dist ready (${DEST})`)
 }
 
+/** src/lang 下除英文外还解出了哪些语言目录 */
+function extraLangs(langDir) {
+  if (!fs.existsSync(langDir)) return []
+  return fs
+    .readdirSync(langDir, { withFileTypes: true })
+    .filter((d) => d.isDirectory() && d.name !== "en")
+    .map((d) => d.name)
+}
+
 /**
  * 拉取官方前端发布的多语言翻译包，解压到前端仓库 src/lang/ 后运行
  * i18n.mjs 补齐 entry.ts 与缺失翻译，保证构建产物包含完整多语言。
  *
- * 翻译下载失败不阻塞构建（回退为英文），与前端 build.sh 的 `|| true` 语义一致。
+ * 失败即中断构建（不再静默回退英文）：语言包走 GitHub Release 资源，网络抖动
+ * 会让下载悄悄失败，而英文产物照常构建成功 —— 部署后表现为线上中文站点突然
+ * 变英文，且没有任何报错线索。确需英文产物时显式设 I18N_OPTIONAL=1。
  */
 function fetchI18n(repo) {
   const langDir = path.join(repo, "src", "lang")
-  if (!fs.existsSync(langDir)) {
-    console.warn("  [fetch-frontend] repo missing src/lang, skipping i18n fetch")
-    return
+  const optional = process.env.I18N_OPTIONAL === "1"
+  const bail = (why) => {
+    const msg = `[fetch-frontend] ${why} 产物将是纯英文界面 —— 直接部署会把线上中文站点切成英文。确认要英文构建请显式设 I18N_OPTIONAL=1`
+    if (optional) {
+      console.warn(`  ${msg}（I18N_OPTIONAL=1，已降级继续）`)
+      return
+    }
+    throw new Error(msg)
   }
+
+  if (!fs.existsSync(langDir)) return bail("前端仓库缺少 src/lang 目录，")
+
   const tmpTar = path.join(os.tmpdir(), `openlist-i18n-${process.pid}.tar.gz`)
-  console.log(`  Fetching i18n translations: ${I18N_TAR_URL}`)
-  try {
+  const fetchOnce = () => {
     run(`curl -fL --retry 3 -o "${tmpTar}" "${I18N_TAR_URL}"`)
     run(`tar -xzf "${tmpTar}" -C "${langDir}"`)
+  }
+  console.log(`  Fetching i18n translations: ${I18N_TAR_URL}`)
+  try {
+    fetchOnce()
   } catch (err) {
+    // 语言包走 GitHub Release 资源，网络抖动很常见，重试一次再判定失败
     console.warn(
-      `  [fetch-frontend] i18n fetch failed (falling back to English): ${err?.message || err}`,
+      `  [fetch-frontend] i18n fetch failed, retrying once: ${err?.message || err}`,
     )
+    try {
+      fetchOnce()
+    } catch {
+      /* 交由下面的落地检查统一报错 */
+    }
   } finally {
     fs.rmSync(tmpTar, { force: true })
   }
-  // 无论翻译是否下载成功，都补齐 entry.ts 与缺失翻译（与前端 build.sh 一致）
+
+  // 落地检查：下载"没报错"但没解出任何语言目录，同样是英文产物
+  const langs = extraLangs(langDir)
+  if (langs.length === 0) return bail("未解出任何非英文语言包，")
+  console.log(`  [fetch-frontend] i18n ready: ${langs.join(", ")}`)
+
+  // 补齐 entry.ts 与缺失翻译（与前端 build.sh 一致）
   run(`node ./scripts/i18n.mjs`, { cwd: repo })
 }
 
