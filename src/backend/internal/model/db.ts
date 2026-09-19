@@ -827,14 +827,23 @@ let globalEnvCtx: any = null
  *   为 false 时表示 memoryDb 只是空壳兜底/默认值，绝不能写回存储。
  * - `dbLastLoadError`: 最近一次读取失败的原因，用于给出可诊断的拦截日志。
  * - `dbWriteBlocked`: 是否曾拦截过「疑似空数据写回」，供诊断与回归测试使用。
+ * - `dbSealedReadUntrusted`: 本次读取是否「拿到密文却没密钥解密」。既有的写前
+ *   守卫只拦**空壳**，带存储的正常载荷不会被它拦住，所以防止二次加密必须靠这个
+ *   独立标记：为 true 时 saveDb 拒绝落盘（除非显式 force）。
  */
 let dbTrusted = false
 let dbWriteBlocked = false
 let dbLastLoadError: string | null = null
+let dbSealedReadUntrusted = false
 
 /** 当前内存库是否可信（可安全写回持久化存储）。 */
 export function isDbTrusted(): boolean {
   return dbTrusted
+}
+
+/** 最近一次读取是否「有密文但密钥不可用」（此时禁止写回以免二次加密）。 */
+export function isDbSealedReadUntrusted(): boolean {
+  return dbSealedReadUntrusted
 }
 
 /** 最近一次读取持久化存储失败的错误信息（无错误时为 null）。 */
@@ -1099,6 +1108,12 @@ export const __resetDbCacheForTest = () => {
   dbTrusted = false
   dbLastLoadError = null
   dbWriteBlocked = false
+  dbSealedReadUntrusted = false
+  // 字段加密密钥同样是模块级缓存：不清会让「密钥不可用」的用例读到上一个用例
+  // 缓存的密钥，结果取决于执行顺序。
+  cachedEncryptionKey = null
+  cachedFromEnv = false
+  encryptionKeyWarned = false
 }
 
 /** 仅供测试：注入统计型存储后端。 */
@@ -1155,15 +1170,36 @@ const loadDb = async (envCtx?: any) => {
     backend = await storeBackendLoader(activeEnv)
     const persisted = await backend.load(activeEnv)
     if (persisted) {
-      await unsealDb(persisted, await getEncryptionKey(activeEnv))
+      const encKey = await getEncryptionKey(activeEnv)
+      await unsealDb(persisted, encKey)
       memoryDb = persisted
       ensureDefaultSettings(memoryDb)
       ensureDefaultStorages(memoryDb)
       ensureDefaultShares(memoryDb)
       ensureDefaultPlugins(memoryDb)
       ensureDefaultMetas(memoryDb)
+      // 例外：没有密钥却仍有 enc:v1: 密文 —— 说明这次读**没解开**，内存库是
+      // 半成品。此时不能标记可信：任何后续写入都会把密文再封一层（AES-GCM 随机
+      // IV，解密只能剥掉外层），那是不可逆损坏。置 dbTrusted=false 后写前守卫会
+      // 拒绝落盘；同时打明确日志 —— 缺这一步时线上只会表现为「登录失败」和前端
+      // 「not valid JSON」，排查时毫无线索。
+      if (!encKey && hasSealedValues(memoryDb)) {
+        console.error(
+          "[DB] 库中存在未解密的 enc:v1: 密文，但字段加密密钥不可用" +
+            "（JWT_SECRET 未读到，或存储后端在密钥解析前就不可用）。" +
+            "本次读取按不可信处理并禁止写回，以免二次加密。",
+        )
+        dbTrusted = false
+        // 真正拦住写回的是这个标记：dbTrusted=false 只会挡住「空壳落盘」，
+        // 带存储的正常载荷要从这里拦。
+        dbSealedReadUntrusted = true
+        dbLastLoadError =
+          "sealed values present but encryption key unavailable; writes blocked"
+        return memoryDb
+      }
       // 读取成功：内存库与持久化存储一致，允许后续写回。
       dbTrusted = true
+      dbSealedReadUntrusted = false
       dbLastLoadError = null
       return memoryDb
     }
@@ -1576,6 +1612,26 @@ async function unsealValue(value: string, key: string): Promise<string> {
   }
 }
 
+/** 值是否已经是 `enc:v1:` 封套 */
+const alreadySealed = (v: any): boolean =>
+  typeof v === "string" && v.startsWith(ENCRYPTION_PREFIX)
+
+/**
+ * 库里是否仍留有未解开的封套。
+ *
+ * 用于识别「读到了密文却没解密」这种状态：AES-GCM 每次随机 IV，把封套再封一层
+ * 后解密只能剥掉外层，属于不可逆损坏，因此这种状态下必须禁止写回。
+ */
+const hasSealedValues = (data: any): boolean => {
+  if (!data) return false
+  for (const s of data.storages || []) if (alreadySealed(s?.addition)) return true
+  for (const st of data.settings || [])
+    if (SENSITIVE_SETTING_KEYS.has(st?.key) && alreadySealed(st.value)) return true
+  for (const u of data.users || [])
+    if (alreadySealed(u?.otp_secret) || alreadySealed(u?.password)) return true
+  return false
+}
+
 async function sealDb(data: any, key: string | null): Promise<any> {
   if (!key || !data) return data
   const copy = JSON.parse(JSON.stringify(data))
@@ -1585,14 +1641,19 @@ async function sealDb(data: any, key: string | null): Promise<any> {
     if (!s || !s.addition) continue
     const str =
       typeof s.addition === "string" ? s.addition : JSON.stringify(s.addition)
-    if (str && str !== "{}") {
+    if (str && str !== "{}" && !alreadySealed(str)) {
       s.addition = await sealValue(str, key)
     }
   }
 
   // 2. 加密敏感的系统设置
   for (const st of copy.settings || []) {
-    if (st && SENSITIVE_SETTING_KEYS.has(st.key) && st.value) {
+    if (
+      st &&
+      SENSITIVE_SETTING_KEYS.has(st.key) &&
+      st.value &&
+      !alreadySealed(st.value)
+    ) {
       st.value = await sealValue(String(st.value), key)
     }
   }
@@ -1600,11 +1661,11 @@ async function sealDb(data: any, key: string | null): Promise<any> {
   // 3. 加密用户敏感信息
   for (const u of copy.users || []) {
     // OTP 密钥
-    if (u && u.otp_secret) {
+    if (u && u.otp_secret && !alreadySealed(u.otp_secret)) {
       u.otp_secret = await sealValue(String(u.otp_secret), key)
     }
     // 密码二次加密（defense-in-depth，即使已哈希也加密存储）
-    if (u && u.password) {
+    if (u && u.password && !alreadySealed(u.password)) {
       u.password = await sealValue(String(u.password), key)
     }
   }
@@ -1724,6 +1785,18 @@ export const saveDb = async (
   //
   // 这样即使某条调用链在读取失败后拿到默认库，也无法把它写回存储。
   // 唯一的例外是调用方明确知情（首次初始化、管理员主动重置）并传入 force。
+  // 未解密的读取绝不允许写回：内存里仍是 enc:v1: 密文，再封一层就是不可逆损坏
+  // （AES-GCM 每次随机 IV，解密只能剥掉外层）。
+  if (dbSealedReadUntrusted && !options?.force) {
+    dbWriteBlocked = true
+    console.error(
+      "[DB] saveDb BLOCKED: 本次读取存在未解密的 enc:v1: 密文（字段加密密钥不可用），" +
+        "写回会造成二次加密。请先修好 JWT_SECRET / 存储后端绑定；" +
+        "确知后果时可用 saveDb(db, env, { force: true }) 强行写入。",
+    )
+    return false
+  }
+
   const shell = isDbShell(data)
   if (shell && !options?.force) {
     dbWriteBlocked = true
