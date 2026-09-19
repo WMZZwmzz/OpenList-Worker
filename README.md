@@ -152,6 +152,7 @@ pnpm run deploy:worker
 - 注入发生在 `scripts/fetch-frontend.mjs` 的 `applyTheme()`：把 CSS/JS 拷进 `dist/`，并写入 `dist/index.html` 的官方占位注释处。
 - 关闭：构建时设环境变量 `THEME_MOE=off`。
 - **本站样式微调写在 `theme/site-overrides.css`**（构建时拷到 `dist/` 根目录，加载顺序在主题 CSS 之后，因此可直接覆盖主题与官方样式）——不要改 `theme/openlist-moe/` 里的上游产物，否则无法跟随上游更新。当前已有：面包屑首项用 🏠 代替 "Home/首页" 文字；目录区居中提示卡（如 `failed get storage`）去掉官方那层不透明底色，只留外层毛玻璃面板。
+- **界面字体**：Zen Maru Gothic Medium（SIL OFL 1.1）以 woff2 同源托管在 `theme/zenmarugothic/`，构建时拷到站点根目录，`@font-face` 与字体栈写在 `theme/site-overrides.css`。该字体只有 Medium 一个字重，粗体交给浏览器合成加粗；代码区保留官方的等宽字体。
 - 换背景图：改 `applyTheme()` 注入的 `<style>`，覆盖 `--moe-bg-image-desktop` / `--moe-bg-image-mobile`。
 
 已知限制：

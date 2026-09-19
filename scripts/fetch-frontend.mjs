@@ -32,6 +32,11 @@ const THEME_DIR = path.join(ROOT, "theme", "openlist-moe")
 const THEME_ASSETS = ["OpenList-Moe.min.css", "OpenList-Moe.min.js"]
 // 本站覆盖样式（非上游产物）：加载在主题 CSS 之后，用于微调面包屑/提示卡等表现
 const SITE_CSS = "site-overrides.css"
+// 界面字体：theme/zenmarugothic/*.woff2 → dist 根目录同源提供。
+// Zen Maru Gothic Medium（SIL Open Font License 1.1）；版权与许可证记录保存在字体
+// 的 name 表里，TTF 转 woff2 后仍保留，随文件一起分发即满足 OFL 的要求。
+const FONT_DIR = path.join(ROOT, "theme", "zenmarugothic")
+const FONT_ASSETS = ["ZenMaruGothic-Medium.woff2"]
 // 官方前端 index.html 自带的占位注释（上游 Go 版在此处做运行时替换）。
 // 注入时保留注释本身，后续若实现运行时 customize_head 注入仍能定位锚点。
 const MARK_HEAD = "<!-- customize head -->"
@@ -162,6 +167,7 @@ function applyTheme() {
   }
   const files = [
     ...THEME_ASSETS.map((f) => [path.join(THEME_DIR, f), f]),
+    ...FONT_ASSETS.map((f) => [path.join(FONT_DIR, f), f]),
     [path.join(ROOT, "theme", SITE_CSS), SITE_CSS],
   ]
   for (const [from, name] of files) {
