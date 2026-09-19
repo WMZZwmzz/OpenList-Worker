@@ -89,6 +89,47 @@ test("sealDb 幂等：连续保存不会把封套再封一层", async () => {
   )
 })
 
+test("双钥解密：旧密钥封存的数据可读，写入后自动迁移到新密钥", async () => {
+  const LEGACY = "legacy-key-0000000000000000000000000000000000000000000000000000a"
+  const NEW = "new-key-10000000000000000000000000000000000000000000000000000000b"
+
+  // 1. 用旧密钥封存（模拟历史部署：字段加密密钥来源是 ENCRYPTION_SECRET）
+  const { backend, peek } = fakeBackend(null)
+  __resetDbCacheForTest()
+  __setStoreBackendLoaderForTest(async () => backend)
+  assert.equal(
+    await saveDb(payload(), { JWT_SECRET: LEGACY } as any, { force: true }),
+    true,
+  )
+  const sealed = String(peek().storages[0].addition)
+  assert.ok(sealed.startsWith("enc:v1:"), "前置条件：已用旧密钥封存")
+
+  // 2. 新密钥 + 保留旧密钥：必须能解开（否则线上就是「登录失败 + 密文漏给前端」）
+  __resetDbCacheForTest()
+  __setStoreBackendLoaderForTest(async () => backend)
+  const mixedEnv = { JWT_SECRET: NEW, ENCRYPTION_SECRET: LEGACY } as any
+  const loaded = await getDb(mixedEnv)
+  assert.equal(loaded.storages[0].addition, ADDITION, "旧密钥封存的值应被回退解密")
+
+  // 3. 再保存一次应迁移到新密钥
+  assert.equal(await saveDb(loaded, mixedEnv), true)
+  assert.notEqual(
+    String(peek().storages[0].addition),
+    sealed,
+    "迁移后密文应发生变化",
+  )
+
+  // 4. 只配新密钥的实例也必须能解开，说明迁移完成
+  __resetDbCacheForTest()
+  __setStoreBackendLoaderForTest(async () => backend)
+  const migrated = await getDb({ JWT_SECRET: NEW } as any)
+  assert.equal(
+    migrated.storages[0].addition,
+    ADDITION,
+    "迁移后仅用新密钥即可解开",
+  )
+})
+
 test("读到密文却无密钥：标记不可信、禁止写回并留下诊断信息", async () => {
   // 先用带密钥的 env 造出真实的封套数据
   const first = fakeBackend(null)

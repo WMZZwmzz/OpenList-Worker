@@ -1170,23 +1170,23 @@ const loadDb = async (envCtx?: any) => {
     backend = await storeBackendLoader(activeEnv)
     const persisted = await backend.load(activeEnv)
     if (persisted) {
-      const encKey = await getEncryptionKey(activeEnv)
-      await unsealDb(persisted, encKey)
+      const encKeys = await getEncryptionKeyCandidates(activeEnv)
+      await unsealDb(persisted, encKeys)
       memoryDb = persisted
       ensureDefaultSettings(memoryDb)
       ensureDefaultStorages(memoryDb)
       ensureDefaultShares(memoryDb)
       ensureDefaultPlugins(memoryDb)
       ensureDefaultMetas(memoryDb)
-      // 例外：没有密钥却仍有 enc:v1: 密文 —— 说明这次读**没解开**，内存库是
-      // 半成品。此时不能标记可信：任何后续写入都会把密文再封一层（AES-GCM 随机
-      // IV，解密只能剥掉外层），那是不可逆损坏。置 dbTrusted=false 后写前守卫会
-      // 拒绝落盘；同时打明确日志 —— 缺这一步时线上只会表现为「登录失败」和前端
-      // 「not valid JSON」，排查时毫无线索。
-      if (!encKey && hasSealedValues(memoryDb)) {
+      // 例外：一把密钥都没有却仍有 enc:v1: 密文 —— 说明这次读**没解开**，内存库
+      // 是半成品。此时不能标记可信：任何后续写入都会把密文再封一层（AES-GCM 随机
+      // IV，解密只能剥掉外层），那是不可逆损坏。置 dbSealedReadUntrusted=true 后
+      // 写前守卫会拒绝落盘；同时打明确日志 —— 缺这一步时线上只会表现为「登录失
+      // 败」和前端「not valid JSON」，排查时毫无线索。
+      if (!encKeys.length && hasSealedValues(memoryDb)) {
         console.error(
           "[DB] 库中存在未解密的 enc:v1: 密文，但字段加密密钥不可用" +
-            "（JWT_SECRET 未读到，或存储后端在密钥解析前就不可用）。" +
+            "（JWT_SECRET / ENCRYPTION_SECRET 都未读到，或存储后端在密钥解析前就不可用）。" +
             "本次读取按不可信处理并禁止写回，以免二次加密。",
         )
         dbTrusted = false
@@ -1434,6 +1434,34 @@ async function getEncryptionKey(envCtx?: any): Promise<string | null> {
 }
 
 /**
+ * 解密用的候选密钥（按优先级）。
+ *
+ * 为什么解密要允许多把：字段加密的密钥来源换过一次 —— 早期部署用
+ * `ENCRYPTION_SECRET` 封存，现在的 `getEncryptionKey` 只认 `JWT_SECRET`。只拿一
+ * 把会让存量密文全部解不开，表现为「登录失败」+ 网盘配置以 `enc:v1:` 原样漏到
+ * 前端（前端 JSON.parse 报 `Unexpected token 'e', "enc:v1:..."`），而错误只藏在
+ * 一句 warn 里，极难定位。
+ *
+ * 加密则固定只用第一把：这样任何一次正常写入都会把数据平滑迁移到新密钥，无需
+ * 停机改密，也不会出现两把钥匙来回覆盖。
+ */
+async function getEncryptionKeyCandidates(envCtx?: any): Promise<string[]> {
+  const env =
+    envCtx ||
+    globalEnvCtx ||
+    (typeof process !== "undefined" ? process.env : {})
+
+  const keys: string[] = []
+  const push = (v: any) => {
+    if (typeof v === "string" && v.trim().length > 0 && !keys.includes(v))
+      keys.push(v)
+  }
+  push(await getEncryptionKey(env))
+  push(env?.ENCRYPTION_SECRET)
+  return keys
+}
+
+/**
  * 加密密钥是否已就绪（**绕过进程内缓存**，直查真实来源）。
  *
  * 用途：供 `/public/init_status` 向前端暴露「后端是否已准备好接受登录」。
@@ -1599,17 +1627,22 @@ async function sealValue(value: string, key: string): Promise<string> {
   return ENCRYPTION_PREFIX + (await encrypt(value, key))
 }
 
-async function unsealValue(value: string, key: string): Promise<string> {
+async function unsealValue(value: string, keys: string[]): Promise<string> {
   if (!value || !value.startsWith(ENCRYPTION_PREFIX)) return value
-  try {
-    return await decrypt(value.slice(ENCRYPTION_PREFIX.length), key)
-  } catch (e) {
-    console.warn(
-      "[DB] Failed to decrypt a sealed secret (wrong JWT_SECRET?):",
-      e,
-    )
-    return value // keep raw value, never lose data
+  const cipher = value.slice(ENCRYPTION_PREFIX.length)
+  let lastErr: any = null
+  for (const key of keys) {
+    try {
+      return await decrypt(cipher, key)
+    } catch (e) {
+      lastErr = e
+    }
   }
+  console.warn(
+    "[DB] Failed to decrypt a sealed secret (neither JWT_SECRET nor ENCRYPTION_SECRET matches):",
+    lastErr,
+  )
+  return value // keep raw value, never lose data
 }
 
 /** 值是否已经是 `enc:v1:` 封套 */
@@ -1641,19 +1674,15 @@ async function sealDb(data: any, key: string | null): Promise<any> {
     if (!s || !s.addition) continue
     const str =
       typeof s.addition === "string" ? s.addition : JSON.stringify(s.addition)
-    if (str && str !== "{}" && !alreadySealed(str)) {
+    if (str && str !== "{}") {
+      // sealValue 对已是封套的值直接返回，不会二次加密
       s.addition = await sealValue(str, key)
     }
   }
 
   // 2. 加密敏感的系统设置
   for (const st of copy.settings || []) {
-    if (
-      st &&
-      SENSITIVE_SETTING_KEYS.has(st.key) &&
-      st.value &&
-      !alreadySealed(st.value)
-    ) {
+    if (st && SENSITIVE_SETTING_KEYS.has(st.key) && st.value) {
       st.value = await sealValue(String(st.value), key)
     }
   }
@@ -1661,11 +1690,11 @@ async function sealDb(data: any, key: string | null): Promise<any> {
   // 3. 加密用户敏感信息
   for (const u of copy.users || []) {
     // OTP 密钥
-    if (u && u.otp_secret && !alreadySealed(u.otp_secret)) {
+    if (u && u.otp_secret) {
       u.otp_secret = await sealValue(String(u.otp_secret), key)
     }
     // 密码二次加密（defense-in-depth，即使已哈希也加密存储）
-    if (u && u.password && !alreadySealed(u.password)) {
+    if (u && u.password) {
       u.password = await sealValue(String(u.password), key)
     }
   }
@@ -1682,8 +1711,8 @@ async function sealDb(data: any, key: string | null): Promise<any> {
  */
 const UNSEAL_CONCURRENCY = 16
 
-async function unsealDb(data: any, key: string | null): Promise<void> {
-  if (!key || !data) return
+async function unsealDb(data: any, keys: string[]): Promise<void> {
+  if (!keys.length || !data) return
 
   // 并行解密（带并发上限）：
   //
@@ -1708,7 +1737,7 @@ async function unsealDb(data: any, key: string | null): Promise<void> {
       const target = s
       const cipher = target.addition
       tasks.push(async () => {
-        target.addition = await unsealValue(cipher, key)
+        target.addition = await unsealValue(cipher, keys)
       })
     }
   }
@@ -1724,7 +1753,7 @@ async function unsealDb(data: any, key: string | null): Promise<void> {
       const target = st
       const cipher = target.value
       tasks.push(async () => {
-        target.value = await unsealValue(cipher, key)
+        target.value = await unsealValue(cipher, keys)
       })
     }
   }
@@ -1740,7 +1769,7 @@ async function unsealDb(data: any, key: string | null): Promise<void> {
       const target = u
       const cipher = target.otp_secret
       tasks.push(async () => {
-        target.otp_secret = await unsealValue(cipher, key)
+        target.otp_secret = await unsealValue(cipher, keys)
       })
     }
     // 密码解密
@@ -1751,7 +1780,7 @@ async function unsealDb(data: any, key: string | null): Promise<void> {
       const target = u
       const cipher = target.password
       tasks.push(async () => {
-        target.password = await unsealValue(cipher, key)
+        target.password = await unsealValue(cipher, keys)
       })
     }
   }
