@@ -2,8 +2,17 @@
    与 theme/openlist-moe/ 分开存放，保证上游产物可原样更新。 */
 
 /* ── 界面字体 ───────────────────────────────────────────────────────────
-   Zen Maru Gothic Medium（SIL Open Font License 1.1），由 applyTheme() 从
+   Zen Maru Gothic Medium（SIL OFL 1.1），由 applyTheme() 从
    theme/zenmarugothic/ 拷到站点根目录同源提供。
+
+   这个 woff2 是从原 TTF 裁出来的**拉丁子集**（346 个码位、16 KB；原文件 3.6 MB）。
+   原因：Zen Maru Gothic 是日文字体，汉字用的是日式写法（「非」「直」「骨」等的
+   笔画形态与中文不同），所以汉字不交给它，改由下面的中文字体渲染。
+   重新裁子集：
+     python -m fontTools.subset ZenMaruGothic-Medium.ttf \
+       --unicodes="U+0020-007E,U+00A0-00FF,U+2000-206F,U+2070-209F,U+2190-21BB,U+2212,U+2500-257F,U+FF01-FF5E,U+FFE0-FFE6" \
+       --flavor=woff2 --layout-features='*' --output-file=ZenMaruGothic-Medium.woff2
+
    只有 Medium 一个字重：粗体交给浏览器合成加粗，避免中途换成别的字体。
    代码/等宽区不在选择器列表里，官方样式会保留它自己的等宽字体。 */
 @font-face {
@@ -12,6 +21,8 @@
   font-weight: 500;
   font-style: normal;
   font-display: swap;
+  unicode-range: U+0020-007E, U+00A0-00FF, U+2000-206F, U+2070-209F, U+2190-21BB,
+    U+2212, U+2500-257F, U+FF01-FF5E, U+FFE0-FFE6;
 }
 
 body,
@@ -20,7 +31,8 @@ body,
 .art-video-player,
 [class*="hint--"]:after {
   font-family: "Zen Maru Gothic", -apple-system, BlinkMacSystemFont, "Segoe UI",
-    Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji",
+    "PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei", "Source Han Sans SC",
+    "Noto Sans SC", Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji",
     "Segoe UI Emoji" !important;
 }
 
