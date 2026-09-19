@@ -145,6 +145,21 @@ pnpm run deploy:worker
 - **UI 库**：Ant Design / Material-UI
 - **构建工具**：Vite
 
+### 主题（OpenList Moe）
+
+构建时默认注入 [OpenList Moe](https://github.com/SajunaOo/OpenList-Moe) 的半透明毛玻璃主题（日/夜模式跟随系统），**不含备案号**，产物同源托管在 `theme/openlist-moe/`，详见该目录下的 `UPSTREAM.md`。
+
+- 注入发生在 `scripts/fetch-frontend.mjs` 的 `applyTheme()`：把 CSS/JS 拷进 `dist/`，并写入 `dist/index.html` 的官方占位注释处。
+- 关闭：构建时设环境变量 `THEME_MOE=off`。
+- **本站样式微调写在 `theme/site-overrides.css`**（构建时拷到 `dist/` 根目录，加载顺序在主题 CSS 之后，因此可直接覆盖主题与官方样式）——不要改 `theme/openlist-moe/` 里的上游产物，否则无法跟随上游更新。当前已有：面包屑首项用 🏠 代替 "Home/首页" 文字；目录区居中提示卡（如 `failed get storage`）去掉官方那层不透明底色，只留外层毛玻璃面板。
+- 换背景图：改 `applyTheme()` 注入的 `<style>`，覆盖 `--moe-bg-image-desktop` / `--moe-bg-image-mobile`。
+
+已知限制：
+
+- 主题烘在构建产物里，改主题需重新 `pnpm run build` 并部署；后台「设置 → 自定义头部 / 自定义内容」对应的 `customize_head` / `customize_body` 在本 Worker 版**尚未实现**（只被 `/api/public/settings` 回显，填了不生效）。
+- 后台改「主色调」不会同步主题强调色（构建期常量兜底）。
+- 以子路径部署（`base_path` 非 `/`）时主题的绝对路径 `/OpenList-Moe.min.css` 会失效，根域名部署无此问题。
+
 ---
 
 
