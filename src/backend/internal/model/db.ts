@@ -1,4 +1,9 @@
-import { encrypt, decrypt } from "../../pkg/crypto"
+import {
+  decrypt,
+  decryptConfigValue,
+  deriveConfigEncryptionKey,
+  encryptConfigValue,
+} from "../../pkg/crypto"
 import {
   generateSecret,
   readPersistedSecret,
@@ -827,23 +832,14 @@ let globalEnvCtx: any = null
  *   为 false 时表示 memoryDb 只是空壳兜底/默认值，绝不能写回存储。
  * - `dbLastLoadError`: 最近一次读取失败的原因，用于给出可诊断的拦截日志。
  * - `dbWriteBlocked`: 是否曾拦截过「疑似空数据写回」，供诊断与回归测试使用。
- * - `dbSealedReadUntrusted`: 本次读取是否「拿到密文却没密钥解密」。既有的写前
- *   守卫只拦**空壳**，带存储的正常载荷不会被它拦住，所以防止二次加密必须靠这个
- *   独立标记：为 true 时 saveDb 拒绝落盘（除非显式 force）。
  */
 let dbTrusted = false
 let dbWriteBlocked = false
 let dbLastLoadError: string | null = null
-let dbSealedReadUntrusted = false
 
 /** 当前内存库是否可信（可安全写回持久化存储）。 */
 export function isDbTrusted(): boolean {
   return dbTrusted
-}
-
-/** 最近一次读取是否「有密文但密钥不可用」（此时禁止写回以免二次加密）。 */
-export function isDbSealedReadUntrusted(): boolean {
-  return dbSealedReadUntrusted
 }
 
 /** 最近一次读取持久化存储失败的错误信息（无错误时为 null）。 */
@@ -1108,12 +1104,6 @@ export const __resetDbCacheForTest = () => {
   dbTrusted = false
   dbLastLoadError = null
   dbWriteBlocked = false
-  dbSealedReadUntrusted = false
-  // 字段加密密钥同样是模块级缓存：不清会让「密钥不可用」的用例读到上一个用例
-  // 缓存的密钥，结果取决于执行顺序。
-  cachedEncryptionKey = null
-  cachedFromEnv = false
-  encryptionKeyWarned = false
 }
 
 /** 仅供测试：注入统计型存储后端。 */
@@ -1170,36 +1160,15 @@ const loadDb = async (envCtx?: any) => {
     backend = await storeBackendLoader(activeEnv)
     const persisted = await backend.load(activeEnv)
     if (persisted) {
-      const encKeys = await getEncryptionKeyCandidates(activeEnv)
-      await unsealDb(persisted, encKeys)
+      await unsealDb(persisted, await getEncryptionKey(activeEnv))
       memoryDb = persisted
       ensureDefaultSettings(memoryDb)
       ensureDefaultStorages(memoryDb)
       ensureDefaultShares(memoryDb)
       ensureDefaultPlugins(memoryDb)
       ensureDefaultMetas(memoryDb)
-      // 例外：一把密钥都没有却仍有 enc:v1: 密文 —— 说明这次读**没解开**，内存库
-      // 是半成品。此时不能标记可信：任何后续写入都会把密文再封一层（AES-GCM 随机
-      // IV，解密只能剥掉外层），那是不可逆损坏。置 dbSealedReadUntrusted=true 后
-      // 写前守卫会拒绝落盘；同时打明确日志 —— 缺这一步时线上只会表现为「登录失
-      // 败」和前端「not valid JSON」，排查时毫无线索。
-      if (!encKeys.length && hasSealedValues(memoryDb)) {
-        console.error(
-          "[DB] 库中存在未解密的 enc:v1: 密文，但字段加密密钥不可用" +
-            "（JWT_SECRET / ENCRYPTION_SECRET 都未读到，或存储后端在密钥解析前就不可用）。" +
-            "本次读取按不可信处理并禁止写回，以免二次加密。",
-        )
-        dbTrusted = false
-        // 真正拦住写回的是这个标记：dbTrusted=false 只会挡住「空壳落盘」，
-        // 带存储的正常载荷要从这里拦。
-        dbSealedReadUntrusted = true
-        dbLastLoadError =
-          "sealed values present but encryption key unavailable; writes blocked"
-        return memoryDb
-      }
       // 读取成功：内存库与持久化存储一致，允许后续写回。
       dbTrusted = true
-      dbSealedReadUntrusted = false
       dbLastLoadError = null
       return memoryDb
     }
@@ -1308,7 +1277,15 @@ export const getDb = async (envCtx?: any) => {
 // 保持既有部署（无密钥）向后兼容。已存在的明文数据不带前缀，unseal 时原样
 // 返回，不会因升级而丢失。
 // ============================================================
-const ENCRYPTION_PREFIX = "enc:v1:"
+const LEGACY_ENCRYPTION_PREFIX = "enc:v1:"
+const ENCRYPTION_PREFIX = "enc:v2:"
+
+function isSealedValue(value: string): boolean {
+  return (
+    value.startsWith(ENCRYPTION_PREFIX) ||
+    value.startsWith(LEGACY_ENCRYPTION_PREFIX)
+  )
+}
 
 const SENSITIVE_SETTING_KEYS = new Set([
   "token",
@@ -1431,34 +1408,6 @@ async function getEncryptionKey(envCtx?: any): Promise<string | null> {
     )
   }
   return null
-}
-
-/**
- * 解密用的候选密钥（按优先级）。
- *
- * 为什么解密要允许多把：字段加密的密钥来源换过一次 —— 早期部署用
- * `ENCRYPTION_SECRET` 封存，现在的 `getEncryptionKey` 只认 `JWT_SECRET`。只拿一
- * 把会让存量密文全部解不开，表现为「登录失败」+ 网盘配置以 `enc:v1:` 原样漏到
- * 前端（前端 JSON.parse 报 `Unexpected token 'e', "enc:v1:..."`），而错误只藏在
- * 一句 warn 里，极难定位。
- *
- * 加密则固定只用第一把：这样任何一次正常写入都会把数据平滑迁移到新密钥，无需
- * 停机改密，也不会出现两把钥匙来回覆盖。
- */
-async function getEncryptionKeyCandidates(envCtx?: any): Promise<string[]> {
-  const env =
-    envCtx ||
-    globalEnvCtx ||
-    (typeof process !== "undefined" ? process.env : {})
-
-  const keys: string[] = []
-  const push = (v: any) => {
-    if (typeof v === "string" && v.trim().length > 0 && !keys.includes(v))
-      keys.push(v)
-  }
-  push(await getEncryptionKey(env))
-  push(env?.ENCRYPTION_SECRET)
-  return keys
 }
 
 /**
@@ -1621,53 +1570,40 @@ export async function ensureEncryptionSecret(
   }
 }
 
-async function sealValue(value: string, key: string): Promise<string> {
+async function sealValue(value: string, key: CryptoKey): Promise<string> {
   if (!value) return value
-  if (value.startsWith(ENCRYPTION_PREFIX)) return value // idempotent
-  return ENCRYPTION_PREFIX + (await encrypt(value, key))
+  if (isSealedValue(value)) return value // idempotent
+  return ENCRYPTION_PREFIX + (await encryptConfigValue(value, key))
 }
 
-async function unsealValue(value: string, keys: string[]): Promise<string> {
-  if (!value || !value.startsWith(ENCRYPTION_PREFIX)) return value
-  const cipher = value.slice(ENCRYPTION_PREFIX.length)
-  let lastErr: any = null
-  for (const key of keys) {
-    try {
-      return await decrypt(cipher, key)
-    } catch (e) {
-      lastErr = e
+async function unsealValue(
+  value: string,
+  secret: string,
+  configKey: () => Promise<CryptoKey>,
+): Promise<string> {
+  if (!value || !isSealedValue(value)) return value
+  try {
+    if (value.startsWith(ENCRYPTION_PREFIX)) {
+      return await decryptConfigValue(
+        value.slice(ENCRYPTION_PREFIX.length),
+        await configKey(),
+      )
     }
+    return await decrypt(value.slice(LEGACY_ENCRYPTION_PREFIX.length), secret)
+  } catch (e) {
+    console.warn(
+      "[DB] Failed to decrypt a sealed secret (wrong JWT_SECRET?):",
+      e,
+    )
+    return value // keep raw value, never lose data
   }
-  console.warn(
-    "[DB] Failed to decrypt a sealed secret (neither JWT_SECRET nor ENCRYPTION_SECRET matches):",
-    lastErr,
-  )
-  return value // keep raw value, never lose data
-}
-
-/** 值是否已经是 `enc:v1:` 封套 */
-const alreadySealed = (v: any): boolean =>
-  typeof v === "string" && v.startsWith(ENCRYPTION_PREFIX)
-
-/**
- * 库里是否仍留有未解开的封套。
- *
- * 用于识别「读到了密文却没解密」这种状态：AES-GCM 每次随机 IV，把封套再封一层
- * 后解密只能剥掉外层，属于不可逆损坏，因此这种状态下必须禁止写回。
- */
-const hasSealedValues = (data: any): boolean => {
-  if (!data) return false
-  for (const s of data.storages || []) if (alreadySealed(s?.addition)) return true
-  for (const st of data.settings || [])
-    if (SENSITIVE_SETTING_KEYS.has(st?.key) && alreadySealed(st.value)) return true
-  for (const u of data.users || [])
-    if (alreadySealed(u?.otp_secret) || alreadySealed(u?.password)) return true
-  return false
 }
 
 async function sealDb(data: any, key: string | null): Promise<any> {
   if (!key || !data) return data
   const copy = JSON.parse(JSON.stringify(data))
+  // Derive once per save. All fields still receive independent random GCM IVs.
+  const configKey = await deriveConfigEncryptionKey(key)
 
   // 1. 加密存储配置中的 addition 字段（网盘凭据）
   for (const s of copy.storages || []) {
@@ -1675,15 +1611,14 @@ async function sealDb(data: any, key: string | null): Promise<any> {
     const str =
       typeof s.addition === "string" ? s.addition : JSON.stringify(s.addition)
     if (str && str !== "{}") {
-      // sealValue 对已是封套的值直接返回，不会二次加密
-      s.addition = await sealValue(str, key)
+      s.addition = await sealValue(str, configKey)
     }
   }
 
   // 2. 加密敏感的系统设置
   for (const st of copy.settings || []) {
     if (st && SENSITIVE_SETTING_KEYS.has(st.key) && st.value) {
-      st.value = await sealValue(String(st.value), key)
+      st.value = await sealValue(String(st.value), configKey)
     }
   }
 
@@ -1691,11 +1626,11 @@ async function sealDb(data: any, key: string | null): Promise<any> {
   for (const u of copy.users || []) {
     // OTP 密钥
     if (u && u.otp_secret) {
-      u.otp_secret = await sealValue(String(u.otp_secret), key)
+      u.otp_secret = await sealValue(String(u.otp_secret), configKey)
     }
     // 密码二次加密（defense-in-depth，即使已哈希也加密存储）
     if (u && u.password) {
-      u.password = await sealValue(String(u.password), key)
+      u.password = await sealValue(String(u.password), configKey)
     }
   }
 
@@ -1705,39 +1640,40 @@ async function sealDb(data: any, key: string | null): Promise<any> {
 /**
  * 解密并发上限。
  *
- * 解密是 WebCrypto + PBKDF2（10 万次迭代）的异步重活：串行会让墙钟随字段数
- * 线性增长，而一次性全部并发又会在字段极多时造成 CPU/内存峰值。16 是兼顾
- * serverless 延迟与峰值的折中值。
+ * v2 密文只需一次快速密钥派生；旧 v1 密文仍需 PBKDF2（10 万次迭代），并在
+ * 下次保存时自动迁移。限制并发可避免旧数据字段很多时产生 CPU/内存峰值。
  */
 const UNSEAL_CONCURRENCY = 16
 
-async function unsealDb(data: any, keys: string[]): Promise<void> {
-  if (!keys.length || !data) return
+async function unsealDb(data: any, key: string | null): Promise<void> {
+  if (!key || !data) return
+
+  // v2 的派生结果在本次加载中共享；纯 v1 数据不会做这次派生。
+  let configKey: Promise<CryptoKey> | null = null
+  const getConfigKey = () => (configKey ||= deriveConfigEncryptionKey(key))
 
   // 并行解密（带并发上限）：
   //
-  // 原先三类字段（storage/setting/user）各自串行 await，字段一多就是「N 次
-  // await 叠加」；而 decrypt 走 WebCrypto + PBKDF2（10 万次迭代），是真正的
-  // 异步重活，且该函数在一次请求内会被调用多次（历史缺陷下更是数十次），
-  // 是加载变慢的主要贡献之一。
+  // 原先三类字段（storage/setting/user）各自串行 await，旧 v1 字段一多就是
+  // 「N 次 PBKDF2（10 万次迭代）」叠加，且该函数在一次请求内会被调用多次
+  // （历史缺陷下更是数十次），是加载变慢的主要贡献之一。
   //
   // 这里先**同步收集 thunk**（不在收集阶段就把解密全部发起），再按
   // UNSEAL_CONCURRENCY 分批 await：既拿到并行带来的墙钟收益，又避免字段极多
   // （如数千用户）时一次性并发过多造成 CPU/内存峰值。
   const tasks: Array<() => Promise<void>> = []
 
-
   // 1. 解密存储配置
   for (const s of data.storages || []) {
     if (
       s &&
       typeof s.addition === "string" &&
-      s.addition.startsWith(ENCRYPTION_PREFIX)
+      isSealedValue(s.addition)
     ) {
       const target = s
       const cipher = target.addition
       tasks.push(async () => {
-        target.addition = await unsealValue(cipher, keys)
+        target.addition = await unsealValue(cipher, key, getConfigKey)
       })
     }
   }
@@ -1748,12 +1684,12 @@ async function unsealDb(data: any, keys: string[]): Promise<void> {
       st &&
       SENSITIVE_SETTING_KEYS.has(st.key) &&
       typeof st.value === "string" &&
-      st.value.startsWith(ENCRYPTION_PREFIX)
+      isSealedValue(st.value)
     ) {
       const target = st
       const cipher = target.value
       tasks.push(async () => {
-        target.value = await unsealValue(cipher, keys)
+        target.value = await unsealValue(cipher, key, getConfigKey)
       })
     }
   }
@@ -1762,25 +1698,19 @@ async function unsealDb(data: any, keys: string[]): Promise<void> {
   for (const u of data.users || []) {
     if (!u) continue
     // OTP 密钥
-    if (
-      typeof u.otp_secret === "string" &&
-      u.otp_secret.startsWith(ENCRYPTION_PREFIX)
-    ) {
+    if (typeof u.otp_secret === "string" && isSealedValue(u.otp_secret)) {
       const target = u
       const cipher = target.otp_secret
       tasks.push(async () => {
-        target.otp_secret = await unsealValue(cipher, keys)
+        target.otp_secret = await unsealValue(cipher, key, getConfigKey)
       })
     }
     // 密码解密
-    if (
-      typeof u.password === "string" &&
-      u.password.startsWith(ENCRYPTION_PREFIX)
-    ) {
+    if (typeof u.password === "string" && isSealedValue(u.password)) {
       const target = u
       const cipher = target.password
       tasks.push(async () => {
-        target.password = await unsealValue(cipher, keys)
+        target.password = await unsealValue(cipher, key, getConfigKey)
       })
     }
   }
@@ -1814,18 +1744,6 @@ export const saveDb = async (
   //
   // 这样即使某条调用链在读取失败后拿到默认库，也无法把它写回存储。
   // 唯一的例外是调用方明确知情（首次初始化、管理员主动重置）并传入 force。
-  // 未解密的读取绝不允许写回：内存里仍是 enc:v1: 密文，再封一层就是不可逆损坏
-  // （AES-GCM 每次随机 IV，解密只能剥掉外层）。
-  if (dbSealedReadUntrusted && !options?.force) {
-    dbWriteBlocked = true
-    console.error(
-      "[DB] saveDb BLOCKED: 本次读取存在未解密的 enc:v1: 密文（字段加密密钥不可用），" +
-        "写回会造成二次加密。请先修好 JWT_SECRET / 存储后端绑定；" +
-        "确知后果时可用 saveDb(db, env, { force: true }) 强行写入。",
-    )
-    return false
-  }
-
   const shell = isDbShell(data)
   if (shell && !options?.force) {
     dbWriteBlocked = true
