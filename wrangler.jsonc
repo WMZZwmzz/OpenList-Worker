@@ -152,14 +152,14 @@
   // 存储绑定
   // ===========================================================================
   //
-  // ▶ 方案 A：KV（默认启用，免费额度大、最通用）
-  //   ⚠️ 必须【完全省略 id 字段】，不能写成 "id": ""：
-  //      wrangler 配置校验会拒绝空字符串 id（"should have a string id field"）。
-  //   省略 id 后：首次部署由 wrangler 自动创建 openlist-tsworkers-kv 并绑定；
-  //   二次部署通过 inherit 复用已有绑定，不会重复创建。
-  //   若想改用账户里已有的 KV，把该命名空间的 id 填进来即可。
+  // ▶ 方案 A：KV（本部署在用，线上真实数据在 openlist-tsworkers-kv 里）
+  //   ⚠️ 必须【显式写明 id】，不能只写 binding 或省略 id：
+  //      省略 id 时 wrangler 只按「自动预配」推断绑定，只要配置与远端略有不同步
+  //      （或非交互式部署自动回答了「删除不在配置里的绑定」），绑定就会被丢掉，
+  //      线上立刻整站 503「No storage backend is available」——2026-10-08 踩过一次。
+  //      id 不是凭据（无密钥不可读写），换命名空间时改这里即可。
   //
-  //  "kv_namespaces": [{ "binding": "KV" }],
+  "kv_namespaces": [{ "binding": "KV", "id": "2df51e19a62c48c18706b2b8cc54ac20" }],
   //
   // ▶ 方案 B：D1（关系型，可与 Go 后端共享库；DB_FORMAT 建议改为 "sql"）
   //   控制台：Workers & Pages → D1 → 创建数据库 → 绑定到 Worker，变量名填 DB
