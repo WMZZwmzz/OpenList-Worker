@@ -877,6 +877,22 @@ export function isDbWriteBlocked(): boolean {
 }
 
 /**
+ * 本次读取是否「拿到密文却没能解开」：没有可用密钥，或密钥与封存时不一致。
+ *
+ * 为什么必须独立于 `dbTrusted`：写前守卫只拦**空壳**库，而「有密文但解不开」的库
+ * 带着完整的存储配置，不属于空壳。此时内存库是半成品 —— 敏感字段仍是 `enc:vN:`
+ * 原文，解密侧除了一句 warn 没有任何信号。放行写回的代价：这种半成品状态被持久化，
+ * 前端直接拿到密文（`JSON.parse` 报 `Unexpected token 'e'`，线上表现为「莫名登录
+ * 失败」），并且旧密钥封存的值不会被重新加密，迁移永远不会完成。
+ */
+let dbSealedReadUntrusted = false
+
+/** 本次读取是否因「有密文但密钥不可用/不匹配」而按不可信处理（此时禁止写回）。 */
+export function isDbSealedReadUntrusted(): boolean {
+  return dbSealedReadUntrusted
+}
+
+/**
  * 判断一份数据是否为「疑似空库/空壳」。
  *
  * 判定顺序：
@@ -1131,6 +1147,7 @@ export const __resetDbCacheForTest = () => {
   dbTrusted = false
   dbLastLoadError = null
   dbWriteBlocked = false
+  dbSealedReadUntrusted = false
   // 加密相关的缓存与一次性告警复位：
   // 用例可能先后使用不同密钥/不同 DB_CIPHER，缓存串味会让「首次告警」「换钥后
   // 可解」这类断言依赖执行顺序。
@@ -1206,8 +1223,16 @@ const loadDb = async (envCtx?: any) => {
       //   - 存在 enc:vN: 密文（旧部署 / 曾开启加密）→ 仍按前缀解密，
       //     因此「关掉加密」不会让既有数据读不出来。
       const hadSealed = hasSealedValues(persisted)
+      // 解密密钥链：当前密钥优先，历史密钥（ENCRYPTION_SECRET）兜底 ——
+      // 密钥来源换过的部署只有这样才读得出存量密文（见 getEncryptionKeyCandidates）。
+      const decryptChain = hadSealed
+        ? await resolveDecryptCipherChain(activeEnv)
+        : []
+      // 「关掉加密」的迁移提示只在真的解开了密文时才成立：拿不到密钥时下面会按
+      // 不可信处理并禁止写回，此时承诺「下次保存转明文」是误导。
       if (
         hadSealed &&
+        decryptChain.length > 0 &&
         readCipher(activeEnv) === "none" &&
         !plaintextMigrationLogged
       ) {
@@ -1218,18 +1243,32 @@ const loadDb = async (envCtx?: any) => {
             "no explicit step needed). Set DB_CIPHER to keep them encrypted.",
         )
       }
-      const fieldCipher = hadSealed
-        ? await resolveFieldCipher(activeEnv, { needDecrypt: true })
-        : null
-      await unsealDb(persisted, fieldCipher)
+      await unsealDb(persisted, decryptChain)
       memoryDb = persisted
       ensureDefaultSettings(memoryDb)
       ensureDefaultStorages(memoryDb)
       ensureDefaultShares(memoryDb)
       ensureDefaultPlugins(memoryDb)
       ensureDefaultMetas(memoryDb)
+      // 例外：仍有密文没解开 —— 没有可用密钥，或密钥与封存时不一致。内存库是
+      // 半成品（敏感字段还是 enc:vN: 原文）：此时不能标记可信，写前守卫会拒绝落盘。
+      // 缺这一步时线上只表现为「登录失败」和前端 not valid JSON，毫无线索，而且
+      // 旧密钥封存的值不会被重新加密，迁移永远无法完成。
+      if (hasSealedValues(memoryDb)) {
+        console.error(
+          "[DB] 库中存在未能解密的密文（字段加密密钥不可用，或与封存时不一致）——" +
+            "JWT_SECRET / ENCRYPTION_SECRET 都没读到匹配的那把，" +
+            "或在密钥解析前存储后端就不可用。本次读取按不可信处理并禁止写回。",
+        )
+        dbTrusted = false
+        dbSealedReadUntrusted = true
+        dbLastLoadError =
+          "sealed values present but encryption key unavailable; writes blocked"
+        return memoryDb
+      }
       // 读取成功：内存库与持久化存储一致，允许后续写回。
       dbTrusted = true
+      dbSealedReadUntrusted = false
       dbLastLoadError = null
       return memoryDb
     }
@@ -1475,6 +1514,45 @@ async function getEncryptionKey(envCtx?: any): Promise<string | null> {
     )
   }
   return null
+}
+
+/**
+ * **解密**用的候选密钥（按优先级）：主密钥（`JWT_SECRET` / 持久化共享密钥）→
+ * `ENCRYPTION_SECRET`。
+ *
+ * 为什么解密要允许多把：字段加密的密钥来源换过一次 —— 早期部署用
+ * `ENCRYPTION_SECRET` 封存，而 `getEncryptionKey` 只认 `JWT_SECRET` / 持久化密钥。
+ * 只拿一把会让存量密文全部解不开，表现为「登录失败」+ 网盘配置以 `enc:vN:` 原文漏到
+ * 前端（前端 `JSON.parse` 报 `Unexpected token 'e', "enc:v1:..." is not valid JSON`），
+ * 而错误只藏在一句 warn 里，极难定位。
+ *
+ * 加密固定只用第一把：任意一次正常写入都会把数据平滑迁移到新密钥，无需停机改密，
+ * 也不会出现两把钥匙来回覆盖。
+ */
+async function getEncryptionKeyCandidates(env: any): Promise<string[]> {
+  const keys: string[] = []
+  const push = (v: any) => {
+    if (typeof v === "string" && v.trim().length > 0 && !keys.includes(v))
+      keys.push(v)
+  }
+  push(await getEncryptionKey(env))
+  push(env?.ENCRYPTION_SECRET)
+  return keys
+}
+
+/**
+ * 读取路径的加解密器链（按优先级）。
+ *
+ * 与 `resolveFieldCipher` 的区别：这里不要求 `getEncryptionKey` 能拿到密钥 —— 只配了
+ * 历史密钥 `ENCRYPTION_SECRET` 的部署同样必须能解开存量密文，否则整个库读不出来。
+ * 写入算法不参与判断：解密由密文前缀驱动，链上第 0 个只是「当前写入密钥」的同义词。
+ */
+async function resolveDecryptCipherChain(env: any): Promise<FieldCipher[]> {
+  const cipher = readCipher(env)
+  const candidates = await getEncryptionKeyCandidates(env)
+  return Promise.all(
+    candidates.map((secret) => createFieldCipher(cipher, secret)),
+  )
 }
 
 /**
@@ -1751,11 +1829,11 @@ async function sealValue(
  */
 async function unsealValue(
   value: string,
-  fieldCipher: FieldCipher | null,
+  cipherChain: FieldCipher[],
   identity: string,
 ): Promise<string> {
   if (!value || !isSealedCiphertext(value)) return value
-  if (!fieldCipher) {
+  if (cipherChain.length === 0) {
     // 有密文但拿不到密钥：保持原值，绝不丢数据，但必须显式告警 ——
     // 否则表现为「密码/凭据看起来是乱码」而无任何线索。
     if (!unsealKeyWarned) {
@@ -1769,27 +1847,34 @@ async function unsealValue(
     return value
   }
   const hit = detectCipherPrefix(value)
-  try {
-    const plain = await fieldCipher.decrypt(value)
-    // 只有「密文算法 == 当前写入算法」时才记账：否则一旦复用就等于阻止了
-    // 「读到 v1 → 保存为 v2」这类自动迁移（那是必须发生的）。
-    if (hit && hit.cipher === fieldCipher.cipher) {
-      rememberSealed(
-        identity,
-        plain,
-        value,
-        fieldCipher.fingerprint,
-        hit.cipher,
-      )
+  let lastErr: any = null
+  for (let i = 0; i < cipherChain.length; i++) {
+    try {
+      const plain = await cipherChain[i].decrypt(value)
+      // 只有「用当前写入密钥解开」且「密文算法 == 当前写入算法」时才记账：
+      //   - 算法不同（读到 v1 → 保存为 v2）必须重新加密，记账会阻止该迁移；
+      //   - 用**历史密钥**解开的值同样不能记账，否则保存时会把旧密钥的密文原样
+      //     写回，「任意一次写入即迁移到新密钥」永远不发生。
+      if (i === 0 && hit && hit.cipher === cipherChain[0].cipher) {
+        rememberSealed(
+          identity,
+          plain,
+          value,
+          cipherChain[0].fingerprint,
+          hit.cipher,
+        )
+      }
+      return plain
+    } catch (e) {
+      lastErr = e
     }
-    return plain
-  } catch (e) {
-    console.warn(
-      "[DB] Failed to decrypt a sealed secret (wrong JWT_SECRET?):",
-      e,
-    )
-    return value // keep raw value, never lose data
   }
+  console.warn(
+    "[DB] Failed to decrypt a sealed secret (neither JWT_SECRET nor " +
+      "ENCRYPTION_SECRET matches):",
+    lastErr,
+  )
+  return value // keep raw value, never lose data
 }
 
 /**
@@ -1824,20 +1909,16 @@ function hasSealedValues(data: any): boolean {
 }
 
 /**
- * 依据 `DB_CIPHER` 与共享密钥构造字段加解密器（一次 save / load 复用一个实例）。
+ * 依据 `DB_CIPHER` 与共享密钥构造**写入**用的字段加解密器（一次 save 复用一个实例）。
  *
- * @param opts.needDecrypt 读取路径专用：即使当前 `DB_CIPHER=none`，只要数据里存在
- *        历史密文（`enc:vN:`）就仍然需要密钥去解开它 —— 这正是「关掉加密后旧数据
- *        依旧可读、并在下次保存时自动转为明文」所依赖的分支。
- *        此时返回的对象写入算法是 `none`（seal 侧本就不会调用它）。
- * @returns null 表示「不需要加密/解密」或「需要但拿不到密钥」。后者由调用方告警。
+ * 读取路径用 `resolveDecryptCipherChain`：解密由密文前缀驱动，且要支持历史密钥回退，
+ * 与「当前是否启用加密」无关。
+ *
+ * @returns null 表示「未启用加密」或「需要但拿不到密钥」。后者由调用方告警。
  */
-async function resolveFieldCipher(
-  env: any,
-  opts?: { needDecrypt?: boolean },
-): Promise<FieldCipher | null> {
+async function resolveFieldCipher(env: any): Promise<FieldCipher | null> {
   const cipher = readCipher(env)
-  if (cipher === "none" && !opts?.needDecrypt) return null
+  if (cipher === "none") return null
   const secret = await getEncryptionKey(env)
   if (!secret) return null
   return createFieldCipher(cipher, secret)
@@ -1946,9 +2027,9 @@ const UNSEAL_CONCURRENCY = 16
 
 async function unsealDb(
   data: any,
-  fieldCipher: FieldCipher | null,
+  cipherChain: FieldCipher[],
 ): Promise<void> {
-  if (!fieldCipher || !data) return
+  if (cipherChain.length === 0 || !data) return
 
   // 并行解密（带并发上限）：
   //
@@ -1972,7 +2053,7 @@ async function unsealDb(
       const sealedValue = target.addition
       const identity = `storages:${s.id ?? i}:addition`
       tasks.push(async () => {
-        target.addition = await unsealValue(sealedValue, fieldCipher, identity)
+        target.addition = await unsealValue(sealedValue, cipherChain, identity)
       })
     }
   }
@@ -1991,7 +2072,7 @@ async function unsealDb(
       const sealedValue = target.value
       const identity = `settings:${st.key}:value`
       tasks.push(async () => {
-        target.value = await unsealValue(sealedValue, fieldCipher, identity)
+        target.value = await unsealValue(sealedValue, cipherChain, identity)
       })
     }
   }
@@ -2007,7 +2088,7 @@ async function unsealDb(
       const sealedValue = target.otp_secret
       const identity = `users:${u.id ?? i}:otp_secret`
       tasks.push(async () => {
-        target.otp_secret = await unsealValue(sealedValue, fieldCipher, identity)
+        target.otp_secret = await unsealValue(sealedValue, cipherChain, identity)
       })
     }
     // 密码解密
@@ -2016,7 +2097,7 @@ async function unsealDb(
       const sealedValue = target.password
       const identity = `users:${u.id ?? i}:password`
       tasks.push(async () => {
-        target.password = await unsealValue(sealedValue, fieldCipher, identity)
+        target.password = await unsealValue(sealedValue, cipherChain, identity)
       })
     }
   }
@@ -2036,6 +2117,20 @@ export const saveDb = async (
   }
 
   const activeEnv = envCtx || globalEnvCtx
+
+  // 本次读取没能解开密文（密钥不可用 / 与封存时不一致）时禁止写回：内存库是半成品
+  // （敏感字段仍是 enc:vN: 原文），放行会把这种状态持久化，前端也会继续拿到密文 ——
+  // 线上表现就是「莫名登录失败」+ 配置乱码。
+  if (dbSealedReadUntrusted && !options?.force) {
+    dbWriteBlocked = true
+    console.error(
+      "[DB] saveDb BLOCKED: 本次读取存在未能解密的密文（字段加密密钥不可用，或与" +
+        "封存时不一致），写回会把半成品状态持久化。请先修好 JWT_SECRET / " +
+        "ENCRYPTION_SECRET / 存储后端绑定；确知后果时可用 " +
+        "saveDb(db, env, { force: true }) 强行写入。",
+    )
+    return false
+  }
 
   // ============ 写前守卫：永远不得以「空数据」覆盖持久化配置 ============
   //
@@ -2128,6 +2223,7 @@ export const saveDb = async (
   // 写入成功 = 存储中的内容与内存库一致，因此内存库现在可视为可信；
   // 这样同一 isolate 后续的写入不会被守卫误拦。
   dbTrusted = true
+  dbSealedReadUntrusted = false
   dbLastLoadError = null
   return true
 }

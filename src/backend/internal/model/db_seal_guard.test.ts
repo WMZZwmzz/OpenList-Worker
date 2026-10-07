@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 
 /**
- * 字段加密（enc:v1: 封套）安全回归测试。
+ * 字段加密（`enc:vN:` 封套）安全回归测试。
  *
  * 锁定两条线上事故的防护（2026-09-19：一次部署后 admin 登录失败、存储配置以
  * 密文形态漏到前端，报 `Unexpected token 'e', "enc:v1:b0c"... is not valid JSON`）：
@@ -13,6 +13,10 @@ import { test } from "node:test"
  *  2. **读到密文却没有密钥时禁止写回**：`dbTrusted=false` 只拦「空壳落盘」，
  *     带存储的正常载荷要靠 `isDbSealedReadUntrusted()` 单独拦，并且必须留下
  *     可诊断的日志 —— 否则线上只会表现为「莫名登录失败」。
+ *
+ * 加密自 `DB_CIPHER` 引入后是**可选**能力（缺省 none 即明文落盘），因此下面所有
+ * 「应当落盘为密文」的用例都必须显式开启；封套版本号随算法而变（aes-256-gcm →
+ * `enc:v2:`），断言只锁定「已封存」这个事实，不锁定具体版本号。
  */
 
 const mod = await import("./db")
@@ -29,10 +33,12 @@ const {
 
 const KEY = "seal-guard-test-secret-0123456789abcdef"
 const ADDITION = JSON.stringify({ cookie: "session-token", root_folder_id: "/1" })
+/** 任意 `enc:vN:` 封套（版本号随 DB_CIPHER 变化，断言不应写死 v1）。 */
+const SEALED = /^enc:v\d+:/
 
 /** 有密钥 / 无密钥两种 env。DB_DRIVER=memory 让密钥回退查询确定性地落空。 */
 const envWithKey = () =>
-  ({ DB_DRIVER: "memory", JWT_SECRET: KEY }) as any
+  ({ DB_DRIVER: "memory", JWT_SECRET: KEY, DB_CIPHER: "aes-256-gcm" }) as any
 const envNoKey = () => ({ DB_DRIVER: "memory" }) as any
 
 function fakeBackend(initial: any) {
@@ -66,8 +72,9 @@ test("sealDb 幂等：连续保存不会把封套再封一层", async () => {
   __resetDbCacheForTest()
   __setStoreBackendLoaderForTest(async () => backend)
   assert.equal(await saveDb(payload(), envWithKey(), { force: true }), true)
-  assert.ok(
-    String(peek().storages[0].addition).startsWith("enc:v1:"),
+  assert.match(
+    String(peek().storages[0].addition),
+    SEALED,
     "首次保存应把 addition 加密落盘",
   )
 
@@ -98,16 +105,24 @@ test("双钥解密：旧密钥封存的数据可读，写入后自动迁移到�
   __resetDbCacheForTest()
   __setStoreBackendLoaderForTest(async () => backend)
   assert.equal(
-    await saveDb(payload(), { JWT_SECRET: LEGACY } as any, { force: true }),
+    await saveDb(
+      payload(),
+      { JWT_SECRET: LEGACY, DB_CIPHER: "aes-256-gcm" } as any,
+      { force: true },
+    ),
     true,
   )
   const sealed = String(peek().storages[0].addition)
-  assert.ok(sealed.startsWith("enc:v1:"), "前置条件：已用旧密钥封存")
+  assert.match(sealed, SEALED, "前置条件：已用旧密钥封存")
 
   // 2. 新密钥 + 保留旧密钥：必须能解开（否则线上就是「登录失败 + 密文漏给前端」）
   __resetDbCacheForTest()
   __setStoreBackendLoaderForTest(async () => backend)
-  const mixedEnv = { JWT_SECRET: NEW, ENCRYPTION_SECRET: LEGACY } as any
+  const mixedEnv = {
+    JWT_SECRET: NEW,
+    ENCRYPTION_SECRET: LEGACY,
+    DB_CIPHER: "aes-256-gcm",
+  } as any
   const loaded = await getDb(mixedEnv)
   assert.equal(loaded.storages[0].addition, ADDITION, "旧密钥封存的值应被回退解密")
 
@@ -122,7 +137,10 @@ test("双钥解密：旧密钥封存的数据可读，写入后自动迁移到�
   // 4. 只配新密钥的实例也必须能解开，说明迁移完成
   __resetDbCacheForTest()
   __setStoreBackendLoaderForTest(async () => backend)
-  const migrated = await getDb({ JWT_SECRET: NEW } as any)
+  const migrated = await getDb({
+    JWT_SECRET: NEW,
+    DB_CIPHER: "aes-256-gcm",
+  } as any)
   assert.equal(
     migrated.storages[0].addition,
     ADDITION,
@@ -137,9 +155,10 @@ test("读到密文却无密钥：标记不可信、禁止写回并留下诊断�
   __setStoreBackendLoaderForTest(async () => first.backend)
   assert.equal(await saveDb(payload(), envWithKey(), { force: true }), true)
   const sealedRaw = JSON.parse(JSON.stringify(first.peek()))
-  assert.ok(
-    String(sealedRaw.storages[0].addition).startsWith("enc:v1:"),
-    "前置条件：库里应有 enc:v1: 封套",
+  assert.match(
+    String(sealedRaw.storages[0].addition),
+    SEALED,
+    "前置条件：库里应有 enc:vN: 封套",
   )
 
   // 换一个「没有 JWT_SECRET」的 isolate 读同一份密文
@@ -149,8 +168,9 @@ test("读到密文却无密钥：标记不可信、禁止写回并留下诊断�
   const env = envNoKey()
   const loaded = await getDb(env)
 
-  assert.ok(
-    String(loaded.storages[0].addition).startsWith("enc:v1:"),
+  assert.match(
+    String(loaded.storages[0].addition),
+    SEALED,
     "无密钥时读到的仍是未解密密文",
   )
   assert.equal(isDbTrusted(), false, "未解密状态不得标记可信")
