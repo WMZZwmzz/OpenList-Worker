@@ -2,6 +2,13 @@ import { Hono, type Context } from "hono"
 import { sign, verify } from "hono/jwt"
 import { getDb, saveDb } from "../internal/model/db"
 import {
+  findUserByTokenPayload,
+  JWT_ISSUER,
+  JWT_AUDIENCE,
+  jwtClaimsAcceptable,
+} from "../pkg/permission"
+import { clientIpFromContext } from "../pkg/client-ip"
+import {
   getJwtSecret,
   getUserFromContext,
   revokeToken,
@@ -11,6 +18,7 @@ import {
 import {
   generateTotpSecret,
   generateTotpCode,
+  generateBackupCodes,
   verifyTotpCode,
   buildOtpauthUrl,
   buildQrImageUrl,
@@ -26,6 +34,7 @@ import {
   generateSalt,
   setUserPassword,
   isHex64,
+  constantTimeEqualHex,
 } from "../pkg/password"
 import { setCSRFToken, clearCSRFToken } from "../pkg/csrf"
 import { getAuditLogger } from "../pkg/audit"
@@ -47,13 +56,12 @@ const loginFailures = new Map<
   { count: number; lockedUntil: number; attempts: number }
 >()
 
+/**
+ * 登录锁定用的客户端地址。统一走 clientIpFromContext：只有 Cloudflare 的
+ * request.cf.clientIp，或显式 TRUST_PROXY_HEADERS=1 时才采信代理头。
+ */
 function clientIpOf(c: Context): string {
-  return (
-    c.req.header("CF-Connecting-IP") ||
-    c.req.header("x-real-ip") ||
-    c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ||
-    "unknown"
-  )
+  return clientIpFromContext(c)
 }
 
 function loginKey(c: Context, username: string): string {
@@ -275,9 +283,9 @@ export async function verifyUserStaticHash(
   if (!stored || !isHex64(input) || !isHex64(stored)) return false
   if (user?.salt) {
     const expect = (await saltedHash(input, String(user.salt))).toLowerCase()
-    return stored === expect
+    return constantTimeEqualHex(stored, expect)
   }
-  return stored === input
+  return constantTimeEqualHex(stored, input)
 }
 
 /**
@@ -422,20 +430,78 @@ export async function authUserFromReq(
   try {
     const secret = await getJwtSecret(c)
     const payload = await verify(token, secret, "HS256")
+    if (!jwtClaimsAcceptable(payload)) return null
     if (await isTokenRevoked(payload?.jti as string, c.env)) return null
     const db = await getDb(c.env)
     if (!db.users) db.users = []
-    const user = db.users.find(
-      (u: any) => u.id === payload.id || u.username === payload.username,
-    )
-    if (!user) return null
+    const user = findUserByTokenPayload(db.users, payload)
+    // 被禁用（或删除）的账号必须立即失效：这里曾是 WebDAV / S3 / me / 2FA /
+    // sshkey 唯一的身份来源，漏判 disabled 会让封禁对已签发 token 无效。
+    if (!user || user.disabled) return null
     return { db, user }
   } catch {
     return null
   }
 }
 
-async function checkUserOtp(matchedUser: any, body: any) {
+/**
+ * TOTP 重放防护：verifyTotpCode 带 ±1 窗口（约 60~90s 内同一枚码都算有效），
+ * 因此一枚码可被重复使用。这里记录「已消费」的码并在窗口期内拒绝第二次。
+ */
+const usedTotpCodes = new Map<string, number>()
+const TOTP_CODE_TTL_MS = 90 * 1000
+
+function consumeTotpCode(userId: any, code: string): boolean {
+  const now = Date.now()
+  const key = `${userId}:${code}`
+  const seenAt = usedTotpCodes.get(key)
+  if (seenAt !== undefined && now - seenAt < TOTP_CODE_TTL_MS) return false
+  if (usedTotpCodes.size > 4096) {
+    for (const [k, t] of usedTotpCodes) {
+      if (now - t >= TOTP_CODE_TTL_MS) usedTotpCodes.delete(k)
+    }
+  }
+  usedTotpCodes.set(key, now)
+  return true
+}
+
+/**
+ * 备用恢复码：命中即作废（单次使用），存储的是哈希值。
+ * 返回 true 表示本次登录用掉了一个恢复码。
+ */
+async function tryConsumeBackupCode(
+  matchedUser: any,
+  input: string,
+  db: any,
+  c: any,
+): Promise<boolean> {
+  const stored = matchedUser.otp_backup_codes
+  if (!Array.isArray(stored) || stored.length === 0) return false
+  const normalized = input.trim().toUpperCase().replace(/\s/g, "")
+  if (!normalized) return false
+  const hashed = await staticHash(normalized)
+  const idx = stored.findIndex(
+    (item: string) =>
+      typeof item === "string" && constantTimeEqualHex(item, hashed),
+  )
+  if (idx < 0) return false
+  stored.splice(idx, 1)
+  matchedUser.otp_backup_codes = stored
+  try {
+    // 直接用登录流程已持有的那份 db：重新 getDb 可能取到另一个对象，
+    // 作废就会写不到正在被持久化的实例上，同一枚恢复码便可用两次。
+    const target = (db?.users || []).find((u: any) => u.id === matchedUser.id)
+    if (target) {
+      target.otp_backup_codes = stored
+      await saveDb(db, c.env)
+    }
+  } catch (e: any) {
+    console.warn("[Auth] 恢复码作废写入失败:", e?.message || e)
+  }
+  return true
+}
+
+async function checkUserOtp(matchedUser: any, body: any, c: any, db: any) {
   if (!matchedUser.otp_secret) {
     return { ok: true, code: 200, httpStatus: 200 as const, message: "ok" }
   }
@@ -450,12 +516,51 @@ async function checkUserOtp(matchedUser: any, body: any) {
   }
   const valid = await verifyTotpCode(matchedUser.otp_secret, otpCode)
   if (!valid) {
+    // 验证器不在手边时用恢复码登录：命中即作废（单次使用）
+    if (await tryConsumeBackupCode(matchedUser, otpCode, db, c)) {
+      return {
+        ok: true,
+        code: 200,
+        httpStatus: 200 as const,
+        message: "ok (backup code)",
+      }
+    }
     return {
       ok: false,
       code: 401,
       httpStatus: 401 as const,
       message: "Invalid OTP code",
     }
+  }
+  if (!consumeTotpCode(matchedUser.id, otpCode)) {
+    return {
+      ok: false,
+      code: 401,
+      httpStatus: 401 as const,
+      message: "OTP code already used",
+    }
+  }
+  // 跨 isolate / 冷启动的重放：内存 Map 不共享，必须把「最后一次消费的码」
+  // 落到共享 DB。同一枚码在 TOTP 有效窗口内第二次出现一律拒绝。
+  const now = Date.now()
+  const lastAt = Number(matchedUser.otp_last_at || 0)
+  if (
+    matchedUser.otp_last_code === otpCode &&
+    now - lastAt < TOTP_CODE_TTL_MS
+  ) {
+    return {
+      ok: false,
+      code: 401,
+      httpStatus: 401 as const,
+      message: "OTP code already used",
+    }
+  }
+  matchedUser.otp_last_code = otpCode
+  matchedUser.otp_last_at = now
+  try {
+    await saveDb(db, c.env)
+  } catch (e: any) {
+    console.warn("[Auth] 记录 TOTP 消费状态失败:", e?.message || e)
   }
   return { ok: true, code: 200, httpStatus: 200 as const, message: "ok" }
 }
@@ -500,8 +605,12 @@ authRouter.post("/login", async (c) => {
         await saveDb(db, c.env)
       }
 
-      const otpCheck = await checkUserOtp(matchedUser, body)
+      const otpCheck = await checkUserOtp(matchedUser, body, c, db)
       if (!otpCheck.ok) {
+        // 二次验证失败同样计入锁定：密码已泄露的攻击者若能无限试碰 6 位 TOTP 码，
+        // 2FA 就形同虚设（/login 与 /login/hash 两条路径都要盖到）。
+        await getAuditLogger().logLoginFailure(c, username, "Invalid OTP code")
+        await recordLoginFailure(c, username, c.env)
         return c.json(
           { code: otpCheck.code, message: otpCheck.message, data: null },
           otpCheck.httpStatus,
@@ -514,6 +623,8 @@ authRouter.post("/login", async (c) => {
         id: matchedUser.id,
         username: matchedUser.username,
         role: matchedUser.role,
+        iss: JWT_ISSUER,
+        aud: JWT_AUDIENCE,
         exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 7,
         jti: generateJti(),
       }
@@ -583,8 +694,12 @@ authRouter.post("/login/hash", async (c) => {
         await saveDb(db, c.env)
       }
 
-      const otpCheck = await checkUserOtp(matchedUser, body)
+      const otpCheck = await checkUserOtp(matchedUser, body, c, db)
       if (!otpCheck.ok) {
+        // 二次验证失败同样计入锁定：密码已泄露的攻击者若能无限试碰 6 位 TOTP 码，
+        // 2FA 就形同虚设（/login 与 /login/hash 两条路径都要盖到）。
+        await getAuditLogger().logLoginFailure(c, username, "Invalid OTP code")
+        await recordLoginFailure(c, username, c.env)
         return c.json(
           { code: otpCheck.code, message: otpCheck.message, data: null },
           otpCheck.httpStatus,
@@ -597,6 +712,8 @@ authRouter.post("/login/hash", async (c) => {
         id: matchedUser.id,
         username: matchedUser.username,
         role: matchedUser.role,
+        iss: JWT_ISSUER,
+        aud: JWT_AUDIENCE,
         exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 7,
         jti: generateJti(),
       }
@@ -650,6 +767,18 @@ export const meUpdateHandler = async (c: any) => {
   }
 
   if (body.password && body.password.trim() !== "") {
+    // 改密必须证明持有旧口令：否则一次 token 泄露（日志、Referer、被 XSS 偷走）
+    // 就直接变成账号接管，而且用户无法察觉旧口令仍可用。
+    // 尚未设置口令的账号（安装初始 / SSO 预建）允许首次直接设置。
+    if (user.password) {
+      const oldPassword = String(body.old_password ?? "")
+      if (!(await verifyUserPassword(user, oldPassword))) {
+        return c.json(
+          { code: 403, message: "Incorrect original password", data: null },
+          403,
+        )
+      }
+    }
     await setUserPassword(user, body.password.trim())
   }
 
@@ -789,13 +918,35 @@ authRouter.post("/2fa/verify", async (c) => {
       400,
     )
   }
+  // 开启 2FA 属于敏感状态变更，需要一次口令复核：token 被偷的攻击者否则可以
+  // 静默绑定一个自己生成的 TOTP secret，把账号变成「他知道二次因子」的状态。
+  if (user.password) {
+    const password = String(body.password ?? "")
+    if (!(await verifyUserPassword(user, password))) {
+      return c.json(
+        { code: 403, message: "Incorrect password", data: null },
+        403,
+      )
+    }
+  }
   const valid = await verifyTotpCode(secret, code)
   if (!valid) {
     return c.json({ code: 400, message: "Invalid code", data: null }, 400)
   }
   user.otp_secret = secret.toUpperCase()
+  // 恢复码：仅在开启 2FA 时明文返回一次，库内只存哈希，登录时单次消费。
+  const backupCodes = generateBackupCodes(10)
+  user.otp_backup_codes = await Promise.all(
+    backupCodes.map((code) =>
+      staticHash(code.trim().toUpperCase().replace(/\s/g, "")),
+    ),
+  )
   await saveDb(db, c.env)
-  return c.json({ code: 200, message: "success", data: null })
+  return c.json({
+    code: 200,
+    message: "success",
+    data: { backup_codes: backupCodes },
+  })
 })
 
 // Current user SSH Key sub-routes (/api/me/sshkey/*)

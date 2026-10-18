@@ -1,6 +1,7 @@
 import { getDb } from "../internal/model/db"
 import { getJwtSecret } from "../server/middlewares"
 import { hmacSha256 } from "./crypto"
+import { canonicalVirtualPath } from "./path"
 import { getEnableSign } from "../internal/driver/storageopts"
 
 /**
@@ -14,8 +15,8 @@ import { getEnableSign } from "../internal/driver/storageopts"
  *
  * 签名格式：`${expires}.${hmacSha256(virtualPath:expires, secret)}`；
  * `expires === 0` 表示永不过期，验签时不做超期判定（对齐 Go pkg/sign 的
- * `expires != 0` 分支）。secret 复用 getJwtSecret（env.JWT_SECRET → KV/D1
- * 持久化随机 → 进程内随机），与 JWT 同源但用途独立，无需额外配置。
+ * `expires != 0` 分支）。密钥由 getJwtSecret（env.JWT_SECRET → KV/D1 持久化随机
+ * → 进程内随机）派生的专用子密钥，不再与 JWT 直接共用同一字符串，无需额外配置。
  *
  * 与 Go 的差异（有意保留，不影响判签结果）：Go 用 `base64url(hmac) + ":" +
  * expire`，这里用 `expire + "." + hex(hmac)`，两种实现的签名不互通。
@@ -59,9 +60,16 @@ export async function getSignPolicy(c: any): Promise<SignPolicy> {
   }
 }
 
-/** 规范化路径（对齐 Go utils.FixAndCleanPath） */
+/**
+ * 规范化路径（在 Go utils.FixAndCleanPath 的合并斜杠语义之上，额外做与
+ * resolvePath 同源的「多重解码 + `..` 折叠」）。
+ *
+ * meta 覆盖判定用的是字符串比较，而真正定位存储时 resolvePath 会先解码再折叠：
+ * 不同源就会出现 `/public/../secret/x.txt` 被判成「不在 meta 保护区内」（免签名），
+ * 实际却读到 `/secret/x.txt`。
+ */
 function fixAndCleanPath(p: string): string {
-  return "/" + String(p || "").split("/").filter(Boolean).join("/")
+  return canonicalVirtualPath(p)
 }
 
 /**
@@ -135,10 +143,7 @@ export async function isStorageSignEnabled(
  *
  * Go 的 isEncrypt 判定顺序为：存储级 EnableSign → meta 密码 → 其余 false。
  */
-export async function isEncryptPath(
-  c: any,
-  reqPath: string,
-): Promise<boolean> {
+export async function isEncryptPath(c: any, reqPath: string): Promise<boolean> {
   // 对齐 Go：存储级 EnableSign 优先于 meta 密码分支
   if (await isStorageSignEnabled(c, reqPath)) return true
   const meta = await getNearestMeta(c, reqPath)
@@ -157,12 +162,29 @@ export async function isEncryptPath(
  *   - meta 设了密码且覆盖该路径  → 需要签名
  *   - 否则                       → 无需签名，直接公开访问
  */
+/**
+ * meta 用 read_users 限定了可读用户但没有密码。Go 的 isEncrypt 不看这一项，
+ * 于是这类路径的直链是公开的；本项目在 /fs/list、/fs/get 签发签名时已经按
+ * canAccess 校验过请求者，所以把这类路径也纳入「必须签名」，read_users 才能
+ * 真正约束住公开下载端点。
+ */
+async function isReadUsersRestricted(
+  c: any,
+  reqPath: string,
+): Promise<boolean> {
+  const meta = await getNearestMeta(c, reqPath)
+  if (!meta || !Array.isArray(meta.read_users) || meta.read_users.length === 0)
+    return false
+  return metaCoversPath(meta.path, reqPath, !!meta.r_sub)
+}
+
 export async function needDownloadSign(
   c: any,
   reqPath: string,
 ): Promise<boolean> {
   const policy = await getSignPolicy(c)
   if (policy.enabled) return true
+  if (await isReadUsersRestricted(c, reqPath)) return true
   return await isEncryptPath(c, reqPath)
 }
 
@@ -188,6 +210,16 @@ export async function getSignExpiresIn(c: any): Promise<number> {
 }
 
 /**
+ * 下载签名专用子密钥：由 JWT 签名密钥派生，但不直接复用同一字符串。
+ * 一把密钥同时用于「会话 JWT」和「下载链接签名」时，任何一侧的签名 oracle
+ * 都可能被拿去伪造另一侧的凭证。
+ */
+async function getDownloadSignKey(c: any): Promise<string> {
+  const jwtSecret = await getJwtSecret(c)
+  return hmacSha256("openlist-download-sign-v1", jwtSecret)
+}
+
+/**
  * 签发下载签名。
  *
  * `expiresIn === 0` 表示**永不过期**（对齐 Go sign.NotExpired 的 expire=0），
@@ -198,10 +230,13 @@ export async function signDownloadPath(
   virtualPath: string,
   expiresIn: number,
 ): Promise<string> {
-  const secret = await getJwtSecret(c)
+  const secret = await getDownloadSignKey(c)
   const expires =
     expiresIn === 0 ? 0 : Math.floor(Date.now() / 1000) + expiresIn
-  const hmac = await hmacSha256(`${virtualPath}:${expires}`, secret)
+  const hmac = await hmacSha256(
+    `${canonicalVirtualPath(virtualPath)}:${expires}`,
+    secret,
+  )
   return `${expires}.${hmac}`
 }
 
@@ -219,7 +254,10 @@ export async function verifyDownloadSign(
   if (expires !== 0 && expires <= Math.floor(Date.now() / 1000)) {
     return false
   }
-  const secret = await getJwtSecret(c)
-  const expect = await hmacSha256(`${virtualPath}:${expires}`, secret)
+  const secret = await getDownloadSignKey(c)
+  const expect = await hmacSha256(
+    `${canonicalVirtualPath(virtualPath)}:${expires}`,
+    secret,
+  )
   return constantTimeEqualHex(expect, hmac)
 }

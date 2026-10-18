@@ -1,7 +1,7 @@
 /**
  * 审计日志模块 (Audit Log)
  * 添加日期: 2026-09-05
- * 
+ *
  * 记录所有敏感操作，用于安全审计和合规性
  * 支持：
  * - 用户认证事件（登录、登出、失败）
@@ -11,14 +11,16 @@
  */
 
 import type { Context } from "hono"
+import { sanitizeData, sanitizeLine } from "./secure-log"
+import { clientIpFromContext } from "./client-ip"
 
 /**
  * 审计日志级别
  */
 export enum AuditLevel {
-  INFO = "info",      // 一般信息（查看文件、下载）
-  WARN = "warn",      // 警告（登录失败、权限不足）
-  ERROR = "error",    // 错误（系统异常）
+  INFO = "info", // 一般信息（查看文件、下载）
+  WARN = "warn", // 警告（登录失败、权限不足）
+  ERROR = "error", // 错误（系统异常）
   CRITICAL = "critical", // 严重（数据删除、权限变更）
 }
 
@@ -26,13 +28,13 @@ export enum AuditLevel {
  * 审计日志类别
  */
 export enum AuditCategory {
-  AUTH = "auth",           // 认证相关
-  USER = "user",           // 用户管理
-  FILE = "file",           // 文件操作
-  SHARE = "share",         // 分享操作
-  CONFIG = "config",       // 配置变更
+  AUTH = "auth", // 认证相关
+  USER = "user", // 用户管理
+  FILE = "file", // 文件操作
+  SHARE = "share", // 分享操作
+  CONFIG = "config", // 配置变更
   PERMISSION = "permission", // 权限变更
-  SYSTEM = "system",       // 系统操作
+  SYSTEM = "system", // 系统操作
 }
 
 /**
@@ -44,22 +46,22 @@ export interface AuditLogEntry {
   level: AuditLevel
   category: AuditCategory
   action: string // 具体操作（如 "login", "delete_file", "update_permission"）
-  
+
   // 用户信息
   user_id?: string
   username?: string
   ip_address?: string
   user_agent?: string
-  
+
   // 操作目标
   resource_type?: string // 如 "file", "user", "config"
   resource_id?: string
   resource_name?: string
-  
+
   // 详细信息
   message: string
   details?: Record<string, any> // 附加数据
-  
+
   // 结果
   success: boolean
   error_message?: string
@@ -109,10 +111,7 @@ function extractUserInfo(c: Context): {
   user_agent?: string
 } {
   const user = (c as any).get?.("user") // JWT payload
-  const ip = c.req.header("cf-connecting-ip") || 
-             c.req.header("x-forwarded-for") || 
-             c.req.header("x-real-ip") || 
-             "unknown"
+  const ip = clientIpFromContext(c)
   const userAgent = c.req.header("user-agent") || "unknown"
 
   return {
@@ -167,6 +166,15 @@ export class AuditLogger {
       resource_name: options.resource_name,
       details: options.details,
       error_message: options.error_message,
+    }
+
+    // 用户名、资源名、UA、错误文本都是用户可控输入：带 `%0A` 就能伪造出一条
+    // 完整审计记录（无论最终落内存还是落日志文件）。入库前统一压平成单行。
+    for (const [key, value] of Object.entries(entry)) {
+      if (typeof value === "string") (entry as any)[key] = sanitizeLine(value)
+    }
+    if (entry.details && typeof entry.details === "object") {
+      entry.details = sanitizeData(entry.details)
     }
 
     try {
@@ -406,7 +414,8 @@ export class InMemoryAuditLogStorage implements AuditLogStorage {
 
     // 排序（最新的在前）
     results = results.sort(
-      (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
+      (a, b) =>
+        new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
     )
 
     // 分页
@@ -416,7 +425,10 @@ export class InMemoryAuditLogStorage implements AuditLogStorage {
   }
 
   async count(filters: AuditLogQueryFilters): Promise<number> {
-    const results = await this.query({ ...filters, limit: Number.MAX_SAFE_INTEGER })
+    const results = await this.query({
+      ...filters,
+      limit: Number.MAX_SAFE_INTEGER,
+    })
     return results.length
   }
 
@@ -432,14 +444,23 @@ export class InMemoryAuditLogStorage implements AuditLogStorage {
 export class ConsoleAuditLogStorage implements AuditLogStorage {
   async write(entry: AuditLogEntry): Promise<void> {
     const level = entry.level.toUpperCase()
-    const msg = `[AUDIT][${level}][${entry.category}] ${entry.action}: ${entry.message}`
-    
-    if (entry.level === AuditLevel.ERROR || entry.level === AuditLevel.CRITICAL) {
-      console.error(msg, entry)
+    // 审计文本里含用户名 / 路径等用户可控输入：先去控制字符再落日志，
+    // 否则 `%0A` 可伪造整行审计记录；entry 走脱敏副本，避免把 token / 口令
+    // 之类原样打进日志。
+    const msg = sanitizeLine(
+      `[AUDIT][${level}][${entry.category}] ${entry.action}: ${entry.message}`,
+    )
+    const safeEntry = sanitizeData(entry)
+
+    if (
+      entry.level === AuditLevel.ERROR ||
+      entry.level === AuditLevel.CRITICAL
+    ) {
+      console.error(msg, safeEntry)
     } else if (entry.level === AuditLevel.WARN) {
-      console.warn(msg, entry)
+      console.warn(msg, safeEntry)
     } else {
-      console.log(msg, entry)
+      console.log(msg, safeEntry)
     }
   }
 

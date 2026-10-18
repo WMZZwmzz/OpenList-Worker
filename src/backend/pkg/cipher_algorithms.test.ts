@@ -74,7 +74,10 @@ test("ChaCha20-Poly1305 与 Node 原生实现互操作，且拒绝被篡改的�
     authTagLength: 16,
   })
   decipher.setAuthTag(tag)
-  const nodePlain = Buffer.concat([decipher.update(ciphertext), decipher.final()])
+  const nodePlain = Buffer.concat([
+    decipher.update(ciphertext),
+    decipher.final(),
+  ])
   assert.equal(nodePlain.toString("utf8"), "openlist-config-secret-value")
 
   // Node 原生 → 本实现解密
@@ -125,7 +128,9 @@ test("单 DES（8 字节密钥）与 OpenSSL EDE(K,K,K) 完全一致", () => {
   assert.equal(hex(mine), hex(nodeDes3Encrypt(triple, PLAIN)))
   // 反向：OpenSSL 加密 → 本实现解密
   assert.equal(
-    new TextDecoder().decode(desCbcDecrypt(nodeDes3Encrypt(triple, PLAIN), key8, IV8)),
+    new TextDecoder().decode(
+      desCbcDecrypt(nodeDes3Encrypt(triple, PLAIN), key8, IV8),
+    ),
     new TextDecoder().decode(PLAIN),
   )
 })

@@ -16,7 +16,7 @@ const ADMIN_TOKEN = "ADMIN_STATIC_TOKEN"
 const seed = () =>
   saveDb(
     {
-      settings: [{ key: "token", value: ADMIN_TOKEN }],
+      settings: [{ key: "api_token", value: ADMIN_TOKEN }],
       users: [
         {
           id: 1,

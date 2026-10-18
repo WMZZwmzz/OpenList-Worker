@@ -14,6 +14,43 @@ const DefaultNameXPath = "@href"
 const DefaultSizeXPath = "string(following-sibling::text()[1])"
 const DefaultModifiedXPath = "string(following-sibling::text()[2])"
 const FETCH_TIMEOUT_MS = 30_000
+/** 单次目录列表允许的最大字节数（远端 HTML 体积不可控） */
+const MAX_LISTING_BYTES = 4 * 1024 * 1024
+
+/** 流式读取文本并在超过上限时立即中止，避免先整份进内存再判大小。 */
+async function readTextLimited(
+  res: Response,
+  maxBytes: number,
+): Promise<string> {
+  const declared = Number(res.headers.get("content-length") || "0")
+  if (declared > maxBytes) {
+    throw new Error(
+      `autoindex listing too large (${declared} bytes, limit ${maxBytes})`,
+    )
+  }
+  const reader = res.body?.getReader()
+  if (!reader) return ""
+  const decoder = new TextDecoder()
+  let total = 0
+  let out = ""
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    if (!value?.length) continue
+    total += value.byteLength
+    if (total > maxBytes) {
+      try {
+        await reader.cancel()
+      } catch {}
+      throw new Error(
+        `autoindex listing too large (>${maxBytes} bytes, limit ${maxBytes})`,
+      )
+    }
+    out += decoder.decode(value, { stream: true })
+  }
+  out += decoder.decode()
+  return out
+}
 
 export function normalizeAutoIndexAddition(a: any): AutoIndexAddition {
   const norm = { ...(a || {}) } as any
@@ -60,7 +97,16 @@ export class AutoIndexDriver implements StorageDriver {
   }
 
   private nodeToFileItem(node: AutoIndexNode, baseURL: string): FileItem {
-    const fullURL = new URL(node.url, baseURL).toString()
+    // href 完全由远端目录页控制：只接受与挂载点同源的链接。跨源 href 可能被
+    // 用来把浏览器引向内网/元数据（或任意外部地址），不能原样放进 raw_url。
+    let safeRawUrl = ""
+    try {
+      const resolved = new URL(node.url, baseURL)
+      const base = new URL(baseURL)
+      if (resolved.origin === base.origin) safeRawUrl = resolved.toString()
+    } catch {
+      safeRawUrl = ""
+    }
     const isDir = node.isDir
     return {
       name: node.name,
@@ -73,7 +119,7 @@ export class AutoIndexDriver implements StorageDriver {
       // ?sign=http://... 导致签名校验 401。直链走 raw_url。
       sign: "",
       type: calcFileType(node.name, isDir),
-      raw_url: isDir ? "" : fullURL,
+      raw_url: isDir ? "" : safeRawUrl,
     }
   }
 
@@ -88,7 +134,10 @@ export class AutoIndexDriver implements StorageDriver {
     if (!res.ok) {
       throw new Error(`Failed to fetch ${baseURL}: HTTP ${res.status}`)
     }
-    const html = await res.text()
+    // 目录列表大小必须有上限：远端返回几百 MB 的 HTML 时，res.text() 会把整个
+    // isolate 的内存吃光（超时只挡慢连接，挡不住大体积）。流式计数，超限即停。
+    const listing = await readTextLimited(res, MAX_LISTING_BYTES)
+    const html = listing
 
     const nodes = parseAutoIndexHTML(
       html,

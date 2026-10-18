@@ -25,8 +25,16 @@ export interface ZipArchive {
   entries: ZipEntry[]
 }
 
+/** 条目数量上限：中央目录完全由归档作者控制，避免海量条目拖垮解析/解压。 */
+export const MAX_ZIP_ENTRIES = 10_000
+/** 单条目解压上限（默认 64 MiB，可被调用方收紧）。 */
+export const MAX_ZIP_ENTRY_BYTES = 64 * 1024 * 1024
+
 /** 解析 ZIP 的中央目录，返回条目列表（不包含目录条目，只返回文件） */
-export function parseZip(buffer: ArrayBuffer): ZipArchive {
+export function parseZip(
+  buffer: ArrayBuffer,
+  maxEntries: number = MAX_ZIP_ENTRIES,
+): ZipArchive {
   const view = new DataView(buffer)
   const length = buffer.byteLength
 
@@ -49,6 +57,9 @@ export function parseZip(buffer: ArrayBuffer): ZipArchive {
   const entries: ZipEntry[] = []
   let currentCdOffset = cdOffset
   for (let i = 0; i < cdCount; i++) {
+    if (entries.length >= maxEntries) {
+      throw new Error(`ZIP has too many entries (limit ${maxEntries})`)
+    }
     if (view.getUint32(currentCdOffset, true) !== 0x02014b50) break
 
     const compressionMethod = view.getUint16(currentCdOffset + 10, true)
@@ -97,10 +108,11 @@ export function parseZip(buffer: ArrayBuffer): ZipArchive {
   return { entries }
 }
 
-/** 解压单个条目，返回其内容 */
+/** 解压单个条目，返回其内容；超过 maxBytes 时中止，避免 zip bomb 撑爆内存。 */
 export async function extractZipEntry(
   buffer: ArrayBuffer,
   entry: ZipEntry,
+  maxBytes: number = MAX_ZIP_ENTRY_BYTES,
 ): Promise<Uint8Array> {
   const compressed = new Uint8Array(
     buffer,
@@ -110,6 +122,11 @@ export async function extractZipEntry(
 
   if (entry.compressionMethod === 0) {
     // Store（未压缩）
+    if (compressed.byteLength > maxBytes) {
+      throw new Error(
+        `ZIP entry exceeds the ${maxBytes}-byte extraction limit: ${entry.name}`,
+      )
+    }
     return new Uint8Array(compressed)
   }
 
@@ -122,8 +139,31 @@ export async function extractZipEntry(
     const writer = ds.writable.getWriter()
     writer.write(compressed)
     writer.close()
-    const out = await new Response(ds.readable).arrayBuffer()
-    return new Uint8Array(out)
+    const reader = ds.readable.getReader()
+    const chunks: Uint8Array[] = []
+    let total = 0
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (!value?.length) continue
+      total += value.byteLength
+      if (total > maxBytes) {
+        try {
+          await reader.cancel()
+        } catch {}
+        throw new Error(
+          `ZIP entry exceeds the ${maxBytes}-byte extraction limit: ${entry.name}`,
+        )
+      }
+      chunks.push(value)
+    }
+    const out = new Uint8Array(total)
+    let offset = 0
+    for (const chunk of chunks) {
+      out.set(chunk, offset)
+      offset += chunk.byteLength
+    }
+    return out
   }
 
   throw new Error(

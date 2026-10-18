@@ -42,9 +42,7 @@ export async function getNearestMeta(
 
   const cleanPath = fixAndCleanPath(path)
   // 直接匹配
-  const exact = metas.find(
-    (m: Meta) => fixAndCleanPath(m.path) === cleanPath,
-  )
+  const exact = metas.find((m: Meta) => fixAndCleanPath(m.path) === cleanPath)
   if (exact) return exact
 
   // 向上递归查找祖先
@@ -80,10 +78,7 @@ export function metaCoversPath(
 }
 
 function fixAndCleanPath(p: string): string {
-  const normalized = (p || "/")
-    .replace(/\\/g, "/")
-    .replace(/\/+/g, "/")
-    .trim()
+  const normalized = (p || "/").replace(/\\/g, "/").replace(/\/+/g, "/").trim()
   if (normalized === "" || normalized === "/") return "/"
   const cleaned = "/" + normalized.split("/").filter(Boolean).join("/")
   return cleaned
@@ -216,6 +211,48 @@ export function getHeader(meta: Meta | null, path: string): string {
  *
  * 返回 true = 被隐藏（需过滤掉）。
  */
+/**
+ * 灾难性回溯形状（组内已有量词、组外又套量词）与超长模式：hide 要对每个远端
+ * 文件名跑一遍，`(a+)+$` 这类配置在 30 字符的输入上就能把实例 CPU 打满。
+ * 管理端保存时拒绝，运行时对历史数据直接跳过该条模式。
+ */
+const HIDE_PATTERN_MAX_LEN = 256
+const NESTED_QUANTIFIER =
+  /\((?:[^()]|\([^()]*\))*(?:[*+?]|\{[^}]*\})[^)]*\)(?:[*+?]|\{[^}]*\})/
+const BACKREFERENCE = /\\[1-9]/
+const QUANTIFIED_GROUP = /\(([^()]*)\)(?:[*+]|\{\d+,\})/g
+
+/**
+ * 被量词修饰的分组里含「有前缀重叠的候选」时（`(a|aa)+`、`(a|a?)+`），
+ * 回溯会随输入长度指数增长。`(a|b)+` 这类互斥单字符分支是安全的，保留。
+ */
+function hasRiskyQuantifiedAlternation(pattern: string): boolean {
+  QUANTIFIED_GROUP.lastIndex = 0
+  let match: RegExpExecArray | null
+  while ((match = QUANTIFIED_GROUP.exec(pattern))) {
+    const alternatives = match[1].split("|").map((s) => s.trim())
+    if (alternatives.length < 2) continue
+    if (alternatives.some((a) => /[*+?{]/.test(a))) return true
+    for (const a of alternatives) {
+      for (const b of alternatives) {
+        if (a !== b && b.startsWith(a)) return true
+      }
+    }
+  }
+  return false
+}
+
+function isSafeHidePattern(pattern: string): boolean {
+  if (pattern.length > HIDE_PATTERN_MAX_LEN) return false
+  if (NESTED_QUANTIFIER.test(pattern)) return false
+  if (BACKREFERENCE.test(pattern)) return false
+  if (hasRiskyQuantifiedAlternation(pattern)) return false
+  // 多个无界量词串联（`a*a*a*a*b`）的回溯是多项式级，数量一多同样会打满 CPU。
+  const unbounded = pattern.match(/(?:[*+]|\{\d+,\})/g) || []
+  if (unbounded.length > 3) return false
+  return true
+}
+
 export function isHidden(
   meta: Meta | null,
   path: string,
@@ -229,6 +266,7 @@ export function isHidden(
     .map((s) => s.trim())
     .filter(Boolean)
   for (const pattern of patterns) {
+    if (!isSafeHidePattern(pattern)) continue
     try {
       const re = new RegExp(pattern)
       if (re.test(fileName)) return true
@@ -245,8 +283,12 @@ export function isHidden(
  */
 export function validateHide(hide: string): string | null {
   if (!hide || hide.trim() === "") return null
-  const lines = hide.split("\n").map((s) => s.trim()).filter(Boolean)
+  const lines = hide
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean)
   for (const line of lines) {
+    if (!isSafeHidePattern(line)) return line
     try {
       new RegExp(line)
     } catch {

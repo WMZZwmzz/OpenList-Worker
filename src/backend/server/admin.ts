@@ -10,6 +10,7 @@ import { getDriver } from "../internal/op/storage"
 import { search } from "../internal/op/search"
 import { checkAdminAuth } from "../pkg/utils"
 import { safeErrorMessage } from "../pkg/errs"
+import { assertSafeUrl } from "../pkg/http"
 import { validateHide } from "../pkg/meta"
 import {
   PROXY_RANGE_DRIVERS,
@@ -21,11 +22,13 @@ import {
 export const adminRouter = new Hono()
 
 adminRouter.use("*", async (c, next) => {
-  // 统一走 checkAdminAuth：静态 API token（settings.token）与 JWT 管理员
+  // 统一走 checkAdminAuth：静态 API token（api_token / API_TOKEN）与 JWT 管理员
   // （role===2 且 DB 中存在未禁用用户）都视为管理员。
   const isAdmin = await checkAdminAuth(c)
   if (!isAdmin) {
-    return c.json({ code: 401, message: "Unauthorized", data: null })
+    // HTTP 状态也要是 401：只把 code 写在响应体里会让网关、监控和客户端把
+    // 未授权请求当成成功。
+    return c.json({ code: 401, message: "Unauthorized", data: null }, 401)
   }
   await next()
 })
@@ -4842,7 +4845,22 @@ adminRouter.post("/plugin/install", async (c) => {
     // Support install by manifest URL
     if (body.manifest_url && typeof body.manifest_url === "string") {
       try {
-        const resp = await fetch(body.manifest_url)
+        // 管理员可配置，但仍做 SSRF 校验：插件清单通常来自公网；确实需要
+        // 内网源时把 host 加入 SSRF_ALLOWED_HOSTS。禁止自动跟随 3xx，
+        // 避免公网地址重定向到内网/元数据端点。
+        const allowHosts = String((c.env as any)?.SSRF_ALLOWED_HOSTS || "")
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean)
+        assertSafeUrl(body.manifest_url, "Plugin manifest", allowHosts)
+        const resp = await fetch(body.manifest_url, { redirect: "manual" })
+        if (resp.status >= 300 && resp.status < 400) {
+          return c.json({
+            code: 400,
+            message: "Plugin manifest URL must not redirect",
+            data: null,
+          })
+        }
         if (!resp.ok) {
           return c.json({
             code: 400,

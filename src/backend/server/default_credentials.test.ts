@@ -102,7 +102,7 @@ test("Security(F-11): user/create without a password gets a random one, not 1234
         "0000000000000000000000000000000000000000000000000000000000000000",
       ),
     ],
-    [{ key: "token", value: ADMIN_TOKEN }],
+    [{ key: "api_token", value: ADMIN_TOKEN }],
   )
   const app = new Hono()
   app.route("/api/admin/user", userRouter)

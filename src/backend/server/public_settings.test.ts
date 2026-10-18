@@ -20,6 +20,7 @@ const fetchSettings = async () => {
 test("Security(C-1): /api/public/settings must never echo credential-shaped keys", async () => {
   await seed([
     { key: "token", value: "SUPER_SECRET_ADMIN_TOKEN" },
+    { key: "api_token", value: "SUPER_SECRET_API_TOKEN" },
     { key: "jwt_secret", value: "SECRET" },
     { key: "s3_secret_key", value: "SECRET" },
     { key: "refresh_token", value: "SECRET" },

@@ -26,6 +26,8 @@ export interface MultipartSession {
   attempt: number
   path: string
   size: number
+  /** 发起该会话的已认证身份（`${id}:${username}`），用于跨用户接管防护 */
+  owner?: string
   chunk_size: number
   total_chunks: number
   /** 已收到分片 index 集合（0-based） */
@@ -60,6 +62,14 @@ const sessions = new Map<string, MultipartSession>()
 const CHUNK_MIN = 1 * 1024 * 1024 // 1MB
 const CHUNK_MAX = 64 * 1024 * 1024 // 64MB
 const CHUNK_DEFAULT = 10 * 1024 * 1024 // 10MB
+
+/**
+ * 单次分片上传的硬上限。X-File-Size / X-Chunk-Size 都来自请求头，若不设上限，
+ * 一个 X-File-Size: 1e15 就会让服务端 `new Array(1e9)` 分配 partMd5s，并把
+ * snapshot() 里按 total_chunks 的线性扫描变成几十秒级的主循环。
+ */
+export const MAX_UPLOAD_BYTES = 100 * 1024 * 1024 * 1024 // 100GB
+export const MAX_TOTAL_CHUNKS = 20000
 
 /** 将前端建议的 chunk_size clamp 到 [1MB, 64MB] */
 export function clampChunkSize(raw: number): number {
@@ -119,16 +129,20 @@ export function getSession(uploadId: string): MultipartSession | undefined {
   return sessions.get(uploadId)
 }
 
-/** 查找同 path+size 的未完成会话（用于断点续传） */
+/** 查找同 path+size 的未完成会话（用于断点续传）；owner 不匹配时不复用 */
 export function findReceivingSession(
   path: string,
   size: number,
+  owner?: string,
 ): MultipartSession | undefined {
   for (const s of sessions.values()) {
     if (
       s.path === path &&
       s.size === size &&
-      (s.state === "receiving" || s.state === "failed_retriable")
+      (s.state === "receiving" || s.state === "failed_retriable") &&
+      // 会话只按 (path,size) 复用会让另一个用户拿到同一 upload_id 并继续灌分片，
+      // 因此 owner 必须一致（owner 缺省表示调用方未认证，保持旧行为）
+      (owner === undefined || s.owner === undefined || s.owner === owner)
     ) {
       return s
     }
@@ -153,13 +167,27 @@ export function newUploadId(): string {
   return `mp_${rnd}`
 }
 
-/** 清理过期的 completed / aborted 会话（简单防内存泄漏） */
-export function pruneSessions(maxAgeMs = 60 * 60 * 1000): void {
+/**
+ * 清理过期会话。此前定义了却从未被调用，于是 Map 只增不减；同时补上对
+ * receiving 会话的回收——攻击者只要反复 init 而不传分片，就能把条目堆到 isolate
+ * 内存里。
+ */
+export function pruneSessions(
+  maxAgeMs = 60 * 60 * 1000,
+  receivingMaxAgeMs = 6 * 60 * 60 * 1000,
+): void {
   const now = Date.now()
   for (const [id, s] of sessions) {
+    const age = now - s.created_at
+    if ((s.state === "completed" || s.state === "aborted") && age > maxAgeMs) {
+      sessions.delete(id)
+      continue
+    }
     if (
-      (s.state === "completed" || s.state === "aborted") &&
-      now - s.created_at > maxAgeMs
+      (s.state === "receiving" ||
+        s.state === "failed_retriable" ||
+        s.state === "failed_permanent") &&
+      age > receivingMaxAgeMs
     ) {
       sessions.delete(id)
     }

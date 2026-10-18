@@ -1,10 +1,5 @@
-import {
-  calcFileType,
-  FileItem,
-  StorageDriver,
-} from "../../internal/driver/base"
-import { sortFileItems } from "../../internal/driver/sort"
-import { SMBAddition, SMBFileEntry } from "./types"
+import { FileItem, StorageDriver } from "../../internal/driver/base"
+import { SMBAddition } from "./types"
 
 export class SMBDriver implements StorageDriver {
   private addition: SMBAddition
@@ -19,39 +14,27 @@ export class SMBDriver implements StorageDriver {
     }
   }
 
-  private cleanPath(p: string): string {
-    const s = "/" + (p || "").split("/").filter(Boolean).join("/")
-    return s === "/" ? "" : s
+  /**
+   * 本驱动没有 SMB 客户端实现。此前这些方法体是空的，接口一律返回成功，
+   * 用户「删除/上传成功」但文件根本没动——静默失败比报错危险得多，
+   * 因此改为显式抛出未实现。
+   */
+  private unsupported(op: string): never {
+    throw new Error(`SMB driver: ${op} is not implemented in this build`)
   }
 
   async list(virtualPath: string, physicalPath: string): Promise<FileItem[]> {
-    // In Node.js / container runtime, SMB client queries files from share
-    // Return empty list or handled entries
-    const items: FileItem[] = []
-    return sortFileItems(
-      items,
-      this.addition.order_by,
-      this.addition.order_direction,
-    )
+    this.unsupported("list")
   }
 
   async get(virtualPath: string, physicalPath: string): Promise<FileItem> {
-    const clean = this.cleanPath(physicalPath)
-    const name = clean.split("/").filter(Boolean).pop() || "root"
-
-    return {
-      name,
-      size: 0,
-      is_dir: clean === "",
-      modified: new Date().toISOString(),
-      sign: clean || "/",
-      type: calcFileType(name, clean === ""),
-      raw_url: "",
-    }
+    // 原先这里凭路径拼出一个 size:0、raw_url:"" 的假条目：不存在的文件也会
+    // 「存在」，下载则静默失败。改为显式抛出未实现。
+    this.unsupported("get")
   }
 
   async mkdir(virtualPath: string, physicalPath: string): Promise<void> {
-    // SMB mkdir
+    this.unsupported("mkdir")
   }
 
   async rename(
@@ -59,7 +42,7 @@ export class SMBDriver implements StorageDriver {
     physicalPath: string,
     newName: string,
   ): Promise<void> {
-    // SMB rename
+    this.unsupported("rename")
   }
 
   async remove(
@@ -67,7 +50,7 @@ export class SMBDriver implements StorageDriver {
     physicalPath: string,
     names: string[],
   ): Promise<void> {
-    // SMB delete
+    this.unsupported("remove")
   }
 
   async move(
@@ -77,7 +60,7 @@ export class SMBDriver implements StorageDriver {
     srcPhys: string,
     dstPhys: string,
   ): Promise<void> {
-    // SMB move
+    this.unsupported("move")
   }
 
   async copy(
@@ -87,7 +70,7 @@ export class SMBDriver implements StorageDriver {
     srcPhys: string,
     dstPhys: string,
   ): Promise<void> {
-    // SMB copy
+    this.unsupported("copy")
   }
 
   async put(
@@ -95,6 +78,6 @@ export class SMBDriver implements StorageDriver {
     physicalPath: string,
     content: Buffer | Uint8Array,
   ): Promise<void> {
-    // SMB put
+    this.unsupported("put")
   }
 }

@@ -47,8 +47,7 @@ export async function twoStepHash(
 
 /** 生成用户盐（16 位 [A-Za-z0-9]，对应 Go random.String(16)） */
 export function generateSalt(length: number = 16): string {
-  const chars =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
   const bytes = new Uint8Array(length)
   crypto.getRandomValues(bytes)
   let out = ""
@@ -65,10 +64,7 @@ export function isHex64(value: string): boolean {
  * 统一写入口令（对应 Go User.SetPassword）：
  * 生成新盐并写入双层哈希。调用方负责 saveDb 持久化。
  */
-export async function setUserPassword(
-  user: any,
-  plain: string,
-): Promise<void> {
+export async function setUserPassword(user: any, plain: string): Promise<void> {
   user.salt = generateSalt()
   user.password = await twoStepHash(plain, user.salt)
   user.pwd_update_at = new Date().toISOString()
@@ -79,6 +75,17 @@ export async function setUserPassword(
  * @param plain 明文密码（或经过 staticHash 的前端哈希值）
  * @param user  含 password + salt 字段的用户对象
  */
+/**
+ * 定长十六进制摘要的逐字节比较。`===` 会在第一个不同字符处短路，
+ * 时序差可被用来逐字节还原期望哈希。
+ */
+export function constantTimeEqualHex(a: string, b: string): boolean {
+  if (a.length !== b.length) return false
+  let diff = 0
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
+  return diff === 0
+}
+
 export async function verifyUserPassword(
   plain: string,
   user: { password: string; salt?: string },
@@ -89,11 +96,11 @@ export async function verifyUserPassword(
     // 再判断是否是明文（直接登录）。
     const staticHex = isHex64(plain) ? plain : await staticHash(plain)
     const expected = await saltedHash(staticHex, user.salt)
-    return expected === user.password
+    return constantTimeEqualHex(expected, user.password)
   }
   // 历史单层：password == staticHash(plain)
   const staticHex = isHex64(plain) ? plain : await staticHash(plain)
-  return staticHex === user.password
+  return constantTimeEqualHex(staticHex, user.password)
 }
 
 // ---- 工具函数（与存储无关） ----
@@ -165,7 +172,8 @@ export function checkPasswordStrength(password: string): {
 
   if (password.length >= 8) score++
   if (password.length >= 12) score++
-  if (password.length < 8) feedback.push("Password should be at least 8 characters")
+  if (password.length < 8)
+    feedback.push("Password should be at least 8 characters")
 
   if (/[a-z]/.test(password) && /[A-Z]/.test(password)) {
     score++
@@ -185,7 +193,13 @@ export function checkPasswordStrength(password: string): {
     feedback.push("Include at least one special character")
   }
 
-  const weakPatterns = [/^password/i, /^123456/, /^qwerty/i, /^admin/i, /^letmein/i]
+  const weakPatterns = [
+    /^password/i,
+    /^123456/,
+    /^qwerty/i,
+    /^admin/i,
+    /^letmein/i,
+  ]
   for (const pattern of weakPatterns) {
     if (pattern.test(password)) {
       score = Math.max(0, score - 2)

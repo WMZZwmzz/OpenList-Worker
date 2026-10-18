@@ -6,6 +6,7 @@ import {
   calcFileType,
 } from "../../internal/driver/base"
 import { sortFileItems } from "../../internal/driver/sort"
+import { safeRedirectUrl } from "../../pkg/http"
 import {
   MoPanAddition,
   MoPanFile,
@@ -234,7 +235,8 @@ export class MoPanDriver implements StorageDriver {
     try {
       const res = await fetch(url, { redirect: "manual" })
       if (res.status === 302 || res.status === 301) {
-        return res.headers.get("location") || url
+        const loc = res.headers.get("location")
+        return loc ? safeRedirectUrl(loc, url) || url : url
       }
       return url
     } catch {

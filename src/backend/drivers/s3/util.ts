@@ -1,6 +1,7 @@
 // Based on: https://github.com/OpenListTeam/OpenList/tree/main/drivers/s3
 import { S3Addition, S3File, S3ListResult } from "./types"
 import { presignS3Url, rfc3986UriEncode, signS3Headers } from "./sigv4"
+import { decodePathFully, hasParentSegment } from "../../pkg/path"
 
 const maxCopyObjectSize = 5 * 1000 * 1000 * 1000 // 5GB
 const defaultCopyPartSize = 100 * 1024 * 1024 // 100MB
@@ -753,6 +754,15 @@ export class S3Client {
     signUrlExpireHours = 4,
     directUploadHost = "",
   ): Promise<{ upload_url: string; method: string }> {
+    // 预签名是按对象 key 签的：key 里残留 `..`（含 %2e%2e 编码形式）时，签出的
+    // PUT URL 会落到目标目录之外。fs.ts 的入口已校验过一次，这里再兜一道——
+    // 驱动也可能被其它调用方（插件、任务）直接使用。
+    const decodedName = decodePathFully(String(fileName ?? ""))
+    if (hasParentSegment(decodedName) || decodedName.includes("/")) {
+      throw new Error(
+        `illegal file_name for direct upload: ${JSON.stringify(fileName)}`,
+      )
+    }
     const fullPath = joinPath(dstDir, fileName)
     const cleanKey = getKey(fullPath, false)
     const expireSeconds = Math.max(60, Math.floor(signUrlExpireHours * 3600))

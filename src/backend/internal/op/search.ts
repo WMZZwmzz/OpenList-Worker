@@ -12,6 +12,12 @@ export interface SearchOptions {
   max_depth?: number
   /** Max items to collect before truncating (default 500) */
   max_results?: number
+  /**
+   * 条目可见性判定。listItems 本身不套 meta，所以搜索必须由调用方给出这道过滤，
+   * 否则密码目录 / read_users / hide 规则会被搜索结果原样吐出来。
+   * 返回 false 的条目既不进结果，也不递归进入。
+   */
+  isVisible?: (parent: string, item: FileItem) => boolean | Promise<boolean>
 }
 
 export interface SearchResultItem extends FileItem {
@@ -59,8 +65,15 @@ export async function search(
     for (const item of items) {
       if (matches.length >= maxResults) break
 
-      const nameMatch = !keyword || item.name.toLowerCase().includes(keyword)
       const isDir = !!item.is_dir
+      const subPath =
+        dirPath === "/" ? `/${item.name}` : `${dirPath}/${item.name}`
+
+      // 调用方的可见性过滤（meta 密码 / read_users / hide）：不可见的条目既不
+      // 作为结果返回，也不向下递归，否则搜索结果会把子树整个暴露出去。
+      if (opts.isVisible && !(await opts.isVisible(dirPath, item))) continue
+
+      const nameMatch = !keyword || item.name.toLowerCase().includes(keyword)
       // 挂载点虚拟文件夹（storage.ts 合并虚拟子挂载时 sign 为空），
       // 本身不显示，但仍需递归进入搜索其内部文件
       const isMountPoint = isDir && !item.sign
@@ -81,8 +94,6 @@ export async function search(
       }
 
       if (isDir) {
-        const subPath =
-          dirPath === "/" ? `/${item.name}` : `${dirPath}/${item.name}`
         await walk(subPath, depth + 1)
       }
     }

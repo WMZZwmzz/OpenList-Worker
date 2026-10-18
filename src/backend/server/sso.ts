@@ -3,7 +3,10 @@ import { sign } from "hono/jwt"
 import { getDb, saveDb } from "../internal/model/db"
 import { getJwtSecret } from "./middlewares"
 import { generateRandomPassword } from "./auth"
+import { clientIpFromContext } from "../pkg/client-ip"
 import { setUserPassword } from "../pkg/password"
+import { JWT_ISSUER, JWT_AUDIENCE } from "../pkg/permission"
+import { assertSafeUrl } from "../pkg/http"
 
 /**
  * SSO 登录（OAuth2 授权码流 + OIDC）。
@@ -35,12 +38,7 @@ function getBool(db: any, key: string): boolean {
 }
 
 function clientIpOf(c: any): string {
-  return (
-    c.req.header("CF-Connecting-IP") ||
-    c.req.header("x-real-ip") ||
-    c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ||
-    "unknown"
-  )
+  return clientIpFromContext(c)
 }
 
 function apiOrigin(c: any): string {
@@ -54,8 +52,13 @@ function apiOrigin(c: any): string {
 function generateState(clientId: string, ip: string): string {
   const bytes = new Uint8Array(16)
   crypto.getRandomValues(bytes)
-  const state = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")
-  stateStore.set(`${clientId}_${state}`, { ip, exp: Date.now() + STATE_EXPIRE_MS })
+  const state = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join(
+    "",
+  )
+  stateStore.set(`${clientId}_${state}`, {
+    ip,
+    exp: Date.now() + STATE_EXPIRE_MS,
+  })
   return state
 }
 
@@ -81,7 +84,13 @@ interface PlatformDef {
   tokenStyle?: "form" | "json" // Dingtalk 用 JSON
 }
 
-function platformDef(platform: string, ssoLoginUrl: string, ssoTokenUrl: string, ssoUserinfoUrl: string, ssoScopes: string): PlatformDef | null {
+function platformDef(
+  platform: string,
+  ssoLoginUrl: string,
+  ssoTokenUrl: string,
+  ssoUserinfoUrl: string,
+  ssoScopes: string,
+): PlatformDef | null {
   switch (platform) {
     case "Github":
       return {
@@ -95,7 +104,8 @@ function platformDef(platform: string, ssoLoginUrl: string, ssoTokenUrl: string,
       }
     case "Microsoft":
       return {
-        authUrl: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+        authUrl:
+          "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
         tokenUrl: "https://login.microsoftonline.com/common/oauth2/v2.0/token",
         userUrl: "https://graph.microsoft.com/v1.0/me",
         scope: ssoScopes || "user.read",
@@ -130,9 +140,17 @@ function platformDef(platform: string, ssoLoginUrl: string, ssoTokenUrl: string,
       }
     case "Casdoor":
       return {
-        authUrl: (ssoLoginUrl || "").replace(/\/login\/oauth\/authorize$/, "") + "/login/oauth/authorize",
-        tokenUrl: (ssoTokenUrl || "").replace(/\/api\/login\/oauth\/access_token$/, "") + "/api/login/oauth/access_token",
-        userUrl: (ssoUserinfoUrl || "").replace(/\/api\/userinfo$/, "") + "/api/userinfo",
+        authUrl:
+          (ssoLoginUrl || "").replace(/\/login\/oauth\/authorize$/, "") +
+          "/login/oauth/authorize",
+        tokenUrl:
+          (ssoTokenUrl || "").replace(
+            /\/api\/login\/oauth\/access_token$/,
+            "",
+          ) + "/api/login/oauth/access_token",
+        userUrl:
+          (ssoUserinfoUrl || "").replace(/\/api\/userinfo$/, "") +
+          "/api/userinfo",
         scope: ssoScopes || "profile",
         authField: "code",
         idField: "sub",
@@ -147,7 +165,18 @@ function platformDef(platform: string, ssoLoginUrl: string, ssoTokenUrl: string,
 }
 
 /** OIDC discovery：获取授权/令牌/userinfo 端点 */
-async function oidcDiscovery(discoveryUrl: string): Promise<{
+function assertSsoUrl(url: string, c: any): void {
+  const allowHosts = String(c?.env?.SSRF_ALLOWED_HOSTS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+  assertSafeUrl(url, "SSO endpoint", allowHosts)
+}
+
+async function oidcDiscovery(
+  discoveryUrl: string,
+  c: any,
+): Promise<{
   authUrl: string
   tokenUrl: string
   userUrl: string
@@ -155,12 +184,23 @@ async function oidcDiscovery(discoveryUrl: string): Promise<{
   const url = discoveryUrl.endsWith("/.well-known/openid-configuration")
     ? discoveryUrl
     : discoveryUrl.replace(/\/+$/, "") + "/.well-known/openid-configuration"
-  const resp = await fetch(url, { headers: { Accept: "application/json" } })
+  assertSsoUrl(url, c)
+  const resp = await fetch(url, {
+    headers: { Accept: "application/json" },
+    redirect: "manual",
+  })
+  if (resp.status >= 300 && resp.status < 400) {
+    throw new Error("OIDC discovery must not redirect")
+  }
   if (!resp.ok) throw new Error(`OIDC discovery failed: HTTP ${resp.status}`)
   const doc: any = await resp.json()
   if (!doc.authorization_endpoint || !doc.token_endpoint) {
     throw new Error("OIDC discovery returned incomplete metadata")
   }
+  // discovery 文档本身也可能被投毒：它给出的端点同样要过 SSRF 断言。
+  assertSsoUrl(doc.authorization_endpoint, c)
+  assertSsoUrl(doc.token_endpoint, c)
+  if (doc.userinfo_endpoint) assertSsoUrl(doc.userinfo_endpoint, c)
   return {
     authUrl: doc.authorization_endpoint,
     tokenUrl: doc.token_endpoint,
@@ -174,6 +214,8 @@ async function generateToken(user: any, c: any): Promise<string> {
     id: user.id,
     username: user.username,
     role: user.role,
+    iss: JWT_ISSUER,
+    aud: JWT_AUDIENCE,
     exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 7,
     jti:
       typeof crypto.randomUUID === "function"
@@ -185,7 +227,11 @@ async function generateToken(user: any, c: any): Promise<string> {
 }
 
 /** SSO 自动注册 */
-async function autoRegister(db: any, username: string, ssoId: string): Promise<any> {
+async function autoRegister(
+  db: any,
+  username: string,
+  ssoId: string,
+): Promise<any> {
   let uname = username || ssoId
   if (db.users.some((u: any) => u.username === uname)) {
     uname = `${uname}_${ssoId}`
@@ -213,12 +259,18 @@ async function autoRegister(db: any, username: string, ssoId: string): Promise<a
 }
 
 function postMessageHtml(field: string, value: string): string {
-  const safe = String(value).replace(/</g, "\\u003c").replace(/>/g, "\\u003e")
+  // 同时转义反斜杠与引号：只处理 < > 时，含 `"` 的值可以提前闭合字符串字面量，
+  // 在这个「由本应用同源提供」的页面里注入任意脚本。
+  const safe = String(value)
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
   return `<!DOCTYPE html>
 <head></head>
 <body>
 <script>
-window.opener.postMessage({"${field}":"${safe}"}, "*")
+window.opener.postMessage({"${field}":"${safe}"}, window.location.origin)
 window.close()
 </script>
 </body>`
@@ -228,7 +280,10 @@ window.close()
 ssoRouter.get("/sso", async (c) => {
   const db = await getDb(c.env)
   if (!getBool(db, "sso_login_enabled")) {
-    return c.json({ code: 403, message: "Single sign-on is not enabled", data: null }, 403)
+    return c.json(
+      { code: 403, message: "Single sign-on is not enabled", data: null },
+      403,
+    )
   }
   const method = c.req.query("method") || ""
   if (!method) {
@@ -249,7 +304,7 @@ ssoRouter.get("/sso", async (c) => {
 
   try {
     if (platform === "OIDC") {
-      const ep = await oidcDiscovery(discoveryUrl || ssoLoginUrl)
+      const ep = await oidcDiscovery(discoveryUrl || ssoLoginUrl, c)
       const state = generateState(clientId, clientIpOf(c))
       const params = new URLSearchParams({
         response_type: "code",
@@ -261,7 +316,13 @@ ssoRouter.get("/sso", async (c) => {
       return c.redirect(`${ep.authUrl}?${params.toString()}`, 302)
     }
 
-    const def = platformDef(platform, ssoLoginUrl, ssoTokenUrl, ssoUserinfoUrl, ssoScopes)
+    const def = platformDef(
+      platform,
+      ssoLoginUrl,
+      ssoTokenUrl,
+      ssoUserinfoUrl,
+      ssoScopes,
+    )
     if (!def) {
       return c.json({ code: 400, message: "invalid platform", data: null }, 400)
     }
@@ -270,11 +331,17 @@ ssoRouter.get("/sso", async (c) => {
       client_id: clientId,
       redirect_uri: redirectUri,
       scope: def.scope,
+      // 所有平台都要带 state：少了它，攻击者可以诱导已登录浏览器完成一次
+      // 「登录到攻击者账号」的绑定（login CSRF）。OIDC 分支已有同样处理。
+      state: generateState(clientId, clientIpOf(c)),
     })
     for (const [k, v] of Object.entries(def.extraAuth || {})) params.set(k, v)
     return c.redirect(`${def.authUrl}?${params.toString()}`, 302)
   } catch (e: any) {
-    return c.json({ code: 400, message: e.message || "SSO error", data: null }, 400)
+    return c.json(
+      { code: 400, message: e.message || "SSO error", data: null },
+      400,
+    )
   }
 })
 
@@ -303,6 +370,12 @@ ssoRouter.get("/sso_callback", async (c) => {
   const discoveryUrl = getSetting(db, "sso_oidc_discovery_url")
 
   try {
+    // state 校验前置到所有平台共用：verifyState 是单次消费的（校验即删除），
+    // 因此 OIDC 分支不再重复校验。缺少这一步的非 OIDC 平台可被用于登录 CSRF。
+    if (!verifyState(clientId, clientIpOf(c), c.req.query("state") || "")) {
+      return c.text("incorrect or expired state parameter", 400)
+    }
+
     let tokenUrl: string
     let userUrl: string
     let idField: string
@@ -312,19 +385,20 @@ ssoRouter.get("/sso_callback", async (c) => {
     let userInfo: any
 
     if (platform === "OIDC") {
-      const ep = await oidcDiscovery(discoveryUrl || ssoLoginUrl)
+      const ep = await oidcDiscovery(discoveryUrl || ssoLoginUrl, c)
       tokenUrl = ep.tokenUrl
       userUrl = ep.userUrl
       idField = "sub"
       usernameField = "preferred_username"
       scope = ssoScopes || "openid profile"
-      if (!verifyState(clientId, clientIpOf(c), c.req.query("state") || "")) {
-        return c.text("incorrect or expired state parameter", 400)
-      }
       const code = c.req.query("code") || ""
+      assertSsoUrl(tokenUrl, c)
       const tokenResp = await fetch(tokenUrl, {
         method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Accept: "application/json",
+        },
         body: new URLSearchParams({
           grant_type: "authorization_code",
           code,
@@ -338,11 +412,19 @@ ssoRouter.get("/sso_callback", async (c) => {
       accessToken = tokenData.access_token
       if (!accessToken) throw new Error("no access_token in token response")
       if (userUrl) {
+        assertSsoUrl(userUrl, c)
         const uResp = await fetch(userUrl, {
-          headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" },
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            Accept: "application/json",
+          },
         })
         userInfo = await uResp.json().catch(() => ({}))
-        const name = userInfo?.preferred_username || userInfo?.name || userInfo?.nickname || ""
+        const name =
+          userInfo?.preferred_username ||
+          userInfo?.name ||
+          userInfo?.nickname ||
+          ""
         if (!userInfo?.sub && !name) {
           // 回退：解析 id_token payload 的 name 字段
           const idToken = tokenData.id_token
@@ -350,7 +432,8 @@ ssoRouter.get("/sso_callback", async (c) => {
             const payload = parseJwtPayload(idToken)
             userInfo = userInfo || {}
             userInfo.sub = userInfo.sub || payload?.sub
-            userInfo.name = name || payload?.name || payload?.preferred_username || ""
+            userInfo.name =
+              name || payload?.name || payload?.preferred_username || ""
           }
         }
         if (name) userInfo.name = name
@@ -361,7 +444,13 @@ ssoRouter.get("/sso_callback", async (c) => {
         userInfo.sub = userInfo.sub || userInfo.name || ""
       }
     } else {
-      const def = platformDef(platform, ssoLoginUrl, ssoTokenUrl, ssoUserinfoUrl, ssoScopes)
+      const def = platformDef(
+        platform,
+        ssoLoginUrl,
+        ssoTokenUrl,
+        ssoUserinfoUrl,
+        ssoScopes,
+      )
       if (!def) return c.text("invalid platform", 400)
       tokenUrl = def.tokenUrl
       userUrl = def.userUrl
@@ -373,11 +462,15 @@ ssoRouter.get("/sso_callback", async (c) => {
       if (!code) return c.text("No code provided", 400)
 
       let tokenResp: Response
+      assertSsoUrl(tokenUrl, c)
       if (def.tokenStyle === "json") {
         // Dingtalk
         tokenResp = await fetch(tokenUrl, {
           method: "POST",
-          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json",
+          },
           body: JSON.stringify({
             clientId,
             clientSecret,
@@ -403,27 +496,34 @@ ssoRouter.get("/sso_callback", async (c) => {
       const tokenData: any = await tokenResp.json().catch(() => ({}))
       accessToken = tokenData.access_token || tokenData.accessToken
       if (!accessToken) {
-        throw new Error(`token exchange failed: ${tokenData.error || tokenResp.status}`)
+        throw new Error(
+          `token exchange failed: ${tokenData.error || tokenResp.status}`,
+        )
       }
 
       const headers: Record<string, string> = { Accept: "application/json" }
-      if (platform === "Dingtalk") {
-        headers["x-acs-dingtalk-access-token"] = accessToken
+      if (platform === "Dingtalk") {        headers["x-acs-dingtalk-access-token"] = accessToken
       } else {
         headers["Authorization"] = `Bearer ${accessToken}`
       }
+      assertSsoUrl(userUrl, c)
       const uResp = await fetch(userUrl, { headers })
       userInfo = await uResp.json().catch(() => ({}))
     }
 
-    const userID = String(userInfo?.id ?? userInfo?.sub ?? userInfo?.[idField] ?? "")
+    const userID = String(
+      userInfo?.id ?? userInfo?.sub ?? userInfo?.[idField] ?? "",
+    )
     if (!userID || userID === "0") {
       return c.text("cannot get user id from SSO provider", 400)
     }
 
     if (method === "get_sso_id") {
       if (useCompat) {
-        return c.redirect(`${apiOrigin(c)}/@manage?sso_id=${encodeURIComponent(userID)}`, 302)
+        return c.redirect(
+          `${apiOrigin(c)}/@manage?sso_id=${encodeURIComponent(userID)}`,
+          302,
+        )
       }
       return c.html(postMessageHtml("sso_id", userID))
     }
@@ -435,12 +535,21 @@ ssoRouter.get("/sso_callback", async (c) => {
       if (!autoReg) {
         return c.text("user not found and auto register is disabled", 400)
       }
-      const username = String(userInfo?.login ?? userInfo?.[usernameField] ?? userInfo?.name ?? "")
+      const username = String(
+        userInfo?.login ?? userInfo?.[usernameField] ?? userInfo?.name ?? "",
+      )
       user = await autoRegister(db, username || userID, userID)
+    }
+    // 禁用账号不得借 SSO 拿到新 token（登录侧同样拒绝），否则封禁可被绕过。
+    if (user.disabled) {
+      return c.text("account is disabled", 403)
     }
     const token = await generateToken(user, c)
     if (useCompat) {
-      return c.redirect(`${apiOrigin(c)}/@login?token=${encodeURIComponent(token)}`, 302)
+      return c.redirect(
+        `${apiOrigin(c)}/@login?token=${encodeURIComponent(token)}`,
+        302,
+      )
     }
     return c.html(postMessageHtml("token", token))
   } catch (e: any) {

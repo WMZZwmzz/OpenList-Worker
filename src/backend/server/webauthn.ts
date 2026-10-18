@@ -2,6 +2,8 @@ import { Hono } from "hono"
 import { sign } from "hono/jwt"
 import { getDb, saveDb } from "../internal/model/db"
 import { getJwtSecret, getUserFromContext } from "./middlewares"
+import { hmacSha256 } from "../pkg/crypto"
+import { JWT_ISSUER, JWT_AUDIENCE } from "../pkg/permission"
 
 /**
  * WebAuthn / Passkey 登录。
@@ -59,7 +61,11 @@ function cborDecode(r: CborReader): any {
     value = (r.u8[r.i] << 8) | r.u8[r.i + 1]
     r.i += 2
   } else if (minor === 26) {
-    value = (r.u8[r.i] << 24) | (r.u8[r.i + 1] << 16) | (r.u8[r.i + 2] << 8) | r.u8[r.i + 3]
+    value =
+      (r.u8[r.i] << 24) |
+      (r.u8[r.i + 1] << 16) |
+      (r.u8[r.i + 2] << 8) |
+      r.u8[r.i + 3]
     r.i += 4
   } else if (minor === 27) {
     let v = 0n
@@ -84,24 +90,30 @@ function cborDecode(r: CborReader): any {
     }
   }
   switch (major) {
-    case 0: return value // uint
-    case 1: return -1 - value // nint
-    case 2: { // bytes
+    case 0:
+      return value // uint
+    case 1:
+      return -1 - value // nint
+    case 2: {
+      // bytes
       const out = r.u8.slice(r.i, r.i + value)
       r.i += value
       return out
     }
-    case 3: { // string
+    case 3: {
+      // string
       const out = new TextDecoder().decode(r.u8.slice(r.i, r.i + value))
       r.i += value
       return out
     }
-    case 4: { // array
+    case 4: {
+      // array
       const arr: any[] = []
       for (let k = 0; k < value; k++) arr.push(cborDecode(r))
       return arr
     }
-    case 5: { // map
+    case 5: {
+      // map
       const obj: Record<string, any> = {}
       for (let k = 0; k < value; k++) {
         const key = cborDecode(r)
@@ -132,7 +144,13 @@ async function coseToCryptoKey(cose: Record<string, any>): Promise<CryptoKey> {
       y: b64urlEncode(new Uint8Array(y)),
     }
     const name = alg === -7 ? "ECDSA" : "ECDSA"
-    return await crypto.subtle.importKey("jwk", jwk, { name, namedCurve: "P-256" }, false, ["verify"])
+    return await crypto.subtle.importKey(
+      "jwk",
+      jwk,
+      { name, namedCurve: "P-256" },
+      false,
+      ["verify"],
+    )
   }
   if (kty === 3) {
     // RSA
@@ -144,7 +162,13 @@ async function coseToCryptoKey(cose: Record<string, any>): Promise<CryptoKey> {
       e: b64urlEncode(new Uint8Array(e)),
     }
     const name = alg === -257 ? "RSASSA-PKCS1-v1_5" : "RSASSA-PKCS1-v1_5"
-    return await crypto.subtle.importKey("jwk", jwk, { name, hash: "SHA-256" }, false, ["verify"])
+    return await crypto.subtle.importKey(
+      "jwk",
+      jwk,
+      { name, hash: "SHA-256" },
+      false,
+      ["verify"],
+    )
   }
   throw new Error(`unsupported COSE kty ${kty}`)
 }
@@ -165,7 +189,11 @@ async function parseAttestation(attObj: Uint8Array): Promise<{
 
   const rpIdHash = authData.slice(0, 32)
   const flags = authData[32]
-  const signCount = (authData[33] << 24) | (authData[34] << 16) | (authData[35] << 8) | authData[36]
+  const signCount =
+    (authData[33] << 24) |
+    (authData[34] << 16) |
+    (authData[35] << 8) |
+    authData[36]
 
   if (!(flags & 0x40)) throw new Error("attestedCredentialData not present")
   let offset = 37
@@ -196,19 +224,45 @@ function getStrSetting(db: any, key: string, def = ""): string {
 }
 
 function rpIdOf(c: any, db: any): string {
-  const explicit = getStrSetting(db, "webauthn_rp_id")
-  if (explicit) return explicit
-  try {
-    return new URL(c.req.url).hostname
-  } catch {
-    return "localhost"
-  }
+  // 不再回退 Host：Host 可由反向代理/客户端影响，攻击者可借此把 challenge
+  // 绑到另一个 RP。必须显式配置 webauthn_rp_id 或 WEBAUTHN_RP_ID。
+  const explicit =
+    getStrSetting(db, "webauthn_rp_id") ||
+    String(c?.env?.WEBAUTHN_RP_ID || "").trim()
+  return explicit
+}
+
+function rpIdMissing(c: any) {
+  return c.json(
+    {
+      code: 400,
+      message:
+        "WebAuthn RP ID is not configured; set webauthn_rp_id or WEBAUTHN_RP_ID",
+      data: null,
+    },
+    400,
+  )
 }
 
 function newChallenge(): Uint8Array {
   const c = new Uint8Array(32)
   crypto.getRandomValues(c)
   return c
+}
+
+/**
+ * clientDataJSON.origin 必须与 rpId 同一主机：否则在攻击者域名上完成的认证
+ * 可以被搬到本站来用（认证跨源重放）。安卓等无 host 的来源格式无方可比对，放行。
+ */
+function originMatchesRp(origin: unknown, rpId: string): boolean {
+  const o = String(origin ?? "")
+  if (!o) return false
+  if (o.startsWith("android:")) return true
+  try {
+    return new URL(o).hostname.toLowerCase() === String(rpId).toLowerCase()
+  } catch {
+    return false
+  }
 }
 
 interface SessionData {
@@ -219,11 +273,66 @@ interface SessionData {
   userVerification: string
 }
 
-function sessionToB64(sd: SessionData): string {
-  return b64Encode(new TextEncoder().encode(JSON.stringify(sd)))
+/**
+ * 本实例签发过的 challenge 登记表。
+ *
+ * session 头是一段客户端可自造的 base64 JSON：finish_* 里「clientDataJSON.challenge
+ * 与 blob 里的 challenge 相等」这条校验，攻击者自己造一个 blob 就能满足，等于没有
+ * 校验。登记表把 challenge 锚定到「确实由服务端发出过」。冷启动 / 跨实例时表为空，
+ * 无从核对，此时保持可用（不因为边缘调度的实例漂移而拒绝正常登录）。
+ */
+const issuedChallenges = new Map<string, number>()
+const CHALLENGE_TTL_MS = 5 * 60 * 1000
+
+function rememberChallenge(challenge?: string): void {
+  if (!challenge) return
+  const now = Date.now()
+  for (const [k, exp] of issuedChallenges) {
+    if (exp <= now) issuedChallenges.delete(k)
+  }
+  issuedChallenges.set(challenge, now + CHALLENGE_TTL_MS)
 }
-function sessionFromB64(s: string): SessionData {
-  return JSON.parse(new TextDecoder().decode(b64Decode(s)))
+
+function isIssuedChallenge(challenge?: string): boolean {
+  if (!challenge) return false
+  if (issuedChallenges.size === 0) return true
+  const exp = issuedChallenges.get(challenge)
+  if (exp === undefined) return false
+  issuedChallenges.delete(challenge) // 单次消费
+  return exp > Date.now()
+}
+
+function sessionToB64(sd: SessionData, c: any): Promise<string> {
+  rememberChallenge(sd.challenge)
+  return signSessionPayload(b64Encode(new TextEncoder().encode(JSON.stringify(sd))), c)
+}
+
+async function signSessionPayload(payload: string, c: any): Promise<string> {
+  const secret = await getJwtSecret(c)
+  const key = await hmacSha256("openlist-webauthn-session-v1", secret)
+  const sig = await hmacSha256(payload, key)
+  return `${payload}.${sig}`
+}
+
+async function sessionFromB64(s: string, c: any): Promise<SessionData> {
+  const dot = s.lastIndexOf(".")
+  if (dot <= 0) throw new Error("invalid session format")
+  const payload = s.slice(0, dot)
+  const signature = s.slice(dot + 1)
+  const secret = await getJwtSecret(c)
+  const key = await hmacSha256("openlist-webauthn-session-v1", secret)
+  const expected = await hmacSha256(payload, key)
+  if (!constantTimeEqual(signature, expected)) {
+    throw new Error("invalid session signature")
+  }
+  return JSON.parse(new TextDecoder().decode(b64Decode(payload)))
+}
+
+function constantTimeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false
+  let diff = 0
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
+  return diff === 0
 }
 
 async function generateToken(user: any, c: any): Promise<string> {
@@ -231,8 +340,13 @@ async function generateToken(user: any, c: any): Promise<string> {
     id: user.id,
     username: user.username,
     role: user.role,
+    iss: JWT_ISSUER,
+    aud: JWT_AUDIENCE,
     exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 7,
-    jti: typeof crypto.randomUUID === "function" ? crypto.randomUUID() : b64urlEncode(newChallenge()),
+    jti:
+      typeof crypto.randomUUID === "function"
+        ? crypto.randomUUID()
+        : b64urlEncode(newChallenge()),
   }
   const secret = await getJwtSecret(c)
   return await sign(payload, secret)
@@ -248,12 +362,19 @@ function getUserCredentials(user: any): any[] {
 webauthnRouter.post("/webauthn_begin_login", async (c) => {
   const db = await getDb(c.env)
   if (!getBoolSetting(db, "webauthn_login_enabled")) {
-    return c.json({ code: 403, message: "WebAuthn is not enabled", data: null }, 403)
+    return c.json(
+      { code: 403, message: "WebAuthn is not enabled", data: null },
+      403,
+    )
   }
   const username = c.req.query("username") || ""
   const rpId = rpIdOf(c, db)
+  if (!rpId) return rpIdMissing(c)
   const challenge = newChallenge()
-  const sd: SessionData = { challenge: b64urlEncode(challenge), userVerification: "preferred" }
+  const sd: SessionData = {
+    challenge: b64urlEncode(challenge),
+    userVerification: "preferred",
+  }
 
   let allowCredentials: { id: string; type: string }[] | undefined
   if (username) {
@@ -264,7 +385,10 @@ webauthnRouter.post("/webauthn_begin_login", async (c) => {
     sd.userId = String(user.id)
     sd.username = username
     allowCredentials = getUserCredentials(user).map((cred: any) => ({
-      id: typeof cred.id === "string" ? cred.id : b64urlEncode(new Uint8Array(cred.id)),
+      id:
+        typeof cred.id === "string"
+          ? cred.id
+          : b64urlEncode(new Uint8Array(cred.id)),
       type: "public-key",
     }))
     sd.allowedCredentials = allowCredentials
@@ -282,7 +406,7 @@ webauthnRouter.post("/webauthn_begin_login", async (c) => {
   return c.json({
     code: 200,
     message: "success",
-    data: { options, session: sessionToB64(sd) },
+    data: { options, session: await sessionToB64(sd, c) },
   })
 })
 
@@ -290,38 +414,68 @@ webauthnRouter.post("/webauthn_begin_login", async (c) => {
 webauthnRouter.post("/webauthn_finish_login", async (c) => {
   const db = await getDb(c.env)
   if (!getBoolSetting(db, "webauthn_login_enabled")) {
-    return c.json({ code: 403, message: "WebAuthn is not enabled", data: null }, 403)
+    return c.json(
+      { code: 403, message: "WebAuthn is not enabled", data: null },
+      403,
+    )
   }
   const sessionHeader = c.req.header("session") || c.req.header("Session") || ""
   let sd: SessionData
   try {
-    sd = sessionFromB64(sessionHeader)
+    sd = await sessionFromB64(sessionHeader, c)
   } catch {
     return c.json({ code: 400, message: "invalid session", data: null }, 400)
   }
   const body = await c.req.json().catch(() => ({}))
   const rpId = rpIdOf(c, db)
+  if (!rpId) return rpIdMissing(c)
 
   try {
     // 1. 解析 clientDataJSON，校验 challenge
     const rawId = b64urlDecode(body.id || "")
     const clientDataJSON = JSON.parse(
-      new TextDecoder().decode(b64urlDecode(body.response?.clientDataJSON || "")),
+      new TextDecoder().decode(
+        b64urlDecode(body.response?.clientDataJSON || ""),
+      ),
     )
     if (clientDataJSON.challenge !== sd.challenge) {
-      return c.json({ code: 400, message: "challenge mismatch", data: null }, 400)
+      return c.json(
+        { code: 400, message: "challenge mismatch", data: null },
+        400,
+      )
+    }
+    if (!isIssuedChallenge(sd.challenge)) {
+      return c.json(
+        {
+          code: 400,
+          message: "session not issued by this instance or already used",
+          data: null,
+        },
+        400,
+      )
     }
     if (clientDataJSON.type !== "webauthn.get") {
-      return c.json({ code: 400, message: "invalid ceremony type", data: null }, 400)
+      return c.json(
+        { code: 400, message: "invalid ceremony type", data: null },
+        400,
+      )
+    }
+    if (!originMatchesRp(clientDataJSON.origin, rpId)) {
+      return c.json({ code: 400, message: "origin mismatch", data: null }, 400)
     }
 
     // 2. 解析 authenticatorData
     const authData = b64urlDecode(body.response?.authenticatorData || "")
     if (authData.length < 37) throw new Error("invalid authenticatorData")
     const rpIdHash = authData.slice(0, 32)
-    const expectedRpHash = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(rpId)))
+    const expectedRpHash = new Uint8Array(
+      await crypto.subtle.digest("SHA-256", new TextEncoder().encode(rpId)),
+    )
     if (b64urlEncode(rpIdHash) !== b64urlEncode(expectedRpHash)) {
-      return c.json({ code:400, message: "rpId hash mismatch", data: null }, 400)
+      return c.json(
+        { code: 400, message: "rpId hash mismatch", data: null },
+        400,
+      )
     }
 
     // 3. 找到对应用户与 credential
@@ -332,7 +486,10 @@ webauthnRouter.post("/webauthn_finish_login", async (c) => {
     let credential: any
     if (user) {
       credential = getUserCredentials(user).find((cred: any) => {
-        const cid = typeof cred.id === "string" ? cred.id : b64urlEncode(new Uint8Array(cred.id))
+        const cid =
+          typeof cred.id === "string"
+            ? cred.id
+            : b64urlEncode(new Uint8Array(cred.id))
         return cid === body.id
       })
     } else {
@@ -343,20 +500,29 @@ webauthnRouter.post("/webauthn_finish_login", async (c) => {
         user = (db.users || []).find((u: any) => String(u.id) === userId)
         if (user) {
           credential = getUserCredentials(user).find((cred: any) => {
-            const cid = typeof cred.id === "string" ? cred.id : b64urlEncode(new Uint8Array(cred.id))
+            const cid =
+              typeof cred.id === "string"
+                ? cred.id
+                : b64urlEncode(new Uint8Array(cred.id))
             return cid === body.id
           })
         }
       }
     }
     if (!user || !credential) {
-      return c.json({ code: 400, message: "credential not found", data: null }, 400)
+      return c.json(
+        { code: 400, message: "credential not found", data: null },
+        400,
+      )
     }
 
     // 4. 验证签名（credential 存储 JWK 公钥）
     const jwk = credential.publicKey
     if (!jwk) {
-      return c.json({ code: 400, message: "credential missing public key", data: null }, 400)
+      return c.json(
+        { code: 400, message: "credential missing public key", data: null },
+        400,
+      )
     }
     const publicKey = await crypto.subtle.importKey(
       "jwk",
@@ -371,7 +537,9 @@ webauthnRouter.post("/webauthn_finish_login", async (c) => {
     const clientDataHash = new Uint8Array(
       await crypto.subtle.digest(
         "SHA-256",
-        b64urlDecode(body.response?.clientDataJSON || "") as unknown as BufferSource,
+        b64urlDecode(
+          body.response?.clientDataJSON || "",
+        ) as unknown as BufferSource,
       ),
     )
     const signedData = new Uint8Array(authData.length + clientDataHash.length)
@@ -391,21 +559,47 @@ webauthnRouter.post("/webauthn_finish_login", async (c) => {
       )
       .catch(() => false)
     if (!valid) {
-      return c.json({ code: 400, message: "signature verification failed", data: null }, 400)
+      return c.json(
+        { code: 400, message: "signature verification failed", data: null },
+        400,
+      )
     }
 
     // 5. 更新 signCount（防重放，可选）
-    const signCount = (authData[33] << 24) | (authData[34] << 16) | (authData[35] << 8) | authData[36]
-    if (credential.sign_count !== undefined && signCount !== 0 && signCount <= credential.sign_count) {
-      return c.json({ code: 400, message: "stale signCount (possible replay)", data: null }, 400)
+    const signCount =
+      (authData[33] << 24) |
+      (authData[34] << 16) |
+      (authData[35] << 8) |
+      authData[36]
+    if (
+      credential.sign_count !== undefined &&
+      signCount !== 0 &&
+      signCount <= credential.sign_count
+    ) {
+      return c.json(
+        { code: 400, message: "stale signCount (possible replay)", data: null },
+        400,
+      )
     }
     credential.sign_count = signCount
     await saveDb(db, c.env)
 
+    // 凭据有效但账号已被禁用时不得签发 token：finish_login 的其余分支都判了
+    // disabled，唯独这里漏了，封禁会被 WebAuthn 绕过。
+    if (user.disabled) {
+      return c.json(
+        { code: 403, message: "account is disabled", data: null },
+        403,
+      )
+    }
+
     const token = await generateToken(user, c)
     return c.json({ code: 200, message: "success", data: { token } })
   } catch (e: any) {
-    return c.json({ code: 400, message: e.message || "WebAuthn login failed", data: null }, 400)
+    return c.json(
+      { code: 400, message: e.message || "WebAuthn login failed", data: null },
+      400,
+    )
   }
 })
 
@@ -413,13 +607,17 @@ webauthnRouter.post("/webauthn_finish_login", async (c) => {
 webauthnRouter.post("/webauthn_begin_registration", async (c) => {
   const db = await getDb(c.env)
   if (!getBoolSetting(db, "webauthn_login_enabled")) {
-    return c.json({ code: 403, message: "WebAuthn is not enabled", data: null }, 403)
+    return c.json(
+      { code: 403, message: "WebAuthn is not enabled", data: null },
+      403,
+    )
   }
   const user = await getUserFromContext(c)
   if (!user || user.disabled) {
     return c.json({ code: 401, message: "Unauthorized", data: null }, 401)
   }
   const rpId = rpIdOf(c, db)
+  if (!rpId) return rpIdMissing(c)
   const challenge = newChallenge()
   const userIdBytes = new TextEncoder().encode(String(user.id))
   const sd: SessionData = {
@@ -430,7 +628,10 @@ webauthnRouter.post("/webauthn_begin_registration", async (c) => {
   }
 
   const existing = getUserCredentials(user).map((cred: any) => ({
-    id: typeof cred.id === "string" ? cred.id : b64urlEncode(new Uint8Array(cred.id)),
+    id:
+      typeof cred.id === "string"
+        ? cred.id
+        : b64urlEncode(new Uint8Array(cred.id)),
     type: "public-key",
   }))
 
@@ -458,7 +659,7 @@ webauthnRouter.post("/webauthn_begin_registration", async (c) => {
   return c.json({
     code: 200,
     message: "success",
-    data: { options, session: sessionToB64(sd) },
+    data: { options, session: await sessionToB64(sd, c) },
   })
 })
 
@@ -466,7 +667,10 @@ webauthnRouter.post("/webauthn_begin_registration", async (c) => {
 webauthnRouter.post("/webauthn_finish_registration", async (c) => {
   const db = await getDb(c.env)
   if (!getBoolSetting(db, "webauthn_login_enabled")) {
-    return c.json({ code: 403, message: "WebAuthn is not enabled", data: null }, 403)
+    return c.json(
+      { code: 403, message: "WebAuthn is not enabled", data: null },
+      403,
+    )
   }
   const user = await getUserFromContext(c)
   if (!user || user.disabled) {
@@ -475,31 +679,80 @@ webauthnRouter.post("/webauthn_finish_registration", async (c) => {
   const sessionHeader = c.req.header("Session") || c.req.header("session") || ""
   let sd: SessionData
   try {
-    sd = sessionFromB64(sessionHeader)
+    sd = await sessionFromB64(sessionHeader, c)
   } catch {
     return c.json({ code: 400, message: "invalid session", data: null }, 400)
   }
   const body = await c.req.json().catch(() => ({}))
   const rpId = rpIdOf(c, db)
+  if (!rpId) return rpIdMissing(c)
 
   try {
     // 1. 校验 clientDataJSON challenge
     const clientDataJSON = JSON.parse(
-      new TextDecoder().decode(b64urlDecode(body.response?.clientDataJSON || "")),
+      new TextDecoder().decode(
+        b64urlDecode(body.response?.clientDataJSON || ""),
+      ),
     )
     if (clientDataJSON.challenge !== sd.challenge) {
-      return c.json({ code: 400, message: "challenge mismatch", data: null }, 400)
+      return c.json(
+        { code: 400, message: "challenge mismatch", data: null },
+        400,
+      )
+    }
+    if (!isIssuedChallenge(sd.challenge)) {
+      return c.json(
+        {
+          code: 400,
+          message: "session not issued by this instance or already used",
+          data: null,
+        },
+        400,
+      )
     }
     if (clientDataJSON.type !== "webauthn.create") {
-      return c.json({ code: 400, message: "invalid ceremony type", data: null }, 400)
+      return c.json(
+        { code: 400, message: "invalid ceremony type", data: null },
+        400,
+      )
+    }
+    if (!originMatchesRp(clientDataJSON.origin, rpId)) {
+      return c.json({ code: 400, message: "origin mismatch", data: null }, 400)
     }
 
     // 2. 解析 attestationObject
     const attObj = b64urlDecode(body.response?.attestationObject || "")
-    const { publicKey, aaguid, credentialId, signCount } = await parseAttestation(attObj)
+    const { authData, publicKey, aaguid, credentialId, signCount } =
+      await parseAttestation(attObj)
+
+    // 注册时同样要核对 rpIdHash：attestation 里的前 32 字节必须是本站 rpId 的
+    // SHA-256，否则别的 relying party 上产出的凭据可以被绑进本账号。
+    const expectedRegRpHash = new Uint8Array(
+      await crypto.subtle.digest("SHA-256", new TextEncoder().encode(rpId)),
+    )
+    if (
+      b64urlEncode(authData.slice(0, 32)) !== b64urlEncode(expectedRegRpHash)
+    ) {
+      return c.json(
+        { code: 400, message: "rpId hash mismatch", data: null },
+        400,
+      )
+    }
 
     // 3. 保存 credential（JWK 公钥，便于 finish_login 时重建 CryptoKey）
-    const rawId = body.id || b64urlEncode(credentialId)
+    // 客户端的 id 必须与 attestation 里的 credentialId 一致：否则可以把
+    // authenticator 产出的公钥存到一个由客户端指定的 cred id 下，后续登录
+    // 用另一枚凭据做混淆。
+    if (body.id) {
+      const claimedId = b64urlDecode(String(body.id))
+      if (b64urlEncode(claimedId) !== b64urlEncode(credentialId)) {
+        return c.json(
+          { code: 400, message: "credential id mismatch", data: null },
+          400,
+        )
+      }
+    }
+    const rawId = b64urlEncode(credentialId)
     const credRecord = {
       id: rawId,
       publicKey: await crypto.subtle.exportKey("jwk", publicKey),
@@ -508,13 +761,17 @@ webauthnRouter.post("/webauthn_finish_registration", async (c) => {
       created_at: new Date().toISOString(),
     }
     const webauthnUser = user as any
-    if (!webauthnUser.webauthn_credentials) webauthnUser.webauthn_credentials = []
+    if (!webauthnUser.webauthn_credentials)
+      webauthnUser.webauthn_credentials = []
     webauthnUser.webauthn_credentials.push(credRecord)
     await saveDb(db, c.env)
 
     return c.json({ code: 200, message: "Registered Successfully", data: null })
   } catch (e: any) {
-    return c.json({ code: 400, message: e.message || "registration failed", data: null }, 400)
+    return c.json(
+      { code: 400, message: e.message || "registration failed", data: null },
+      400,
+    )
   }
 })
 
@@ -528,11 +785,17 @@ webauthnRouter.post("/delete_authn", async (c) => {
   const id = body.id || ""
   const db = await getDb(c.env)
   const target = (db.users || []).find((u: any) => u.id === user.id)
-  if (!target) return c.json({ code: 404, message: "user not found", data: null }, 404)
+  if (!target)
+    return c.json({ code: 404, message: "user not found", data: null }, 404)
   const before = (target.webauthn_credentials || []).length
-  target.webauthn_credentials = (target.webauthn_credentials || []).filter((cred: any) => cred.id !== id)
+  target.webauthn_credentials = (target.webauthn_credentials || []).filter(
+    (cred: any) => cred.id !== id,
+  )
   if (target.webauthn_credentials.length === before) {
-    return c.json({ code: 404, message: "credential not found", data: null }, 404)
+    return c.json(
+      { code: 404, message: "credential not found", data: null },
+      404,
+    )
   }
   await saveDb(db, c.env)
   return c.json({ code: 200, message: "Deleted Successfully", data: null })

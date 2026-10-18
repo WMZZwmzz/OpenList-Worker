@@ -1,4 +1,5 @@
 // Teambition API 客户端
+import { safeRedirectUrl } from "../../pkg/http"
 import {
   DriverTeambitionAddition,
   TbCollection,
@@ -93,7 +94,7 @@ export class ClientTeambition {
     })
     if (resp.status === 302) {
       const loc = resp.headers.get("location")
-      if (loc) return loc
+      if (loc) return safeRedirectUrl(loc, url) || url
     }
     return url
   }

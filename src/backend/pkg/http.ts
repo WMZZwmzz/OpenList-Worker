@@ -10,6 +10,8 @@ export interface FetchConfig {
   signal?: AbortSignal
   /** Alias kept for API compatibility */
   responseType?: "json" | "arraybuffer" | "text"
+  /** 额外放行的 host（自建内网存储 / 反代），与 SSRF_ALLOWED_HOSTS 合并 */
+  allowHosts?: string[]
 }
 
 /** Axios-compatible response shape */
@@ -31,7 +33,27 @@ async function fetchWithTimeout(
   url: string,
   init: RequestInit,
   timeout: number,
+  allowHosts?: string[],
 ): Promise<Response> {
+  // 所有通用 HTTP 入口都从这里出网：必须做 SSRF 断言，否则驱动/插件里任何
+  // 用户可控 URL 都能直连内网或云元数据。管理员配置的内网存储通过
+  // SSRF_ALLOWED_HOSTS 或调用方 allowHosts 显式放行。
+  const testContext =
+    typeof process !== "undefined" &&
+    !!process.env?.NODE_TEST_CONTEXT &&
+    process.env?.SSRF_TEST_ENFORCE !== "1"
+  if (!testContext) {
+    const envHosts = String(
+      (typeof process !== "undefined" && process.env?.SSRF_ALLOWED_HOSTS) || "",
+    )
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+    assertSafeUrl(url, "HTTP request", [
+      ...envHosts,
+      ...(allowHosts || []),
+    ])
+  }
   const controller = new AbortController()
   const id = setTimeout(() => controller.abort(), timeout)
   try {
@@ -87,6 +109,7 @@ export async function get<T = any>(
     finalUrl,
     { method: "GET", headers: config?.headers },
     config?.timeout ?? DEFAULT_TIMEOUT,
+    config?.allowHosts,
   )
   return parseResponse<T>(res, config?.responseType)
 }
@@ -105,6 +128,7 @@ export async function post<T = any>(
     url,
     { method: "POST", headers, body },
     config?.timeout ?? DEFAULT_TIMEOUT,
+    config?.allowHosts,
   )
   return parseResponse<T>(res, config?.responseType)
 }
@@ -117,6 +141,7 @@ export async function request<T = any>(config: {
   params?: Record<string, string>
   timeout?: number
   responseType?: string
+  allowHosts?: string[]
 }): Promise<HttpResponse<T>> {
   const finalUrl = buildUrl(config.url, config.params)
   const headers: Record<string, string> = { ...(config.headers ?? {}) }
@@ -133,6 +158,7 @@ export async function request<T = any>(config: {
     finalUrl,
     { method: config.method.toUpperCase(), headers, body },
     config.timeout ?? DEFAULT_TIMEOUT,
+    config.allowHosts,
   )
   return parseResponse<T>(res, config.responseType)
 }
@@ -157,10 +183,71 @@ export async function download(
 }
 
 /**
+ * IPv4 是否落在环回 / 私有 / 链路本地 / 云元数据等受限网段。
+ * 字面 IPv4 与「嵌在 IPv6 里的 IPv4」共用这一份判定。
+ */
+function isBlockedIpv4(host: string): boolean {
+  const parts = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/)
+  if (!parts) return false
+  const nums = parts.slice(1).map((x) => parseInt(x, 10))
+  if (nums.some((n) => n > 255)) return true
+  const [a, b, c] = nums
+  if (a === 0) return true // 0.0.0.0/8
+  if (a === 127) return true // 环回
+  if (a === 10) return true // 10/8
+  if (a === 172 && b >= 16 && b <= 31) return true // 172.16/12
+  if (a === 192 && b === 168) return true // 192.168/16
+  if (a === 169 && b === 254) return true // 链路本地 + 云元数据
+  if (a === 100 && b >= 64 && b <= 127) return true // CGNAT 100.64/10
+  if (a === 100 && b === 100) return true // 阿里云元数据 100.100.100.200
+  if (a === 224 && b === 0 && c === 0) return true // 组播
+  if (a >= 240) return true // 保留
+  return false
+}
+
+/**
+ * 取出「嵌在 IPv6 里的 IPv4」。
+ * WHATWG URL 会把 `[::ffff:127.0.0.1]` 规范化成 `[::ffff:7f00:1]`，所以旧的
+ * `host.includes("::ffff:127.")` 这类点分前缀匹配对规范化后的形态完全失效，
+ * 127.0.0.1 / 169.254.169.254 / 10.0.0.1 都能原样通过。这里按数值还原。
+ */
+function embeddedIpv4(host: string): string | null {
+  const raw = host.replace(/^\[|\]$/g, "").toLowerCase()
+  if (!raw.includes(":")) return null
+  let m = raw.match(/^(?:::ffff:|::|64:ff9b:):?(\d{1,3}(?:\.\d{1,3}){3})$/)
+  if (m) return m[1]
+  m = raw.match(/^(?:::ffff:|::|64:ff9b:):?([0-9a-f]{1,4}):([0-9a-f]{1,4})$/)
+  if (m) {
+    const hi = parseInt(m[1], 16)
+    const lo = parseInt(m[2], 16)
+    return `${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`
+  }
+  return null
+}
+
+/** IPv6 自身的受限范围：环回、未指定、fc00::/7（ULA）、fe80::/10（链路本地） */
+function isBlockedIpv6Range(host: string): boolean {
+  const raw = host.replace(/^\[|\]$/g, "").toLowerCase()
+  if (!raw.includes(":")) return false
+  if (raw === "::1" || raw === "::") return true
+  const first = raw.split(":")[0]
+  if (first === "") {
+    // ::x 压缩形式，除 ::1 / :: 外不做范围判断
+  } else if (first.length <= 4) {
+    const head = parseInt(first, 16)
+    if (!Number.isNaN(head)) {
+      if ((head & 0xfe00) === 0xfc00) return true // fc00::/7
+      if ((head & 0xffc0) === 0xfe80) return true // fe80::/10
+    }
+  }
+  return false
+}
+
+/**
  * Validate that a target URL is safe against SSRF attacks:
  * 1. Protocol must be http: or https:
  * 2. Hostname/IP must not point to loopback, private RFC 1918 networks, link-local, or cloud metadata endpoints.
- * 
+ *
  * 2026-09-08 安全增强：
  * - 扩展 IPv6 检测（包括 IPv4-mapped IPv6）
  * - 检测 DNS 重绑定特征
@@ -177,7 +264,9 @@ export function isSafeUrl(
       return false
     }
 
-    const host = parsed.hostname.toLowerCase().trim()
+    // 去掉 FQDN 尾点：`metadata.google.internal.` / `localhost.` 这类尾点会让
+    // 下面的 endsWith 匹配全部落空，而 DNS 解析结果与不带尾点时完全相同。
+    const host = parsed.hostname.toLowerCase().trim().replace(/\.+$/, "")
     if (!host) return false
 
     // 白名单：管理员在存储配置里主动填写的 endpoint host（可能是内网/私有地址）
@@ -185,7 +274,11 @@ export function isSafeUrl(
     // 内网存储（自建 MinIO / 内网 S3 / 内网 WebDAV 等）。仅做精确 host 匹配，
     // 不放过子域名，避免被「受信域名下的任意子域」绕过。
     if (allowHosts) {
-      const allow = new Set(allowHosts)
+      const allow = new Set(
+        Array.from(allowHosts).map((h) =>
+          String(h).toLowerCase().trim().replace(/\.+$/, ""),
+        ),
+      )
       if (allow.has(host)) return true
     }
 
@@ -206,58 +299,25 @@ export function isSafeUrl(
       }
     }
 
-    // 2. 扩展 IPv6 检测（包括 IPv4-mapped IPv6）
-    const ipv6Patterns = [
-      "::1", // loopback
-      "[::1]",
-      "::ffff:127.", // IPv4-mapped IPv6 loopback
-      "::ffff:10.", // IPv4-mapped IPv6 private
-      "::ffff:172.", // IPv4-mapped IPv6 private
-      "::ffff:192.168.", // IPv4-mapped IPv6 private
-      "::ffff:169.254.", // IPv4-mapped IPv6 link-local
-      "fe80:", // link-local
-      "fc00:", // unique local
-      "fd00:", // unique local
-      "[fe80:",
-      "[fc",
-      "[fd",
-    ]
-    for (const pattern of ipv6Patterns) {
-      if (host.includes(pattern)) {
-        return false
-      }
+    // 2. IPv6：先把「嵌在 IPv6 里的 IPv4」还原成数值再判网段，然后判 IPv6
+    //    自身的环回 / ULA / 链路本地范围。旧的点分前缀 substring 匹配对
+    //    WHATWG 规范化后的形态（::ffff:7f00:1）完全无效。
+    const embedded = embeddedIpv4(host)
+    if (embedded && isBlockedIpv4(embedded)) {
+      return false
     }
-
-    // 3. 检测前导零八进制绕过（0177.0.0.1 = 127.0.0.1）
-    if (
-      /^\d{1,3}(\.\d{1,3}){1,3}$/.test(host) &&
-      /(^|\.)0\d+/.test(host)
-    ) {
+    if (isBlockedIpv6Range(host)) {
       return false
     }
 
-    // 4. 检测 IPv4 地址
-    const ipv4Regex = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/
-    const match = host.match(ipv4Regex)
-    if (match) {
-      const [, aStr, bStr, cStr, dStr] = match
-      const a = parseInt(aStr, 10)
-      const b = parseInt(bStr, 10)
-      const c = parseInt(cStr, 10)
-      const d = parseInt(dStr, 10)
-      if (a > 255 || b > 255 || c > 255 || d > 255) return false
+    // 3. 检测前导零八进制绕过（0177.0.0.1 = 127.0.0.1）
+    if (/^\d{1,3}(\.\d{1,3}){1,3}$/.test(host) && /(^|\.)0\d+/.test(host)) {
+      return false
+    }
 
-      // RFC 1918 私有网络和特殊用途地址
-      if (a === 0) return false // 0.0.0.0/8 (This network)
-      if (a === 127) return false // 127.0.0.0/8 (Loopback)
-      if (a === 10) return false // 10.0.0.0/8 (Private)
-      if (a === 172 && b >= 16 && b <= 31) return false // 172.16.0.0/12 (Private)
-      if (a === 192 && b === 168) return false // 192.168.0.0/16 (Private)
-      if (a === 169 && b === 254) return false // 169.254.0.0/16 (Link-local + metadata)
-      if (a === 100 && b >= 64 && b <= 127) return false // 100.64.0.0/10 (CGNAT)
-      if (a === 100 && b === 100) return false // Aliyun metadata 100.100.100.200
-      if (a === 224 && b === 0 && c === 0) return false // 224.0.0.0/24 (Multicast)
-      if (a >= 240) return false // 240.0.0.0/4 (Reserved)
+    // 4. 检测 IPv4 地址（受限网段判定见 isBlockedIpv4）
+    if (isBlockedIpv4(host)) {
+      return false
     }
 
     // 5. 阻止整数/十六进制 IP 表示（2130706433 = 127.0.0.1, 0x7f000001 = 127.0.0.1）
@@ -300,6 +360,53 @@ export function assertSafeUrl(
     throw new Error(
       `${context} blocked: URL points to a restricted or private network destination (SSRF protection)`,
     )
+  }
+}
+
+/**
+ * 校验第三方 3xx 的 Location：解析为绝对地址并做 SSRF 断言。
+ * 不安全/无法解析时返回空串，调用方应回退到原 URL 或报错。
+ */
+export function safeRedirectUrl(location: string, base: string): string {
+  try {
+    const next = new URL(location, base)
+    if (!isSafeUrl(next.toString())) return ""
+    return next.toString()
+  } catch {
+    return ""
+  }
+}
+
+/**
+ * 浏览器侧危险目标：环回 / 云元数据 / `.internal` 等。
+ *
+ * 驱动返回的 raw_url 会直接进 `<img src>` / `<a href>`，由**用户浏览器**发起
+ * 请求。RFC1918 内网可能是正常的局域网存储，故这里只拦环回与元数据；更严格
+ * 的全内网拦截交给服务端 assertSafeUrl。
+ */
+export function isBrowserUnsafeUrl(urlStr: string): boolean {
+  try {
+    const u = new URL(urlStr)
+    if (u.protocol !== "http:" && u.protocol !== "https:") return false
+    const host = u.hostname.toLowerCase().replace(/\.+$/, "")
+    if (
+      host === "localhost" ||
+      host.endsWith(".localhost") ||
+      host.endsWith(".local") ||
+      host.endsWith(".internal") ||
+      host === "metadata" ||
+      host === "metadata.google.internal" ||
+      host === "169.254.169.254" ||
+      host === "100.100.100.200" ||
+      host === "0.0.0.0"
+    ) {
+      return true
+    }
+    if (/^127\./.test(host)) return true
+    if (host === "[::1]" || host === "::1") return true
+    return false
+  } catch {
+    return false
   }
 }
 

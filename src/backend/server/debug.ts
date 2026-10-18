@@ -8,11 +8,23 @@ debugRouter.get("/info", async (c) => {
   const isAdmin = await checkAdminAuth(c)
   const db = await getDb(c.env)
 
+  const storeStatus: any = await getStoreStatus(c.env)
+  // 驱动 health 里的 error 文本常带 endpoint / DSN / 路径细节，匿名请求只保留
+  // 连接状态本身，管理员仍能看到原文便于排障。
+  const store = isAdmin
+    ? storeStatus
+    : {
+        ...storeStatus,
+        ...(typeof storeStatus?.error === "string"
+          ? { error: "[redacted: admin only]" }
+          : {}),
+      }
+
   const responseData: any = {
     runtime: "Cloudflare Workers / Edge",
     timestamp: new Date().toISOString(),
     // 后端驱动信息非敏感，未登录也返回，便于确认 D1/KV/MySQL 是否生效
-    store: await getStoreStatus(c.env),
+    store,
   }
 
   if (isAdmin) {

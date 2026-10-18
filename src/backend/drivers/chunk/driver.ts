@@ -8,6 +8,7 @@ import {
   calcFileType,
 } from "../../internal/driver/base"
 import { ChunkAddition, ChunkPart } from "./types"
+import { escapeRegExp } from "../../pkg/path"
 
 function joinPath(a: string, b: string): string {
   const left = String(a || "").replace(/\/+$/, "")
@@ -97,7 +98,9 @@ export class ChunkDriver implements StorageDriver {
     for (const item of items) {
       if (item.is_dir) continue
       const idx = parseInt(
-        item.name.replace(new RegExp(`${this.customExt}$`), ""),
+        // custom_ext 来自存储配置，必须当字面量处理：直接拼进 RegExp 会让
+        // `(a+)+` 这类配置变成 ReDoS，或让非法正则直接抛错打断整个列目录。
+        item.name.replace(new RegExp(escapeRegExp(this.customExt) + "$"), ""),
         10,
       )
       if (Number.isNaN(idx)) continue

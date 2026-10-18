@@ -1,5 +1,6 @@
 // 123 Cloud Drive API client
 // Based on: https://github.com/OpenListTeam/OpenList/tree/main/drivers/123
+import { safeRedirectUrl } from "../../pkg/http"
 import {
   Pan123Addition,
   Pan123DownloadResp,
@@ -460,7 +461,8 @@ export class Pan123Client {
       headers: { Referer: "https://yun.123pan.com/" },
     })
     if (res.status === 302) {
-      return res.headers.get("location") || downloadUrl
+      const loc = res.headers.get("location")
+      return loc ? safeRedirectUrl(loc, downloadUrl) || downloadUrl : downloadUrl
     }
     if (res.status < 300) {
       const body = await res.json().catch(() => ({}))

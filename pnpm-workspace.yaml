@@ -1,8 +1,7 @@
 packages:
   - "."
-allowBuilds:
-  "@swc/core": true
-  core-js: true
+# 原先这里的 `allowBuilds:` 不是 pnpm 认得的键（9.x 用 onlyBuiltDependencies /
+# neverBuiltDependencies），因此整块从未生效，属于无效配置，已删除。
 # cpu-features 是 ssh2 的可选原生加速依赖（C++ 模块，node-gyp 编译）。
 # CF Workers / EdgeOne 的边缘构建会把 ssh2 替换为空壳（build-edge.mjs 的
 # emptyNodeDriverPlugin），根本用不到它；Node 运行时下 ssh2 也有纯 JS 回退。

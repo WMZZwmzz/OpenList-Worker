@@ -1,3 +1,4 @@
+import { safeRedirectUrl } from "../../pkg/http"
 import {
   LanzouAddition,
   LanzouFileOrFolder,
@@ -850,9 +851,12 @@ export class LanzouClient {
       ) {
         const loc = probeRes.headers.get("location")
         if (loc) {
-          realDirectUrl = new URL(loc, downloadUrl).toString()
-          resolved = true
-          break
+          const safeLoc = safeRedirectUrl(loc, downloadUrl)
+          if (safeLoc) {
+            realDirectUrl = safeLoc
+            resolved = true
+            break
+          }
         }
       }
 

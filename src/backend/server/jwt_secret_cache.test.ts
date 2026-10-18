@@ -113,8 +113,12 @@ test("getJwtSecret: 不同 env 各自使用自己后端的密钥（不得串用�
   const secretB = "b".repeat(48)
   const statsA = { get: 0, put: 0 }
   const statsB = { get: 0, put: 0 }
-  const envA = { KV: createCountingKv({ [JWT_SECRET_KV_KEY]: secretA }, statsA) }
-  const envB = { KV: createCountingKv({ [JWT_SECRET_KV_KEY]: secretB }, statsB) }
+  const envA = {
+    KV: createCountingKv({ [JWT_SECRET_KV_KEY]: secretA }, statsA),
+  }
+  const envB = {
+    KV: createCountingKv({ [JWT_SECRET_KV_KEY]: secretB }, statsB),
+  }
 
   assert.equal(await getJwtSecret({ env: envA }), secretA)
   const readsA = statsA.get
@@ -130,4 +134,38 @@ test("getJwtSecret: 不同 env 各自使用自己后端的密钥（不得串用�
   // envA 的缓存也不应被 envB 覆盖。
   assert.equal(await getJwtSecret({ env: envA }), secretA)
   assert.equal(statsA.get, readsA, "envA 仍应命中自己的缓存")
+})
+
+test("SEC-027: 过短的 JWT_SECRET 只作最后兜底，够长则直用", async () => {
+  const strong = "0123456789abcdef0123456789abcdef"
+  resetJwtSecretCache()
+  __resetDbCacheForTest()
+  // 达到长度门槛：原样使用
+  assert.equal(await getJwtSecret({ env: { JWT_SECRET: strong } }), strong)
+
+  // 过短 + 有持久化密钥：优先用持久化那把（强且稳定）
+  resetJwtSecretCache()
+  __resetDbCacheForTest()
+  const persisted = "persisted-secret-value-0123456789"
+  const envWithKv = {
+    JWT_SECRET: "abc",
+    KV: createCountingKv(
+      { [JWT_SECRET_KV_KEY]: persisted },
+      { get: 0, put: 0 },
+    ),
+  }
+  assert.equal(await getJwtSecret({ env: envWithKv }), persisted)
+
+  // 过短 + 无处持久化：仍要返回一把**可用且不短**的密钥（生成并持久化成功时
+  // 用强密钥；确实无处可存时，实现里退回配置值以保证跨请求稳定，而不是易失随机钥）。
+  // 过短时不得各实例各造一把：两个**不同**的 env 对象（等价于两个 isolate）用同一
+  // 份配置，必须得到同一把密钥，否则表现为「登录后隔一会儿又 401」。
+  const first = await getJwtSecret({ env: { JWT_SECRET: "abc" } })
+  const second = await getJwtSecret({ env: { JWT_SECRET: "abc" } })
+  assert.equal(first, second, "同一配置必须得到同一把密钥")
+  assert.notEqual(first, "abc", "短密钥本身绝不能作为签名密钥")
+  assert.ok(
+    first.length >= 16,
+    `过短配置必须被替换为强随机密钥：${first}`,
+  )
 })
