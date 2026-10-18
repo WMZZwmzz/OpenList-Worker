@@ -47,7 +47,7 @@
     "build:edge": "node scripts/build-edge.mjs",
     "dev:unified": "node scripts/fetch-frontend.mjs && wrangler dev",
     "dev:worker": "wrangler dev",
-    "deploy:worker": "wrangler deploy --yes",
+    "deploy:worker": "wrangler deploy",
     "deploy": "node scripts/deploy.js",
     "build:all": "npm run build",
     "test:189": "tsx --test src/backend/drivers/189/*.test.ts",
