@@ -203,7 +203,7 @@ app.use("*", async (c, next) => {
     const extra = cdnOrigins ? ` ${cdnOrigins}` : ""
     c.res.headers.set(
       "Content-Security-Policy",
-      `default-src 'self'; script-src 'self' 'unsafe-inline'${extra}; style-src 'self' 'unsafe-inline'${extra}; img-src 'self' data: blob: https:; font-src 'self' data:${extra}; connect-src 'self'${extra}; media-src 'self' blob:${extra}; frame-ancestors 'none'; base-uri 'self'; form-action 'self'`,
+      `default-src 'self'; script-src 'self' 'unsafe-inline' data: https://static.cloudflareinsights.com${extra}; style-src 'self' 'unsafe-inline'${extra}; img-src 'self' data: blob: https:; font-src 'self' data:${extra}; connect-src 'self'${extra}; media-src 'self' blob:${extra}; frame-ancestors 'none'; base-uri 'self'; form-action 'self'`,
     )
   }
 })

@@ -180,7 +180,9 @@ function unverifiedAllowed() {
 
 /** SRI（sha512-<base64>）或 hex 摘要；返回 null 表示元数据里没有可用锚点 */
 function matchesSri(file, sri) {
-  const m = /^(sha512|sha384|sha256)-([^=]+)$/.exec(String(sri || ""))
+  // base64 的 `=` 填充属于摘要的一部分，不能用 [^=]+ 截断，否则所有带填充的
+  // sha512 SRI 都会被判成不匹配（构建被误拦）。
+  const m = /^(sha512|sha384|sha256)-(.+)$/.exec(String(sri || ""))
   if (!m) return false
   const b64 = hashFile(file, m[1]).digest("base64")
   return b64 === m[2]
