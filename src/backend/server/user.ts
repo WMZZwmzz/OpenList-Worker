@@ -1,9 +1,7 @@
 import { Hono } from "hono"
 import { getDb, saveDb } from "../internal/model/db"
-import { verifyUserPassword } from "./auth"
+import { authUserFromReq, verifyUserPassword } from "./auth"
 import { setUserPassword } from "../pkg/password"
-import { verify } from "hono/jwt"
-import { getJwtSecret } from "./middlewares"
 import { listUserSshKeys, deleteUserSshKey } from "../internal/op/sshkey"
 
 export const userRouter = new Hono()
@@ -290,16 +288,14 @@ userRouter.post("/cancel_2fa", async (c) => {
 
 // POST /api/user/update_pwd
 export const updatePwdHandler = async (c: any) => {
-  const authHeader = c.req.header("Authorization")
-  if (!authHeader) {
+  // 统一走 authUserFromReq：它会校验 token 撤销、账号 disabled，并按 id（而不是
+  // id OR username）定位用户。旧实现自己验 JWT，上述三项全部漏掉。
+  const auth = await authUserFromReq(c)
+  if (!auth) {
     return c.json({ code: 401, message: "Unauthorized", data: null }, 401)
   }
-  const token = authHeader.startsWith("Bearer ")
-    ? authHeader.substring(7)
-    : authHeader
+  const { db, user } = auth
   try {
-    const secret = await getJwtSecret(c)
-    const payload = await verify(token, secret, "HS256")
     const body = await c.req.json().catch(() => ({}))
     const oldPassword = body.old_password || ""
     const newPassword = body.new_password || ""
@@ -311,17 +307,12 @@ export const updatePwdHandler = async (c: any) => {
       )
     }
 
-    const db = await getDb(c.env)
     if (!db.users) db.users = []
-
-    const userIdx = db.users.findIndex(
-      (u: any) => u.id === payload.id || u.username === payload.username,
-    )
+    const userIdx = db.users.findIndex((u: any) => u.id === user.id)
     if (userIdx === -1) {
       return c.json({ code: 404, message: "User not found", data: null }, 404)
     }
 
-    const user = db.users[userIdx]
     if (!user.password || !(await verifyUserPassword(user, oldPassword))) {
       return c.json(
         { code: 400, message: "Incorrect old password", data: null },

@@ -148,7 +148,7 @@ test("user/create follows Go: no silent default password and no echoed password"
         "0000000000000000000000000000000000000000000000000000000000000000",
       ),
     ],
-    [{ key: "token", value: ADMIN_TOKEN }],
+    [{ key: "api_token", value: ADMIN_TOKEN }],
   )
   const app = new Hono()
   app.route("/api/admin/user", userRouter)

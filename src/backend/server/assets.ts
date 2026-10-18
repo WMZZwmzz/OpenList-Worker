@@ -190,6 +190,8 @@ export function injectCdnIntoHtml(html: string, cdn: string): string {
   const value = cdn
     .replace(/\\/g, "\\\\")
     .replace(/'/g, "\\'")
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
     .replace(/\r/g, "\\r")
     .replace(/\n/g, "\\n")
   return html.replace(/cdn:\s*undefined/, () => `cdn: '${value}'`)
@@ -283,7 +285,16 @@ export async function getIndexHtmlWithCdn(
     return ensureManifestCredentials(localHtml)
   // 供静态资源缺失时的 302 复用同一地址（见 cdnAssetRedirect）
   resolvedCdnCache.set(rawAssetUrls(env), cdn)
-  const hit = cdnHtmlCache.get(cdn)
+  // 是否允许回退到 CDN 的 index.html。默认**不**信任第三方 HTML：CDN 一旦被
+  // 投毒/劫持，返回的整页 HTML 会在本站同源执行任意脚本（origin XSS）。
+  // 自建可信 CDN 确实需要该兜底时，显式设置 ASSETS_ALLOW_CDN_HTML=1。
+  const allowCdnHtml =
+    env?.ASSETS_ALLOW_CDN_HTML === "1" ||
+    env?.ASSETS_ALLOW_CDN_HTML === "true"
+  // 缓存必须区分两种来源：允许 CDN HTML 后写入的整页内容，绝不能在后续
+  // 默认配置的请求里被复用。
+  const cacheKey = `${cdn}|${allowCdnHtml ? "cdn" : "local"}`
+  const hit = cdnHtmlCache.get(cacheKey)
   if (hit && Date.now() - hit.ts < CDN_HTML_TTL_MS) return hit.html
 
   // A. 本地 HTML：先确认 CDN 上确实有这套哈希，避免本地构建与 CDN 版本不一致
@@ -291,27 +302,29 @@ export async function getIndexHtmlWithCdn(
   const entry = extractEntryAsset(localHtml)
   if (entry && (await cdnHasAsset(cdn, entry))) {
     const html = ensureManifestCredentials(injectCdnIntoHtml(localHtml, cdn))
-    cdnHtmlCache.set(cdn, { html, ts: Date.now() })
+    cdnHtmlCache.set(cacheKey, { html, ts: Date.now() })
     return html
   }
 
-  // B. CDN 的 index.html
-  try {
-    const res = await fetch(`${cdn}/index.html`, {
-      headers: { accept: "text/html" },
-      signal: AbortSignal.timeout(4000),
-    })
-    if (res.ok) {
-      let html = await res.text()
-      // 校验确实是 HTML，而非 CDN 的 JSON 错误页（如 npmmirror 的 451 blocked）
-      if (/<html/i.test(html)) {
-        html = ensureManifestCredentials(injectCdnIntoHtml(html, cdn))
-        cdnHtmlCache.set(cdn, { html, ts: Date.now() })
-        return html
+  // B. CDN 的 index.html —— 仅在显式允许时启用。
+  if (allowCdnHtml) {
+    try {
+      const res = await fetch(`${cdn}/index.html`, {
+        headers: { accept: "text/html" },
+        signal: AbortSignal.timeout(4000),
+      })
+      if (res.ok) {
+        let html = await res.text()
+        // 校验确实是 HTML，而非 CDN 的 JSON 错误页（如 npmmirror 的 451 blocked）
+        if (/<html/i.test(html)) {
+          html = ensureManifestCredentials(injectCdnIntoHtml(html, cdn))
+          cdnHtmlCache.set(cacheKey, { html, ts: Date.now() })
+          return html
+        }
       }
+    } catch {
+      // CDN 不可达 / 超时：回退源站
     }
-  } catch {
-    // CDN 不可达 / 超时：回退源站
   }
 
   // C. 降级：不注入

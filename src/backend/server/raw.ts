@@ -2,7 +2,9 @@ import { Hono } from "hono"
 import { getSettings, resolvePath } from "../internal/model/db"
 import { parseRangeHeader } from "../internal/stream/stream"
 import { flushPendingDriverState, getDriver } from "../internal/op/storage"
-import { resolveShare } from "../internal/op/share"
+import { resolveShare, shareClientKey } from "../internal/op/share"
+import { getUserFromContext } from "./middlewares"
+import { canAccess, getNearestMeta } from "../pkg/meta"
 import {
   getCachedLink,
   setCachedLink,
@@ -15,6 +17,7 @@ import {
   getSignExpiresIn,
 } from "../pkg/sign"
 import { safeErrorMessage } from "../pkg/errs"
+import { secureLog, secureWarn, secureError } from "../pkg/secure-log"
 import { encodeDownloadPath } from "../pkg/path"
 import { assertSafeUrl, getTrustedHosts } from "../pkg/http"
 import {
@@ -36,6 +39,16 @@ import {
   isAuthBoundDownload,
   upstreamBodySize,
 } from "./proxy_request"
+
+function logPath(value: string): string {
+  const s = String(value ?? "")
+  let out = ""
+  for (const ch of s) {
+    const code = ch.codePointAt(0) ?? 0
+    out += code < 0x20 || code === 0x7f ? "_" : ch
+  }
+  return out.length > 512 ? out.slice(0, 512) : out
+}
 
 let fsPromises: any = null
 let createReadStream: any = null
@@ -183,8 +196,8 @@ async function proxyUpstream(
     } catch (ssrfErr: any) {
       return c.text(ssrfErr.message || "SSRF blocked", 403)
     }
-    console.warn(
-      `[rawRouter] Falling back to 302 direct link for '${reqPath}': ${fileItem.size} bytes exceeds ` +
+    secureWarn(
+      `[rawRouter] Falling back to 302 direct link for '${logPath(reqPath)}': ${fileItem.size} bytes exceeds ` +
         `the ${getProxyPayloadLimit(c)}-byte payload limit of this runtime — native proxy would hit ` +
         `CLOUD_FUNCTION_PAYLOAD_TOO_LARGE`,
     )
@@ -192,8 +205,8 @@ async function proxyUpstream(
   }
 
   if (payloadAction === "too-large") {
-    console.warn(
-      `[rawRouter] Refusing to proxy '${reqPath}': ${fileItem.size} bytes exceeds the ` +
+    secureWarn(
+      `[rawRouter] Refusing to proxy '${logPath(reqPath)}': ${fileItem.size} bytes exceeds the ` +
         `${getProxyPayloadLimit(c)}-byte payload limit of this runtime and no direct link can be ` +
         `handed to the browser (driver=${driver}, authBound=${authBound})`,
     )
@@ -230,8 +243,8 @@ async function proxyUpstream(
   // 时去掉 Range 重试一次，保证请求最终能成功。
   // 注意：签名绑定 URL 中的路径与过期时间、与请求头无关，故重试无需重新签名。
   if (shouldRetryWithoutRange(headers, upstreamRes)) {
-    console.warn(
-      `[rawRouter] Upstream ignored/refused Range (status=${upstreamRes.status}) for '${reqPath}', retrying without Range header...`,
+    secureWarn(
+      `[rawRouter] Upstream ignored/refused Range (status=${upstreamRes.status}) for '${logPath(reqPath)}', retrying without Range header...`,
     )
     delete headers["Range"]
     upstreamRes = await safeProxyFetch(fileItem.raw_url, headers, trustedHosts)
@@ -253,9 +266,9 @@ async function proxyUpstream(
     try {
       await upstreamRes.body?.cancel()
     } catch {}
-    console.warn(
+    secureWarn(
       `[rawRouter] Upstream body is ${actualBodySize} bytes after Range negotiation ` +
-        `(status=${upstreamRes.status}) for '${reqPath}', which exceeds the ` +
+        `(status=${upstreamRes.status}) for '${logPath(reqPath)}', which exceeds the ` +
         `${getProxyPayloadLimit(c)}-byte payload limit of this runtime — ` +
         `refusing to stream it (decision=${secondCheck}).`,
     )
@@ -286,10 +299,25 @@ async function proxyUpstream(
   )
 
   // Content-Type: prefer upstream, fallback by extension
+  //
+  // 上游类型是用户可上传的文件内容决定的：把 text/html 原样回传等于让攻击者在
+  // 站点自身源上放一个可执行脚本的文档（存储型 XSS），SVG 同理。
+  // HTML/XHTML 一律降级为纯文本下载，SVG 保留可视但锁死脚本。
+  const upstreamType = (
+    upstreamRes.headers.get("content-type") || contentTypeForPath(reqPath)
+  ).trim()
+  const htmlType = /^(text\/html|application\/xhtml\+xml)/i.test(upstreamType)
+  const svgType = /^image\/svg\+xml/i.test(upstreamType)
   c.header(
     "Content-Type",
-    upstreamRes.headers.get("content-type") || contentTypeForPath(reqPath),
+    htmlType ? "text/plain; charset=utf-8" : upstreamType,
   )
+  if (svgType) {
+    c.header(
+      "Content-Security-Policy",
+      "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; sandbox",
+    )
+  }
 
   // Forward range/length headers
   const contentLength = upstreamRes.headers.get("content-length")
@@ -314,6 +342,9 @@ async function proxyUpstream(
       "Content-Disposition",
       sanitizeContentDisposition(contentDisposition),
     )
+  } else if (htmlType) {
+    // 降级成纯文本后强制另存为，避免在页面里就地渲染
+    c.header("Content-Disposition", "attachment")
   }
 
   return c.body(upstreamRes.body as any, upstreamRes.status as any)
@@ -348,17 +379,27 @@ async function buildDownProxyUrl(
     ? template.replace(/\$path(?!\w)/g, encoded)
     : template.replace(/\/+$/, "") + encoded
 
-  if (!getDisableProxySign(storage) && !/[?&]sign=/.test(url)) {
+  if (!getDisableProxySign(storage) && !/[?&]sign=/.test(template)) {
     try {
-      const sign = await signDownloadPath(
-        c,
-        reqPath,
-        await getSignExpiresIn(c),
-      )
-      if (sign) url += (url.includes("?") ? "&" : "?") + "sign=" + sign
+      const sign = await signDownloadPath(c, reqPath, await getSignExpiresIn(c))
+      if (sign) {
+        // 判断「模板是否自带 sign」只能看模板：文件名里合法地含有 `&sign=` 时，
+        // 对拼接结果做正则会误判成「已有签名」从而跳过补签，等于让攻击者自己
+        // 决定直链上的签名参数。补签时也用 searchParams.set 覆盖同名参数。
+        let appended = false
+        try {
+          const u = new URL(url)
+          u.searchParams.set("sign", sign)
+          url = u.toString()
+          appended = true
+        } catch {
+          // 模板不是绝对 URL：退回字符串拼接
+        }
+        if (!appended) url += (url.includes("?") ? "&" : "?") + "sign=" + sign
+      }
     } catch (e: any) {
-      console.warn(
-        `[rawRouter] failed to sign down_proxy_url for '${reqPath}': ${e?.message || e}`,
+      secureWarn(
+        `[rawRouter] failed to sign down_proxy_url for '${logPath(reqPath)}': ${e?.message || e}`,
       )
     }
   }
@@ -381,10 +422,7 @@ rawRouter.get("/*", async (c) => {
     c.req.path.startsWith("/p") || c.req.path.startsWith("/api/p")
 
   // Strip the route prefix once, preserving mount names such as /pikpak_webdav.
-  const rawPath = c.req.path.replace(
-    /^\/(?:api\/)?(?:raw|sd|d|p)(?=\/|$)/,
-    "",
-  )
+  const rawPath = c.req.path.replace(/^\/(?:api\/)?(?:raw|sd|d|p)(?=\/|$)/, "")
 
   // 非法百分号转义（如手工拼出的 `/api/p/100%.txt`）会让 decodeURIComponent
   // 抛 URIError。Go 侧因为 raw_url 走 EncodePath 编码过 `%`，正常流程不会出现；
@@ -420,12 +458,27 @@ rawRouter.get("/*", async (c) => {
         cookiePwd = cookiePwdRaw
       }
       const sharePwd = c.req.query("pwd") || cookiePwd
-      const shareRes = await resolveShare(reqPath, sharePwd, c.env)
+      const shareRes = await resolveShare(
+        reqPath,
+        sharePwd,
+        c.env,
+        shareClientKey(c),
+      )
       if (!shareRes.ok) {
         return c.text(shareRes.error || "Share not found", 404)
       }
       if (shareRes.virtualList || !shareRes.realPath) {
         return c.text("Cannot download share root", 400)
+      }
+      // 分享直链同样要服从目录 meta：read_users 只能由登录用户满足，
+      // 密码 meta 用分享提取码（同一请求字段）校验。此前这里只解析分享，
+      // 分享一旦指向 meta 保护目录，匿名直链就绕过了密码/名单。
+      const shareUser = await getUserFromContext(c).catch(() => null)
+      const shareMeta = await getNearestMeta(shareRes.realPath, c.env).catch(
+        () => null,
+      )
+      if (!canAccess(shareUser, shareMeta, shareRes.realPath, sharePwd)) {
+        return c.text("Access denied", 403)
       }
       reqPath = shareRes.realPath
     } else {
@@ -488,8 +541,8 @@ rawRouter.get("/*", async (c) => {
           textTypes,
         })
       ) {
-        console.warn(
-          `[rawRouter] proxy not allowed for '${reqPath}' ` +
+        secureWarn(
+          `[rawRouter] proxy not allowed for '${logPath(reqPath)}' ` +
             `(storage=${resolved.storage.id}, driver=${resolved.storage.driver})`,
         )
         return c.text("proxy not allowed", 403)
@@ -557,13 +610,13 @@ rawRouter.get("/*", async (c) => {
                   } catch (ssrfErr: any) {
                     return c.text(ssrfErr.message || "SSRF blocked", 403)
                   }
-                  console.log(
-                    `[rawRouter] Redirecting download for '${reqPath}' to configured proxy url via ${resolved.storage.driver}`,
+                  secureLog(
+                    `[rawRouter] Redirecting download for '${logPath(reqPath)}' to configured proxy url via ${resolved.storage.driver}`,
                   )
                   return c.redirect(url, 302)
                 }
               }
-              console.warn(
+              secureWarn(
                 `[rawRouter] webdav_policy=use_proxy_url but down_proxy_url is empty (storage=${resolved.storage.id}); falling back to native proxy`,
               )
               return proxyUpstream(
@@ -590,8 +643,8 @@ rawRouter.get("/*", async (c) => {
             } catch (ssrfErr: any) {
               return c.text(ssrfErr.message || "SSRF blocked", 403)
             }
-            console.log(
-              `[rawRouter] Redirecting download for '${reqPath}' via ${resolved.storage.driver}`,
+            secureLog(
+              `[rawRouter] Redirecting download for '${logPath(reqPath)}' via ${resolved.storage.driver}`,
             )
             return c.redirect(fileItem.raw_url, 302)
           } else if (
@@ -610,8 +663,8 @@ rawRouter.get("/*", async (c) => {
                 getProxyPayloadLimit(c),
               )
             ) {
-              console.warn(
-                `[rawRouter] Refusing to stream '${reqPath}': ${streamSize} bytes exceeds the ` +
+              secureWarn(
+                `[rawRouter] Refusing to stream '${logPath(reqPath)}': ${streamSize} bytes exceeds the ` +
                   `${getProxyPayloadLimit(c)}-byte payload limit of this runtime.`,
               )
               return c.json(
@@ -631,10 +684,12 @@ rawRouter.get("/*", async (c) => {
             const size = fileItem.size || 0
             const rangeHeader = c.req.header("Range")
             if (rangeHeader && size > 0) {
-              const { start, end, chunksize } = parseRangeHeader(
-                rangeHeader,
-                size,
-              )
+              const range = parseRangeHeader(rangeHeader, size)
+              if (!range) {
+                c.header("Content-Range", `*/${size}`)
+                return c.text("Range Not Satisfiable", 416)
+              }
+              const { start, end, chunksize } = range
               const stream = await (driver as any).createReadStream(
                 resolved.physical,
                 { start, end },
@@ -660,13 +715,13 @@ rawRouter.get("/*", async (c) => {
                 ? "该条目是文件夹，不可作为文件下载。"
                 : "该存储驱动未返回下载链接（raw_url 为空）。")
             return c.text(
-              `File not found or no download link available: ${reqPath}\n${detail}`,
+              `File not found or no download link available: ${logPath(reqPath)}\n${detail}`,
               404,
             )
           }
         } catch (e: any) {
-          console.error(
-            `[rawRouter] Driver get failed for '${reqPath}':`,
+          secureError(
+            `[rawRouter] Driver get failed for '${logPath(reqPath)}':`,
             e.message,
           )
           return c.text(`Download failed: ${safeErrorMessage(e)}`, 500)
@@ -705,7 +760,12 @@ rawRouter.get("/*", async (c) => {
     c.header("Access-Control-Allow-Origin", "*")
     const rangeHeader = c.req.header("Range")
     if (rangeHeader) {
-      const { start, end, chunksize } = parseRangeHeader(rangeHeader, stat.size)
+      const range = parseRangeHeader(rangeHeader, stat.size)
+      if (!range) {
+        c.header("Content-Range", `*/${stat.size}`)
+        return c.text("Range Not Satisfiable", 416)
+      }
+      const { start, end, chunksize } = range
       const stream = createReadStream(resolved.physical, { start, end })
 
       c.header("Content-Range", `bytes ${start}-${end}/${stat.size}`)
@@ -720,7 +780,10 @@ rawRouter.get("/*", async (c) => {
       return c.body(stream as any)
     }
   } catch (err: any) {
-    console.error(`[rawRouter] Download 404 for '${reqPath0}':`, err.message)
+    secureError(
+      `[rawRouter] Download 404 for '${logPath(reqPath0)}':`,
+      err.message,
+    )
     return c.text(`Not found: ${safeErrorMessage(err, "file not found")}`, 404)
   }
 })

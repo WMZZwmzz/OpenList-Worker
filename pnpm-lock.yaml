@@ -1471,7 +1471,7 @@ packages:
         optional: true
 
   '@hope-ui/solid@https://codeload.github.com/OpenListTeam/hope-ui/tar.gz/31b436e36ae5d266016814ba71a442ffa9d91181':
-    resolution: {tarball: https://codeload.github.com/OpenListTeam/hope-ui/tar.gz/31b436e36ae5d266016814ba71a442ffa9d91181}
+    resolution: {integrity: sha512-9/mjxC68etkyl9un/eNBaW7zSALOs6KJKMfbD+B+Ufv7QnwqVufTl6wzI7q32/GFIcWPdbwZ1TvfzLngOGoWzA==, tarball: https://codeload.github.com/OpenListTeam/hope-ui/tar.gz/31b436e36ae5d266016814ba71a442ffa9d91181}
     version: 0.6.7
     peerDependencies:
       '@stitches/core': ^1.2.8
@@ -3452,7 +3452,7 @@ packages:
     resolution: {integrity: sha512-jz4x+TJNFHwHtwuV9vA9rMujcZRb0CEilTEwG2rRSpe/A7Jdkuj8xPKttCgOh+v/lkHy7HsZ64oj+q3xoAFl9A==}
 
   mpegts.js@https://codeload.github.com/OpenListTeam/mpegts.js/tar.gz/1e51e0f6f918cf08e05dfae9c7bfcf658d6b4ac2:
-    resolution: {tarball: https://codeload.github.com/OpenListTeam/mpegts.js/tar.gz/1e51e0f6f918cf08e05dfae9c7bfcf658d6b4ac2}
+    resolution: {integrity: sha512-o+XY4uWTcXr6aDJOf6Et+zuWexpBYZxBCmn2tYI5+VWToK5Do6ueEc0c4xuetKA/MyvbavInkGZBgHLevEpfhw==, tarball: https://codeload.github.com/OpenListTeam/mpegts.js/tar.gz/1e51e0f6f918cf08e05dfae9c7bfcf658d6b4ac2}
     version: 1.8.1
 
   ms@2.1.3:

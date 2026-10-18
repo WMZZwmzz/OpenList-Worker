@@ -1,7 +1,12 @@
 import { Hono } from "hono"
-import { setupRouter } from "./server/router"
+import { rateLimitMiddleware, setupRouter } from "./server/router"
 import { rawRouter } from "./server/raw"
-import { assetsRouter, getIndexHtmlWithCdn, isCdnConfigured, cdnAssetRedirect } from "./server/assets"
+import {
+  assetsRouter,
+  getIndexHtmlWithCdn,
+  isCdnConfigured,
+  cdnAssetRedirect,
+} from "./server/assets"
 import { webdavRouter } from "./server/webdav"
 import { s3Router } from "./server/s3"
 import { setEnvCtx } from "./internal/model/db"
@@ -11,10 +16,29 @@ import { storageErrorSummary, uiStorageError } from "./server/storage-error"
 const app = new Hono()
 
 /**
+ * 从 ASSET_URLS 里提取静态资源 CDN 的 origin，供 CSP 放行。
+ * 模板值（$version / @pkg@）只影响路径，origin 仍可安全解析。
+ */
+function assetCspOrigins(env: any): string {
+  const raw = String(env?.ASSET_URLS || "")
+  if (!raw) return ""
+  const origins = new Set<string>()
+  for (const entry of raw.split(",")) {
+    const m = entry.trim().match(/^(https?:\/\/[^/]+)/i)
+    if (m) origins.add(m[1])
+  }
+  return Array.from(origins).join(" ")
+}
+
+/**
  * 静态资源 / SPA 壳路径：这些请求不应被存储配置错误拦截，
  * 否则前端连提示页面都加载不出来。
  */
-function isStaticOrShell(pathname: string, accept: string, method: string): boolean {
+function isStaticOrShell(
+  pathname: string,
+  accept: string,
+  method: string,
+): boolean {
   // 带扩展名的静态文件
   if (/\.[a-zA-Z0-9]+$/.test(pathname)) return true
   // 浏览器导航请求（HTML）由 SPA 壳承载
@@ -153,6 +177,46 @@ for (const path of KV_PROXY_PATHS) {
   )
 }
 
+// 全局安全响应头。此前这些头只在 setupRouter() 里设置，而 setupRouter 只挂在
+// /api 子应用上：/d /p /sd /dav /s3 与 SPA 兜底完全不经过它，于是用户文件的
+// 响应既没有 nosniff，也没有点击劫持/引用泄露防护。
+// 用“缺省才填”的方式写入，让内层路由自己的取值（如 /api 的 CSP）优先保留。
+app.use("*", async (c, next) => {
+  await next()
+  const h = c.res.headers
+  if (!h.get("X-Content-Type-Options"))
+    c.res.headers.set("X-Content-Type-Options", "nosniff")
+  if (!h.get("X-Frame-Options"))
+    c.res.headers.set("X-Frame-Options", "SAMEORIGIN")
+  if (!h.get("Referrer-Policy"))
+    c.res.headers.set("Referrer-Policy", "no-referrer")
+  if (!h.get("Strict-Transport-Security"))
+    c.res.headers.set(
+      "Strict-Transport-Security",
+      "max-age=31536000; includeSubDomains",
+    )
+  // 全局 CSP：此前只有 /api 子应用设置，SPA 入口与 /dav、/s3 完全没有。
+  // 这里用缺省填充，保留 /api 更严格的策略；'unsafe-inline' 是为了让构建期
+  // 注入的 window.__ASSET_URLS__ 内联脚本继续工作（其内容已做 </script> 转义）。
+  if (!h.get("Content-Security-Policy")) {
+    const cdnOrigins = assetCspOrigins(c.env)
+    const extra = cdnOrigins ? ` ${cdnOrigins}` : ""
+    c.res.headers.set(
+      "Content-Security-Policy",
+      `default-src 'self'; script-src 'self' 'unsafe-inline'${extra}; style-src 'self' 'unsafe-inline'${extra}; img-src 'self' data: blob: https:; font-src 'self' data:${extra}; connect-src 'self'${extra}; media-src 'self' blob:${extra}; frame-ancestors 'none'; base-uri 'self'; form-action 'self'`,
+    )
+  }
+})
+
+// 限流也要覆盖下载与协议入口：/d /p /sd /dav /s3 不经过 setupRouter，此前完全
+// 不受 ip_limit / traffic_limit 约束（刷直链、刷流量、WebDAV 爆破都拦不住）。
+// 两项设置默认为 0，此时中间件直接放行，不改变现有行为。
+app.use("/d/*", rateLimitMiddleware)
+app.use("/p/*", rateLimitMiddleware)
+app.use("/sd/*", rateLimitMiddleware)
+app.use("/dav/*", rateLimitMiddleware)
+app.use("/s3/*", rateLimitMiddleware)
+
 // 挂载 API 到 /api
 const api = new Hono()
 setupRouter(api)
@@ -183,6 +247,14 @@ export function setSpaFallbackHtml(html: string) {
 app.all("*", async (c) => {
   const env = c.env as any
   const url = new URL(c.req.url)
+  // 未匹配到任何路由的**写请求**不能落到 SPA 兜底：兜底会用 c.req.raw 复制一个
+  // 请求，而 POST 的 body 流往往已被审计/解析中间件读过，workerd 会抛
+  // 「ReadableStream is disturbed」，把本该是 404 的结果变成 500（也掩盖了真实
+  // 的「路由不存在」原因，例如拼错的 admin 路径）。
+  const httpMethod = c.req.method.toUpperCase()
+  if (httpMethod !== "GET" && httpMethod !== "HEAD") {
+    return c.json({ code: 404, message: "Not Found", data: null }, 404)
+  }
   if (env && env.ASSETS && typeof env.ASSETS.fetch === "function") {
     const res = await env.ASSETS.fetch(c.req.raw)
     if (res.status >= 200 && res.status < 300) {
@@ -221,7 +293,8 @@ app.all("*", async (c) => {
     if (toCdn) return c.redirect(toCdn, 302)
     // SPA fallback: return index.html for non-asset routes (e.g. /login, /manage)
     // 注意：ASSETS.fetch 对 /index.html 也可能返回 307，直接 fetch "/" 获取实际 HTML
-    const rootReq = new Request(`${url.origin}/`, c.req.raw)
+    // 这里必须以不带 body 的 GET 重新构造，不能复制 c.req.raw（其 body 可能已被消费）
+    const rootReq = new Request(`${url.origin}/`, { method: "GET" })
     const rootRes = await env.ASSETS.fetch(rootReq)
     const headers = new Headers(rootRes.headers)
     headers.set("Content-Type", "text/html; charset=utf-8")

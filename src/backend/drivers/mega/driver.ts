@@ -141,8 +141,9 @@ export class MegaDriver implements StorageDriver {
     if (!node) {
       throw new Error("Node not found")
     }
-    // Rename via attr update
-    console.warn(`[Mega] rename ${physicalPath} to ${newName}`)
+    // 客户端尚未实现改名接口：必须显式失败，不能 console.warn 后假装成功，
+    // 否则调用方会认为改名已完成。
+    throw new Error("Mega driver: rename is not supported")
   }
 
   async move(
@@ -162,9 +163,10 @@ export class MegaDriver implements StorageDriver {
       throw new Error("Destination folder not found")
     }
     const srcNode = this.resolveNodeByPath(srcPath)
-    if (srcNode) {
-      await this.client.moveNode(srcNode.id, dstNode.id)
+    if (!srcNode) {
+      throw new Error(`Mega driver: source node not found for ${srcPath}`)
     }
+    await this.client.moveNode(srcNode.id, dstNode.id)
   }
 
   async copy(
@@ -177,6 +179,7 @@ export class MegaDriver implements StorageDriver {
     console.warn(
       `[Mega] copy not supported natively from ${srcPhys} to ${dstPhys}`,
     )
+    throw new Error("Mega driver: copy is not supported")
   }
 
   async remove(
@@ -188,9 +191,11 @@ export class MegaDriver implements StorageDriver {
     // 参数即目标项路径，不得再拼 name，否则指向 `<item>/<name>`，resolveNodeByPath
     // 返回 null 后被静默跳过，接口成功但节点仍在。
     const node = this.resolveNodeByPath(this.cleanPath(physicalPath))
-    if (node) {
-      await this.client.deleteNode(node.id)
+    if (!node) {
+      // 找不到节点必须报错：静默返回会让调用方以为删除成功，而文件仍在
+      throw new Error(`Mega driver: node not found for ${physicalPath}`)
     }
+    await this.client.deleteNode(node.id)
   }
 
   async put(
@@ -199,6 +204,7 @@ export class MegaDriver implements StorageDriver {
     content: Buffer | Uint8Array,
   ): Promise<void> {
     console.warn(`[Mega] put for ${physicalPath}`)
+    throw new Error("Mega driver: put is not supported")
   }
 
   async getDetails(): Promise<{ total_space?: number; used_space?: number }> {

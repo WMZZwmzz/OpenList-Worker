@@ -1,3 +1,4 @@
+import { safeRedirectUrl } from "../../pkg/http"
 import {
   TeraboxAddition,
   TeraboxCheckLoginResp,
@@ -257,7 +258,7 @@ export class TeraboxApiClient {
     })
 
     const loc = headRes.headers.get("location")
-    return loc || dlink
+    return loc ? safeRedirectUrl(loc, dlink) || dlink : dlink
   }
 
   async linkCrack(path: string): Promise<string> {

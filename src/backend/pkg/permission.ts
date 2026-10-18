@@ -1,7 +1,28 @@
+import {
+  collapsePathSegments,
+  canonicalVirtualPath,
+  decodePathFully,
+} from "./path"
+
 export enum UserRole {
   GENERAL = 0,
   GUEST = 1,
   ADMIN = 2,
+}
+
+export const JWT_ISSUER = "openlist"
+export const JWT_AUDIENCE = "openlist-api"
+
+/**
+ * JWT 的 iss/aud 校验：新签发的 token 必须带正确的值；历史上没有这两个 claim
+ * 的 token 仍接受（避免升级即全员掉线），但带错值的一律拒绝，防止同一密钥被
+ * 其它服务复用后互相认账。
+ */
+export function jwtClaimsAcceptable(payload: any): boolean {
+  if (!payload || typeof payload !== "object") return false
+  if (payload.iss !== undefined && payload.iss !== JWT_ISSUER) return false
+  if (payload.aud !== undefined && payload.aud !== JWT_AUDIENCE) return false
+  return true
 }
 
 export const PermissionBit = {
@@ -30,6 +51,28 @@ export interface UserPermissionObj {
   permission: number
   disabled?: boolean
   base_path?: string
+}
+
+/**
+ * 按 token subject 定位用户。
+ *
+ * 旧写法是 `u.id === payload.id || u.username === payload.username`，两个条件
+ * 任一命中即通过：删号后重建同名用户、或用户改名后旧 id 被复用，都会让一张
+ * 仍在有效期内的旧 token 认到别人身上。现在以 id 为准，只有历史签发的 token
+ * （不含 id）才回退按用户名匹配。
+ */
+export function findUserByTokenPayload(
+  users: any[] | undefined,
+  payload: any,
+): any {
+  if (!Array.isArray(users) || !payload) return null
+  if (payload.id !== undefined && payload.id !== null) {
+    return users.find((u: any) => String(u.id) === String(payload.id)) || null
+  }
+  if (payload.username) {
+    return users.find((u: any) => u.username === payload.username) || null
+  }
+  return null
 }
 
 export function isGuest(user?: UserPermissionObj | null): boolean {
@@ -107,14 +150,20 @@ export function normalizeSegments(p: string): string {
  *    - reqPath = "/sub" -> "/photos/sub"
  *    - reqPath = "sub" -> "/photos/sub"
  *
- * 安全不变量（必须长期保持）：**返回值只可能等于 base_path 或位于其下**。
+ * 安全不变量（必须长期保持）：**返回值只可能等于 base_path 或位于其下**，且始终
+ * 是「与 resolvePath 同源的规范形式」：先按 resolvePath 的方式做多重百分号解码 +
+ * 段折叠，再要求结果不得越过用户自己的根目录（`..`、`%2e%2e`、`%252e%252e` 等写法
+ * 在 base_path 处被钳制）。
+ *
  * 历史缺陷：本函数只做字符串拼接，`..` 段留给下游 resolvePath() 折叠。于是
  * `/photos/alice` + `/../bob/x` 会解析成 `/photos/bob/x` —— 用户根目录被越过。
  * 因为拼接后才规范化，下游只保证「不逃出存储物理根」，并不保证「不逃出用户
- * 根」，两者不是同一约束。这里先把 reqPath 折叠到根再拼接，从源头保证隔离。
+ * 根」，两者不是同一约束。
  *
- * 注意：不额外增加 decodeURIComponent 次数。上游按约定只解码一次，多次解码会
- * 改变合法 `%2f`/百分号字面量的含义（与 Go 的 EncodePath 契约冲突）。
+ * 同源很重要：meta 覆盖判定、签名计算、hide/read_users 检查都是字符串比较，而真正
+ * 定位存储时 resolvePath 会先解码再折叠 `..`。不同源就会出现
+ * `/public/../secret/x.txt` 被判成「不在保护区内」（免签名/免密码），实际却读到
+ * `/secret/x.txt`。
  */
 export function getActualPath(
   user?: UserPermissionObj | null,
@@ -125,17 +174,31 @@ export function getActualPath(
     return p
   }
 
-  const basePath = normalizeSegments((user?.base_path || "/").trim() || "/")
-  if (basePath === "/") {
-    return normalizeSegments(p)
+  let basePath = (user?.base_path || "/").trim()
+  if (!basePath || basePath === "/") {
+    // 没有 base_path 时也返回规范形式：resolvePath 之后会解码并折叠 `..`，而 meta
+    // 覆盖判定与签名计算都是字符串比较，两者必须同源——否则
+    // `/public/../secret/x.txt` 会被判成「不在保护区内」（免签名），却照样读得到。
+    return canonicalVirtualPath(p.startsWith("/") ? p : `/${p}`)
   }
 
-  const cleanReq = normalizeSegments(p)
+  const cleanReq = p.startsWith("/") ? p : `/${p}`
   if (cleanReq === "/") {
-    return basePath
+    return canonicalVirtualPath(basePath)
   }
 
-  return `${basePath}${cleanReq}`
+  const joined = `${basePath}${cleanReq}`
+  const baseStack = decodePathFully(basePath)
+    .split("/")
+    .filter((s) => s !== "" && s !== ".")
+
+  // 统一取「多重解码 + 段折叠」的规范形式（与 resolvePath 同源），并在用户自己的
+  // 根目录处钳制：既堵住 base_path 逃逸，也让 meta 覆盖 / 签名判定看到同一个路径。
+  const clamped = collapsePathSegments(
+    decodePathFully(joined),
+    baseStack.length,
+  )
+  return clamped.length === 0 ? basePath : "/" + clamped.join("/")
 }
 
 /**

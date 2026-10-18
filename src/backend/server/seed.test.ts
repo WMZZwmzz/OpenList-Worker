@@ -148,7 +148,7 @@ test("incremental hashing computes whole-file and piece hashes without buffering
 
 test("seed routes expose capabilities and reject an unapproved source", async () => {
   await saveDb({
-    settings: [{ key: "token", value: ADMIN_TOKEN }],
+    settings: [{ key: "api_token", value: ADMIN_TOKEN }],
     users: [],
     storages: [],
     shares: [],

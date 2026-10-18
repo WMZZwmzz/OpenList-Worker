@@ -53,14 +53,18 @@ jobs:
     runs-on: ubuntu-latest
     name: Build and verify artifacts
     steps:
+      # 按 commit SHA 固定：`@v7` 这类浮动标签由上游随时重打，一旦发布流被投毒，
+      # 本仓库的构建凭证（GITHUB_TOKEN）就会被不可信代码拿去用。
+      # 升级方式：`gh api repos/<owner>/<repo>/commits/<新标签>` 取 sha 后替换，
+      # 并同时更新注释里的版本号，便于人工核对。
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: pnpm

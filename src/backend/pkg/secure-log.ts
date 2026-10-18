@@ -1,10 +1,10 @@
 /**
  * 安全日志工具 - 自动脱敏敏感信息
- * 
+ *
  * 使用方法：
  * import { secureLog, secureWarn, secureError } from './secure-log'
  * secureLog('User data:', userData)  // 自动脱敏 password、token 等字段
- * 
+ *
  * 2026-09-08 创建
  */
 
@@ -32,26 +32,42 @@ const SENSITIVE_KEYS = new Set([
   "hash",
 ])
 
-/** 需要部分脱敏的字段（显示前几位） */
-const PARTIAL_MASK_KEYS = new Set([
-  "email",
-  "phone",
-  "mobile",
-  "telephone",
-  "username",
-  "userid",
-  "user_id",
-])
+/** 需要部分脱敏的字段（显示前几位）——联系方式类，非身份标识 */
+const PARTIAL_MASK_KEYS = new Set(["email", "phone", "mobile", "telephone"])
 
 /**
- * 检查字段名是否为敏感字段
+ * 精确匹配的凭据类字段名。
+ *
+ * 短名（pwd/key/otp/auth/hash）只做**精确**匹配：它们作为子串会误伤
+ * `author`、`keyword`、`monkey_path` 这类无害字段，把日志变得没法看。
+ */
+const SENSITIVE_EXACT = new Set([...SENSITIVE_KEYS, "totp", "otp_secret"])
+
+/** 出现即判定为敏感的组合词（下划线/驼峰复合字段靠它兜住） */
+const SENSITIVE_SUBSTRINGS = [
+  "password",
+  "passwd",
+  "secret",
+  "credential",
+  "authorization",
+  "cookie",
+  "csrf",
+  "token",
+  "api_key",
+  "apikey",
+  "access_key",
+  "private_key",
+  "otp",
+  "salt",
+]
+
+/**
+ * 检查字段名是否需要脱敏
  */
 function isSensitiveKey(key: string): boolean {
   const lower = key.toLowerCase()
-  return (
-    SENSITIVE_KEYS.has(lower) ||
-    Array.from(SENSITIVE_KEYS).some((k) => lower.includes(k))
-  )
+  if (SENSITIVE_EXACT.has(lower)) return true
+  return SENSITIVE_SUBSTRINGS.some((k) => lower.includes(k))
 }
 
 /**
@@ -68,6 +84,29 @@ function isPartialMaskKey(key: string): boolean {
 function partialMask(value: string): string {
   if (value.length <= 3) return "***"
   return value.slice(0, 3) + "*".repeat(Math.min(value.length - 3, 10))
+}
+
+/**
+ * 剥掉 CR / LF / NUL 及其它控制字符。
+ *
+ * 用户可控文本（用户名、请求路径、分享 ID）被直接拼进日志时，`%0A` 会变成真换行，
+ * 攻击者据此伪造整行日志、污染日志检索与告警。
+ */
+function stripControl(value: string): string {
+  let out = ""
+  for (const ch of value) {
+    const code = ch.codePointAt(0) ?? 0
+    out += code < 0x20 || code === 0x7f ? "_" : ch
+  }
+  return out
+}
+
+/**
+ * 单行安全化：去控制字符 + 限长，供拼接日志文本时使用。
+ */
+export function sanitizeLine(value: unknown, maxLen = 500): string {
+  const out = stripControl(String(value ?? ""))
+  return out.length > maxLen ? out.slice(0, maxLen) + "... [truncated]" : out
 }
 
 /**
@@ -93,7 +132,7 @@ function sanitize(obj: any, depth = 0): any {
     if (/^[A-Za-z0-9_-]{32,}$/.test(obj)) {
       return "[API_KEY]"
     }
-    return obj
+    return stripControl(obj)
   }
 
   // 数字/布尔值直接返回

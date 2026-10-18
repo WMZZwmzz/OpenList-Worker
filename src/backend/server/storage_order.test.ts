@@ -94,7 +94,7 @@ test("被禁用的存储不参与挂载点合并", async () => {
 })
 
 test("后台存储列表按 order, id 升序返回（对齐 Go db.GetStorages）", async () => {
-  const env: any = { }
+  const env: any = {}
   await saveDb(
     dbWith(
       [
@@ -102,7 +102,7 @@ test("后台存储列表按 order, id 升序返回（对齐 Go db.GetStorages）
         storageRow(41, "/a", 5),
         storageRow(43, "/c", 1),
       ],
-      [{ key: "token", value: "admin-token" }],
+      [{ key: "api_token", value: "admin-static-token-0123456789" }],
     ),
     env,
   )
@@ -111,7 +111,10 @@ test("后台存储列表按 order, id 升序返回（对齐 Go db.GetStorages）
   app.route("/api/admin", adminRouter)
   const res = await app.request(
     "/api/admin/storage/list",
-    { method: "GET", headers: { Authorization: "Bearer admin-token" } },
+    {
+      method: "GET",
+      headers: { Authorization: "Bearer admin-static-token-0123456789" },
+    },
     env,
   )
   assert.equal(res.status, 200)

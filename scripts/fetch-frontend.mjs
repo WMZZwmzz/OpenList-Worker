@@ -32,10 +32,16 @@
  *   FRONTEND_REPO=../OpenList-Frontend node scripts/fetch-frontend.mjs
  *   FRONTEND_VERSION=4.2.6 node scripts/fetch-frontend.mjs
  *   FRONTEND_BUILD_FROM_SOURCE=1 node scripts/fetch-frontend.mjs
+ *   FRONTEND_GIT_SHA=<40位commit> node scripts/fetch-frontend.mjs   # 源码构建固定 commit
  *   node scripts/fetch-frontend.mjs
+ *
+ * 完整性（详见「下载物完整性校验」一节）：npm tarball 用 registry 的
+ * dist.integrity/shasum，i18n 用 GitHub Release asset.digest；都可用
+ * FRONTEND_SHA512 / I18N_SHA256 显式固定，拿不到锚点即中断（ALLOW_UNVERIFIED=1 降级）。
  */
 
-import { execSync } from "node:child_process"
+import { execSync, execFileSync } from "node:child_process"
+import { createHash } from "node:crypto"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -75,6 +81,8 @@ const OFFICIAL_REPO_URL =
   process.env.FRONTEND_GIT_URL ||
   "https://github.com/OpenListTeam/OpenList-Frontend.git"
 const OFFICIAL_REPO_REF = process.env.FRONTEND_GIT_REF || "main"
+// 源码构建固定到不可变 commit（生产/CI 建议设置）。留空则按浮动分支克隆并告警。
+const OFFICIAL_REPO_SHA = (process.env.FRONTEND_GIT_SHA || "").trim()
 
 // 已发布 dist 的来源（默认路径）。ASSET_URLS 指向的 CDN 提供的正是这份 npm
 // 包内容，取它才能保证内容哈希与 CDN 同源（见文件头说明）。
@@ -94,6 +102,161 @@ function run(cmd, opts = {}) {
   execSync(cmd, { stdio: "inherit", shell: true, ...opts })
 }
 
+/**
+ * 不经过 shell 的参数数组形式执行：凡参数里含外部输入（env 变量、registry 返回
+ * 的 tarball URL、仓库地址/分支）都必须走这里，否则 `"$(...)"` 之类在双引号内
+ * 仍会被 shell 展开执行（SEC-018）。
+ */
+function runArgv(file, args, opts = {}) {
+  console.log(`  > ${file} ${args.join(" ")}`)
+  execFileSync(file, args, { stdio: "inherit", ...opts })
+}
+
+/** 同 runArgv，但取回 stdout（用于 rev-parse 这类需要读结果的调用） */
+function captureArgv(file, args, opts = {}) {
+  return execFileSync(file, args, { encoding: "utf-8", ...opts })
+}
+
+/**
+ * 即便走 argv，以 `-` 开头的值仍会被 git/curl 当成选项解析（例如
+ * `FRONTEND_GIT_REF=--upload-pack=...`），所以外部传入的 ref/url 还要过白名单。
+ */
+function assertSafeGitRef(ref) {
+  if (
+    typeof ref !== "string" ||
+    ref.startsWith("-") ||
+    !/^[A-Za-z0-9._/-]{1,200}$/.test(ref)
+  ) {
+    throw new Error(`unsafe FRONTEND_GIT_REF: ${JSON.stringify(ref)}`)
+  }
+}
+
+/** 只接受 hex commit，排除一切可被 git 解析成 ref/选项的写法 */
+function assertSafeGitSha(sha) {
+  if (typeof sha !== "string" || !/^[0-9a-f]{7,40}$/i.test(sha)) {
+    throw new Error(`unsafe FRONTEND_GIT_SHA: ${JSON.stringify(sha)}`)
+  }
+}
+
+function assertSafeGitUrl(url) {
+  if (
+    typeof url !== "string" ||
+    url.startsWith("-") ||
+    !/^(https?:\/\/|git@|ssh:\/\/)[^\s]+$/.test(url)
+  ) {
+    throw new Error(`unsafe FRONTEND_REPO_URL: ${JSON.stringify(url)}`)
+  }
+}
+
+function assertHttpUrl(url, what) {
+  if (typeof url !== "string" || !/^https?:\/\/[^\s]+$/.test(url)) {
+    throw new Error(`unsafe ${what}: ${JSON.stringify(url)}`)
+  }
+}
+
+// ── 下载物完整性校验（SEC-046）───────────────────────────────────────────────
+//
+// 这两个 tarball 的字节流决定最终产物里跑的是谁写的 JS，而两条链路原本都只做
+// 「下载 → 解包」，一步到位：registry 的 dist.tarball 与 GitHub Release 资源都被
+// 当成不可信输入（镜像站被投毒 / CDN 缓存污染 / 传输被改写时无人发现）。
+//
+// 锚点选择：
+//   - npm：用同一次 registry 元数据响应里的 dist.integrity(SRI sha512) 或
+//     dist.shasum(sha1)。元数据是 JSON、tarball 是二进制，两者走不同链路，
+//     能挡住「tarball 被换掉但元数据没同步」这一类攻击，也是 npm 客户端的做法。
+//   - i18n：GitHub Release API 的 asset.digest（形如 "sha256/<hex>"）。
+// 校验失败一律中断构建；拿不到锚点时同样中断，除非显式设 ALLOW_UNVERIFIED=1
+// （与 I18N_OPTIONAL 同一套「默认失败、降级需显式声明」的约定）。
+
+function hashFile(file, algo) {
+  const h = createHash(algo)
+  h.update(fs.readFileSync(file))
+  return h
+}
+
+function unverifiedAllowed() {
+  return process.env.ALLOW_UNVERIFIED === "1"
+}
+
+/** SRI（sha512-<base64>）或 hex 摘要；返回 null 表示元数据里没有可用锚点 */
+function matchesSri(file, sri) {
+  const m = /^(sha512|sha384|sha256)-([^=]+)$/.exec(String(sri || ""))
+  if (!m) return false
+  const b64 = hashFile(file, m[1]).digest("base64")
+  return b64 === m[2]
+}
+
+/**
+ * 按锚点顺序校验下载物：值形如 `sha512-<base64>` 走 SRI 比较，否则按 a.algo 做
+ * hex 比较。锚点存在但不匹配 = 投毒或链路污染，直接抛错；一个锚点都拿不到时
+ * 同样中断，除非显式 ALLOW_UNVERIFIED=1。
+ */
+function verifyOrThrow(file, anchors, what) {
+  for (const a of anchors) {
+    const value = String(a.value || "").trim()
+    if (!value) continue
+    if (/^sha\d+-/.test(value)) {
+      if (matchesSri(file, value)) {
+        console.log(
+          `  [integrity] ${what} 校验通过（${value.split("-")[0]} SRI）`,
+        )
+        return
+      }
+      throw new Error(
+        `[integrity] ${what} 摘要不匹配（期望 SRI ${value}）—— 下载内容与元数据不一致，拒绝解包`,
+      )
+    }
+    const hex = hashFile(file, a.algo).digest("hex")
+    if (hex === value.toLowerCase()) {
+      console.log(`  [integrity] ${what} 校验通过（${a.algo}）`)
+      return
+    }
+    throw new Error(
+      `[integrity] ${what} 摘要不匹配（${a.algo} 期望 ${value}，实际 ${hex}）—— 拒绝解包`,
+    )
+  }
+  if (unverifiedAllowed()) {
+    console.warn(
+      `  [integrity] ${what} 无可用的摘要锚点，ALLOW_UNVERIFIED=1，已降级继续`,
+    )
+    return
+  }
+  throw new Error(
+    `[integrity] ${what} 拿不到摘要锚点（registry dist.integrity/shasum 或 Release asset.digest 均缺失），已中断构建。确认来源可信可设 ALLOW_UNVERIFIED=1`,
+  )
+}
+
+/** GitHub Release 资源摘要：GET api.github.com/repos/<o>/<r>/releases/tags/<tag> */
+async function githubAssetDigest(url, fileName) {
+  const m =
+    /^https?:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/releases\/download\/([^/\s]+)\/([^/?#\s]+)/.exec(
+      String(url || ""),
+    )
+  if (!m) return ""
+  const [, owner, repo, tag, asset] = m
+  if (asset !== fileName) return ""
+  const headers = {
+    accept: "application/vnd.github+json",
+    "user-agent": "openlist-tsworker-fetch-frontend",
+  }
+  const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN
+  if (token) headers.authorization = `Bearer ${token}`
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}/releases/tags/${encodeURIComponent(tag)}`,
+      { headers, signal: AbortSignal.timeout(30_000) },
+    )
+    if (!res.ok) return ""
+    const data = await res.json()
+    const hit = (data?.assets || []).find((a) => a?.name === fileName)
+    const digest = String(hit?.digest || "")
+    const dm = /^sha256\/([0-9a-f]{64})$/i.exec(digest)
+    return dm ? dm[1] : ""
+  } catch {
+    return ""
+  }
+}
+
 function detectPackageManager(dir) {
   return fs.existsSync(path.join(dir, "pnpm-lock.yaml")) ? "pnpm" : "npm"
 }
@@ -107,16 +270,24 @@ function detectPackageManager(dir) {
  * "Cannot find matching keyid" 直接失败；npx 只经 npm 下载，无此问题。
  */
 function resolvePmCommand(dir, pm) {
-  if (pm !== "pnpm") return pm
+  if (pm !== "pnpm") return { file: pm, args: [] }
   let pinned
   try {
     pinned = JSON.parse(
       fs.readFileSync(path.join(dir, "package.json"), "utf-8"),
     ).packageManager
   } catch {
-    return pm
+    return { file: pm, args: [] }
   }
-  return pinned?.startsWith("pnpm@") ? `npx -y ${pinned}` : pm
+  // packageManager 来自被克隆仓库，是不可信输入。只接受严格的 pnpm 版本号，
+  // 且以 argv 形式交给 npx（不经过 shell）；否则回退到 PATH 里的 pnpm。
+  if (
+    typeof pinned === "string" &&
+    /^pnpm@\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(pinned)
+  ) {
+    return { file: "npx", args: ["-y", pinned] }
+  }
+  return { file: pm, args: [] }
 }
 
 function requireDist(src) {
@@ -378,8 +549,11 @@ function applyTheme() {
  * 失败即中断构建（不再静默回退英文）：语言包走 GitHub Release 资源，网络抖动
  * 会让下载悄悄失败，而英文产物照常构建成功 —— 部署后表现为线上中文站点突然
  * 变英文，且没有任何报错线索。确需英文产物时显式设 I18N_OPTIONAL=1。
+ *
+ * 摘要锚点优先级：I18N_SHA256（显式固定）> GitHub Release asset.digest。
+ * 解包前校验；摘要不匹配直接抛错，不走重试/降级。
  */
-function fetchI18n(repo) {
+async function fetchI18n(repo) {
   const langDir = path.join(repo, "src", "lang")
   const optional = process.env.I18N_OPTIONAL === "1"
   const bail = (why) => {
@@ -394,21 +568,32 @@ function fetchI18n(repo) {
   if (!fs.existsSync(langDir)) return bail("前端仓库缺少 src/lang 目录，")
 
   const tmpTar = path.join(os.tmpdir(), `openlist-i18n-${process.pid}.tar.gz`)
+  const assetName = decodeURIComponent(
+    String(I18N_TAR_URL).split("/").pop().split(/[?#]/)[0] || "i18n.tar.gz",
+  )
+  const anchor =
+    process.env.I18N_SHA256 || (await githubAssetDigest(I18N_TAR_URL, assetName))
+  const isIntegrityError = (err) =>
+    String(err?.message || err).startsWith("[integrity]")
   const fetchOnce = () => {
-    run(`curl -fL --retry 3 -o "${tmpTar}" "${I18N_TAR_URL}"`)
-    run(`${tarBin()} -xzf "${tmpTar}" -C "${langDir}"`)
+    assertHttpUrl(I18N_TAR_URL, "I18N_URL")
+    runArgv("curl", ["-fL", "--retry", "3", "-o", tmpTar, I18N_TAR_URL])
+    verifyOrThrow(tmpTar, [{ algo: "sha256", kind: "hex", value: anchor }], `i18n ${assetName}`)
+    runArgv(tarBin(), ["-xzf", tmpTar, "-C", langDir])
   }
   console.log(`  Fetching i18n translations: ${I18N_TAR_URL}`)
   try {
     fetchOnce()
   } catch (err) {
+    if (isIntegrityError(err)) throw err
     // 语言包走 GitHub Release 资源，网络抖动很常见，重试一次再判定失败
     console.warn(
       `  [fetch-frontend] i18n fetch failed, retrying once: ${err?.message || err}`,
     )
     try {
       fetchOnce()
-    } catch {
+    } catch (err2) {
+      if (isIntegrityError(err2)) throw err2
       /* 交由下面的落地检查统一报错 */
     }
   } finally {
@@ -425,33 +610,37 @@ function fetchI18n(repo) {
 }
 
 /** 在本地前端仓库中 install + build，并取 dist 产物 */
-function buildLocalRepo(repo) {
+async function buildLocalRepo(repo) {
   const abs = path.resolve(repo)
   if (!fs.existsSync(path.join(abs, "package.json"))) {
     throw new Error(`Directory is not a frontend repo: ${abs}`)
   }
   const pm = detectPackageManager(abs)
   const cmd = resolvePmCommand(abs, pm)
-  const install = (extra = "") => run(`${cmd} install${extra}`, { cwd: abs })
+  const install = (extra = []) =>
+    runArgv(cmd.file, [...cmd.args, "install", ...extra], { cwd: abs })
   try {
     install()
-  } catch {
+  } catch (err) {
+    // `--trust-lockfile` 会关闭 pnpm 的供应链复核，不能默认自动回退；
+    // 必须由构建方显式设置 ALLOW_TRUST_LOCKFILE=1 承担风险。
+    if (process.env.ALLOW_TRUST_LOCKFILE !== "1") throw err
     // 重试一次并加 --trust-lockfile：pnpm 11 默认对 lockfile 逐项重跑
     // minimumReleaseAge / trustPolicy 供应链复核，registry manifest 缺少
     // 平台子包时会误报（如 @crowdin/cli-*-arm64）。lockfile 来自刚克隆的
     // 官方前端仓库（HTTPS + 官方分支），属于可信来源，跳过复核安全。
     console.warn(
-      "  [fetch-frontend] pnpm install failed (lockfile supply-chain recheck or network issue), retrying once with --trust-lockfile...",
+      "  [fetch-frontend] install failed; ALLOW_TRUST_LOCKFILE=1 set, retrying once with --trust-lockfile (supply-chain re-verification disabled)...",
     )
-    install(" --trust-lockfile")
+    install(["--trust-lockfile"])
   }
-  fetchI18n(abs)
+  await fetchI18n(abs)
   // 关键修复：前后端默认同源部署，官方前端 VITE_API_URL 的语义是「API 服务器
   // 基础 URL」，正确值为 "/"（同源，config.ts 会转成 location.origin）。若外部
   // 环境（如 EdgeOne 控制台环境变量）误设 VITE_API_URL=/api，官方前端会拼成
   // baseURL=/api/api，导致 API 请求双前缀、落到 SPA 兜底返回 HTML。
   // 这里构建前端时强制覆盖为 "/"，杜绝外部污染。
-  run(`${cmd} run build`, {
+  runArgv(cmd.file, [...cmd.args, "run", "build"], {
     cwd: abs,
     env: { ...process.env, VITE_API_URL: "/" },
   })
@@ -494,7 +683,24 @@ async function fetchPublishedDist() {
   const tgz = path.join(tmp, "pkg.tgz")
   try {
     console.log(`  Downloading published dist: ${PKG_NAME}@${version}`)
-    run(`curl -fL --retry 3 -o "${tgz}" "${tarball}"`)
+    // tarball 地址来自 registry 响应，属于外部输入：走 argv + 协议白名单
+    assertHttpUrl(tarball, "registry tarball URL")
+    runArgv("curl", ["-fL", "--retry", "3", "-o", tgz, tarball])
+    // 解包前校验摘要：锚点取同一次元数据响应的 dist.integrity(SRI)/dist.shasum，
+    // 也可用 FRONTEND_SHA512 显式固定（CI 里把版本与摘要一起钉死）。
+    const distMeta = meta?.versions?.[version]?.dist || {}
+    verifyOrThrow(
+      tgz,
+      [
+        {
+          algo: "sha512",
+          kind: "hex-or-sri",
+          value: process.env.FRONTEND_SHA512 || distMeta.integrity,
+        },
+        { algo: "sha1", kind: "hex", value: distMeta.shasum },
+      ],
+      `${PKG_NAME}@${version} tarball`,
+    )
     // 以 tmp 为 cwd、用相对路径解包：Windows 上 tar 会把 "C:\\..." 里的盘符冒号
     // 当成远程主机（"Cannot connect to C: resolve failed"），不能把绝对路径喂给 tar。
     run(`tar -xzf pkg.tgz package/dist package/package.json`, { cwd: tmp })
@@ -528,7 +734,7 @@ async function main() {
   // 2. 本地前端仓库目录（显式指定）
   const localRepo = process.env.FRONTEND_REPO
   if (localRepo) {
-    buildLocalRepo(localRepo)
+    await buildLocalRepo(localRepo)
     return
   }
 
@@ -536,7 +742,7 @@ async function main() {
   const siblingRepo = path.resolve(ROOT, "..", "OpenList-Frontend")
   if (fs.existsSync(path.join(siblingRepo, "package.json"))) {
     console.log(`  Detected sibling official frontend repo: ${siblingRepo}`)
-    buildLocalRepo(siblingRepo)
+    await buildLocalRepo(siblingRepo)
     return
   }
 
@@ -547,19 +753,61 @@ async function main() {
     if (await fetchPublishedDist()) return
   }
 
-  // 5. 从 Git 克隆 main 并构建（显式要求源码构建，或发布版尚未兼容 Worker）
+  // 5. 从 Git 克隆并构建（显式要求源码构建，或发布版尚未兼容 Worker）
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "openlist-frontend-"))
   console.log(
-    `  Cloning official frontend: ${OFFICIAL_REPO_URL}#${OFFICIAL_REPO_REF}`,
+    `  Cloning official frontend: ${OFFICIAL_REPO_URL}#${OFFICIAL_REPO_REF}` +
+      (OFFICIAL_REPO_SHA ? `@${OFFICIAL_REPO_SHA}` : " (未固定 commit)"),
   )
   try {
-    run(
-      // -c core.autocrlf=false：禁用克隆端的换行符转换。Windows 上 autocrlf
-      // 会把前端源码（含 index.html）检出为 CRLF，改变 vite 构建出的
-      // dist/index.html 内容，进而导致产物哈希跨平台不一致。
-      `git -c core.autocrlf=false clone --depth 1 --branch ${OFFICIAL_REPO_REF} ${OFFICIAL_REPO_URL} ${tmp}`,
-    )
-    buildLocalRepo(tmp)
+    // -c core.autocrlf=false：禁用克隆端的换行符转换。Windows 上 autocrlf
+    // 会把前端源码（含 index.html）检出为 CRLF，改变 vite 构建出的
+    // dist/index.html 内容，进而导致产物哈希跨平台不一致。
+    // REF/URL 来自环境变量：先做字符集白名单（挡掉以 - 开头的 git 选项注入），
+    // 再以 argv 交给 git（挡掉 shell 展开）。
+    assertSafeGitRef(OFFICIAL_REPO_REF)
+    assertSafeGitUrl(OFFICIAL_REPO_URL)
+    if (OFFICIAL_REPO_SHA) {
+      // 固定到不可变 commit：先只取该 SHA（不触碰工作区），核对 HEAD 后再检出，
+      // 保证 install 的 postinstall 钩子跑的就是被审过的那份源码。
+      assertSafeGitSha(OFFICIAL_REPO_SHA)
+      runArgv("git", ["init", "-q", tmp])
+      runArgv("git", ["-C", tmp, "remote", "add", "origin", OFFICIAL_REPO_URL])
+      runArgv("git", ["-C", tmp, "fetch", "--depth", "1", "origin", OFFICIAL_REPO_SHA])
+      const fetched = captureArgv("git", ["-C", tmp, "rev-parse", "FETCH_HEAD"]).trim()
+      if (fetched.toLowerCase() !== OFFICIAL_REPO_SHA.toLowerCase()) {
+        throw new Error(
+          `[fetch-frontend] FRONTEND_GIT_SHA 与实际取到的 commit 不一致（期望 ${OFFICIAL_REPO_SHA}，FETCH_HEAD ${fetched}）`,
+        )
+      }
+      runArgv("git", [
+        "-C",
+        tmp,
+        "-c",
+        "core.autocrlf=false",
+        "checkout",
+        "--detach",
+        OFFICIAL_REPO_SHA,
+      ])
+    } else {
+      // 浮动分支：上游随时可推入任意代码，且 install 会执行其依赖的构建脚本。
+      // CI/生产构建应设 FRONTEND_GIT_SHA 固定；这里只提示，不静默。
+      console.warn(
+        "  [fetch-frontend] 警告：源码构建未固定 commit（FRONTEND_GIT_SHA 为空），本次构建不可复现",
+      )
+      runArgv("git", [
+        "-c",
+        "core.autocrlf=false",
+        "clone",
+        "--depth",
+        "1",
+        "--branch",
+        OFFICIAL_REPO_REF,
+        OFFICIAL_REPO_URL,
+        tmp,
+      ])
+    }
+    await buildLocalRepo(tmp)
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true })
   }

@@ -1,7 +1,7 @@
 {
   "name": "openlist",
   "entry": "./dist/esa-entry.js",
-  "installCommand": "pnpm install --no-frozen-lockfile",
+  "installCommand": "pnpm install --frozen-lockfile",
   "buildCommand": "pnpm run build",
   "assets": {
     "directory": "./dist"

@@ -2,6 +2,8 @@ import { Context } from "hono"
 import { verify } from "hono/jwt"
 import { checkAdminAuth, isStaticApiToken } from "../pkg/utils"
 import { getDb, readPersistedSecret, ENCRYPTION_SECRET_KV_KEY } from "../internal/model/db"
+import { findUserByTokenPayload, jwtClaimsAcceptable } from "../pkg/permission"
+import { clientIpFromContext } from "../pkg/client-ip"
 import { isPasswordStampValid } from "../pkg/password"
 
 // 不再硬编码 JWT 密钥。优先使用环境变量 JWT_SECRET（推荐在生产配置），
@@ -18,6 +20,12 @@ import { isPasswordStampValid } from "../pkg/password"
 // TS 版必须按 env 隔离才能保持同样的语义。
 let cachedJwtSecret: string | null = null
 let jwtSecretByEnv = new WeakMap<object, string>()
+/**
+ * 配置了过短 JWT_SECRET 且无法持久化时，为同一份弱配置生成一把进程内稳定的
+ * 强随机密钥。绝不把短密钥本身当签名密钥；进程重启会换钥（此时应配置
+ * JWT_SECRET 或可持久化后端）。
+ */
+const weakSecretStableRandom = new Map<string, string>()
 const JWT_SECRET_KV_KEY = "openlist_jwt_secret"
 
 /** 记录某个 env 的密钥，并更新进程级 last-known 值（无 env 对象时的兜底）。 */
@@ -47,6 +55,7 @@ export function resetJwtSecretCache(): void {
   cachedJwtSecret = null
   // WeakMap 无法逐项清空，整体替换即可（旧条目随 env 一起被 GC）。
   jwtSecretByEnv = new WeakMap<object, string>()
+  weakSecretStableRandom.clear()
 }
 
 function generateRandomSecret(): string {
@@ -97,9 +106,24 @@ export async function getJwtSecret(c?: Context | any): Promise<string> {
     typeof s === "string" && s.trim().length > 0 ? s : null
 
   // 1. 环境变量显式配置（最优先）
-  const envSecret = useSecret(env.JWT_SECRET)
-  if (envSecret) {
-    return envSecret
+  //
+  // env 来源的密钥额外要求最短 16 字符：HS256 的强度等于密钥熵，`JWT_SECRET=a`
+  // 这种配置让签名可在离线暴力下伪造。
+  // 但不直接的配置「作废」：持久化侧（步骤 2/2a/2b）仍沿用「非空即有效」，且下面
+  // 第 4 步在**无法持久化**时仍会退回这把弱密钥 —— 否则没有 KV 的部署会每次冷启动
+  // 换一把新钥匙，表现为「所有人频繁掉线」，比弱密钥本身更糟。
+  const rawEnvSecret =
+    typeof env.JWT_SECRET === "string" ? env.JWT_SECRET.trim() : ""
+  const weakEnvSecret =
+    rawEnvSecret && rawEnvSecret.length < 16 ? rawEnvSecret : ""
+  if (rawEnvSecret && !weakEnvSecret) {
+    return rawEnvSecret
+  }
+  if (weakEnvSecret) {
+    console.warn(
+      `[JWT] JWT_SECRET 过短（${weakEnvSecret.length} 字符，建议 >= 32：openssl rand -hex 32），` +
+        "不会用作签名密钥；已改用持久化/自动生成的强随机密钥（无法持久化时进程重启会换钥）。",
+    )
   }
 
   // 2. 持久化密钥（跨实例/重启稳定），按 env 缓存
@@ -160,22 +184,32 @@ export async function getJwtSecret(c?: Context | any): Promise<string> {
     const generated = generateRandomSecret()
     rememberJwtSecret(env, generated)
     const persisted = await writeKvSecret(env, generated)
-    
+    if (!persisted && weakEnvSecret) {
+      // 不把短密钥当签名密钥。为同一份弱配置复用一把进程内随机强密钥，
+      // 避免同一配置在不同 env 对象/请求之间各造一把导致互相验签失败。
+      let stable = weakSecretStableRandom.get(weakEnvSecret)
+      if (!stable) {
+        stable = generateRandomSecret()
+        weakSecretStableRandom.set(weakEnvSecret, stable)
+      }
+      rememberJwtSecret(env, stable)
+    }
+
     if (isProduction) {
       console.error(
         "[JWT] ⚠️ 🔴 生产环境安全警告：JWT_SECRET 未配置！" +
-        (persisted
-          ? "\n✅ 已自动生成密钥并持久化到 KV。此密钥将持续使用，但强烈建议手动配置 JWT_SECRET 环境变量以提高安全性。"
-          : "\n❌ 无法持久化密钥到 KV！密钥仅存于内存，重启后所有 token 将失效。请立即配置 JWT_SECRET 环境变量！") +
-        "\n\n🔒 安全建议：生成密钥命令: openssl rand -hex 32"
+          (persisted
+            ? "\n✅ 已自动生成密钥并持久化到 KV。此密钥将持续使用，但强烈建议手动配置 JWT_SECRET 环境变量以提高安全性。"
+            : "\n❌ 无法持久化密钥到 KV！密钥仅存于内存，重启后所有 token 将失效。请立即配置 JWT_SECRET 环境变量！") +
+          "\n\n🔒 安全建议：生成密钥命令: openssl rand -hex 32",
       )
     } else {
       console.warn(
         "[JWT] ⚠️  开发环境警告：JWT_SECRET 未配置，使用临时随机密钥。" +
-        (persisted
-          ? "密钥已持久化到 KV，重启后保持有效。"
-          : "密钥仅存于内存，重启后所有 token 将失效。") +
-        "\n生产环境部署前，建议配置 32+ 字符的 JWT_SECRET 环境变量（推荐而非强制）。"
+          (persisted
+            ? "密钥已持久化到 KV，重启后保持有效。"
+            : "密钥仅存于内存，重启后所有 token 将失效。") +
+          "\n生产环境部署前，建议配置 32+ 字符的 JWT_SECRET 环境变量（推荐而非强制）。",
       )
     }
   }
@@ -293,22 +327,55 @@ function timingSafeEqual(a: string, b: string): boolean {
 
 /**
  * 定时调度鉴权通道：EdgeOne Schedules 只能携带 path/method/payload，
- * 无法附加 Authorization 头。复用 JWT_SECRET 作为调度密钥，
- * 允许请求通过 query（?cron_secret=）、JSON body { cron_secret }
+ * 无法附加 Authorization 头，因此允许通过 JSON body { cron_secret }
  * 或 X-Cron-Secret 头携带匹配值触发受保护的任务接口。
+ *
+ * 默认只接受独立的 CRON_SECRET，绝不复用 JWT_SECRET。老部署若暂时无法
+ * 迁移，可显式设置 CRON_ALLOW_LEGACY_JWT_SECRET=1 临时回退（会告警）；
+ * query 参数默认禁用，URL 会进访问日志/Referer，确需旧行为时设置
+ * CRON_ALLOW_QUERY_SECRET=1。
  */
+let warnedLegacyCronSecret = false
+
 export async function matchCronSecret(c: Context): Promise<boolean> {
   const env = (c as any)?.env || {}
-  const secret =
-    env.JWT_SECRET ||
-    (typeof process !== "undefined" ? process.env?.JWT_SECRET : "")
-  if (!secret || typeof secret !== "string") return false
+  const processEnv = typeof process !== "undefined" ? process.env : undefined
+  const separate = env.CRON_SECRET || processEnv?.CRON_SECRET || ""
+  const legacyAllowed =
+    env.CRON_ALLOW_LEGACY_JWT_SECRET === "1" ||
+    env.CRON_ALLOW_LEGACY_JWT_SECRET === "true" ||
+    processEnv?.CRON_ALLOW_LEGACY_JWT_SECRET === "1" ||
+    processEnv?.CRON_ALLOW_LEGACY_JWT_SECRET === "true"
+  const legacy = env.JWT_SECRET || processEnv?.JWT_SECRET || ""
+  const secret = separate || (legacyAllowed ? legacy : "")
+  if (!secret || typeof secret !== "string") {
+    if (!separate && !warnedLegacyCronSecret) {
+      warnedLegacyCronSecret = true
+      console.warn(
+        "[Cron] CRON_SECRET 未配置，定时任务请求将被拒绝；" +
+          "请为调度单独配置 CRON_SECRET（旧部署可临时设置 CRON_ALLOW_LEGACY_JWT_SECRET=1）。",
+      )
+    }
+    return false
+  }
+  if (!separate && !warnedLegacyCronSecret) {
+    warnedLegacyCronSecret = true
+    console.warn(
+      "[Cron] 正在使用 CRON_ALLOW_LEGACY_JWT_SECRET 回退到 JWT_SECRET；" +
+        "建议尽快改为独立的 CRON_SECRET。",
+    )
+  }
 
   const header = c.req.header("x-cron-secret")
   if (header && timingSafeEqual(header, secret)) return true
 
-  const query = c.req.query("cron_secret")
-  if (query && timingSafeEqual(query, secret)) return true
+  const allowQuery =
+    env.CRON_ALLOW_QUERY_SECRET === "1" ||
+    env.CRON_ALLOW_QUERY_SECRET === "true"
+  if (allowQuery) {
+    const query = c.req.query("cron_secret")
+    if (query && timingSafeEqual(query, secret)) return true
+  }
 
   try {
     const body = await c.req.json()
@@ -342,7 +409,9 @@ export async function generateCSRFToken(c: Context): Promise<string> {
   const token = await sign(
     {
       type: "csrf",
-      jti: crypto.randomUUID ? crypto.randomUUID() : generateRandomSecret().slice(0, 16),
+      jti: crypto.randomUUID
+        ? crypto.randomUUID()
+        : generateRandomSecret().slice(0, 16),
       exp: Math.floor(Date.now() / 1000) + 3600, // 1 小时过期
     },
     secret,
@@ -353,15 +422,24 @@ export async function generateCSRFToken(c: Context): Promise<string> {
 /**
  * CSRF 保护中间件：对 POST/PUT/DELETE/PATCH 请求验证 CSRF token
  * GET/HEAD/OPTIONS 请求豁免检查
- * 
+ *
  * 安全增强 (2026-09-08):
  * - 仅允许从 HTTP Header 获取 token（移除 Query 和 Body 获取）
  * - 防止 JSON 劫持和 URL 泄露攻击
  */
-export async function csrfProtection(
-  c: Context,
-  next: () => Promise<void>,
-) {
+/**
+ * CSRF 双提交校验中间件。
+ *
+ * 现状：本项目的会话凭证只走 `Authorization: Bearer`（登录响应体里返回，前端存
+ * localStorage），服务端从不签发承载身份的 Cookie（唯一写 Cookie 的地方是本模块，
+ * 而它未被挂载）。跨站表单/fetch 无法自带攻击者不知道的 Authorization 头，因此
+ * 传统 CSRF 在这里不成立；把本中间件挂上去只会让不发送 X-CSRF-Token 的既有客户端
+ * （官方前端、curl、SDK）全部写失败。
+ *
+ * 若将来引入 Cookie 会话（例如 HttpOnly JWT），必须同时在此挂载本中间件，并把
+ * SameSite 设为 Strict/Lax。
+ */
+export async function csrfProtection(c: Context, next: () => Promise<void>) {
   const method = c.req.method.toUpperCase()
 
   // GET/HEAD/OPTIONS 请求无需 CSRF 验证
@@ -412,10 +490,7 @@ export async function csrfProtection(
  * 审计日志中间件：记录所有状态修改操作
  * 仅记录 POST/PUT/DELETE/PATCH 请求
  */
-export async function auditMiddleware(
-  c: Context,
-  next: () => Promise<void>,
-) {
+export async function auditMiddleware(c: Context, next: () => Promise<void>) {
   const startTime = Date.now()
   const method = c.req.method.toUpperCase()
   const path = c.req.path
@@ -431,14 +506,11 @@ export async function auditMiddleware(
       const user = await getUserFromContext(c).catch(() => null)
       const duration = Date.now() - startTime
       const statusCode = c.res.status || 200
-      const status = statusCode >= 200 && statusCode < 400 ? "success" : "failure"
+      const status =
+        statusCode >= 200 && statusCode < 400 ? "success" : "failure"
 
       // 获取客户端 IP
-      const ip =
-        c.req.header("cf-connecting-ip") ||
-        c.req.header("x-real-ip") ||
-        c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ||
-        "unknown"
+      const ip = clientIpFromContext(c)
 
       await logAudit(
         {
@@ -463,7 +535,7 @@ export async function auditMiddleware(
   }
 }
 
-export async function getUserFromContext(c: Context): Promise<{
+export type AuthedUser = {
   id?: number
   role: number
   permission: number
@@ -473,8 +545,32 @@ export async function getUserFromContext(c: Context): Promise<{
   sso_id?: string
   allow_ldap?: boolean
   otp_secret?: string
-} | null> {
-  // 仅静态 API token（settings.token）命中才视为匿名管理员；
+}
+
+/** 解析出的请求身份挂在 Hono context 上的键名（供存储层读取） */
+export const AUTHED_USER_KEY = "authedUser"
+
+/**
+ * 解析当前请求的用户身份，并把它记在 context 上：存储写入层需要它才能套用目录
+ * meta 的 write_users 白名单。此前该白名单只参与 /fs/list 的 writable 显示位
+ * 计算，任何写接口都不校验它。
+ */
+export async function getUserFromContext(
+  c: Context,
+): Promise<AuthedUser | null> {
+  const user = await resolveUserFromContext(c)
+  if (user) {
+    try {
+      c.set(AUTHED_USER_KEY, user)
+    } catch {
+      // 某些运行时包装的 context 不支持 set，忽略：门禁退化为不生效但不报错
+    }
+  }
+  return user
+}
+
+async function resolveUserFromContext(c: Context): Promise<AuthedUser | null> {
+  // 仅静态 API token（api_token / API_TOKEN）命中才视为匿名管理员；
   // JWT 管理员走下方正常解析，避免用户名被硬编码成 "api-token"。
   if (await isStaticApiToken(c)) {
     return {
@@ -499,7 +595,17 @@ export async function getUserFromContext(c: Context): Promise<{
   if (!authHeader) {
     try {
       const db = await getDb(c.env)
-      const guest = (db.users || []).find((u: any) => u.username === "guest")
+      // allow_guest=false 必须在服务端生效：此前它只是 /api/public/settings
+      // 里给前端看的一个字段，读取类接口照样会把 guest 身份发给匿名请求，
+      // 于是「关闭游客」在关掉登录框后仍然形同虚设。
+      const allowGuest = (db.settings || []).find(
+        (s: any) => s.key === "allow_guest",
+      )
+      const guestAllowed =
+        !allowGuest || String(allowGuest.value ?? "true") !== "false"
+      const guest = guestAllowed
+        ? (db.users || []).find((u: any) => u.username === "guest")
+        : null
       if (guest && !guest.disabled) {
         return {
           id: guest.id,
@@ -525,11 +631,10 @@ export async function getUserFromContext(c: Context): Promise<{
   try {
     const secret = await getJwtSecret(c)
     const payload: any = await verify(token, secret, "HS256")
+    if (!jwtClaimsAcceptable(payload)) return null
     if (await isTokenRevoked(payload?.jti, c.env)) return null
     const db = await getDb(c.env)
-    const user = (db.users || []).find(
-      (u: any) => u.id === payload.id || u.username === payload.username,
-    )
+    const user = findUserByTokenPayload(db.users, payload)
     if (!user || user.disabled) return null
     // 密码指纹：改密后旧令牌立即失效（对齐 Go middlewares.Auth 的 PwdTS 比对）
     if (!isPasswordStampValid(payload, user)) return null

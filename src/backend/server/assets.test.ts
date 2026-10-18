@@ -339,11 +339,18 @@ test("getIndexHtmlWithCdn: CDN 上有本地哈希资产时用本地 HTML（不�
   )
 })
 
-test("getIndexHtmlWithCdn: 本地哈希不在 CDN 上时改用 CDN 的 index.html（哈希同源）", async () => {
+test("getIndexHtmlWithCdn: 显式允许时才改用 CDN 的 index.html（哈希同源）", async () => {
   const log: string[] = []
   const cdnHtml = INDEX_HTML.replace("index-LOCAL.js", "index-CDN.js")
   const out = await withFetch(
-    () => getIndexHtmlWithCdn({ ASSET_URLS: "https://cdn-a.example.com/dist" }, LOCAL_HTML),
+    () =>
+      getIndexHtmlWithCdn(
+        {
+          ASSET_URLS: "https://cdn-a.example.com/dist",
+          ASSETS_ALLOW_CDN_HTML: "1",
+        },
+        LOCAL_HTML,
+      ),
     cdnImpl({ asset: false, html: cdnHtml, log }),
   )
   assert.deepEqual(log, [
@@ -354,13 +361,35 @@ test("getIndexHtmlWithCdn: 本地哈希不在 CDN 上时改用 CDN 的 index.htm
   assert.match(out, /cdn: 'https:\/\/cdn-a\.example\.com\/dist'/)
 })
 
+test("getIndexHtmlWithCdn: 默认不信任 CDN 的 index.html（避免同源 XSS）", async () => {
+  const log: string[] = []
+  const cdnHtml = INDEX_HTML.replace("index-LOCAL.js", "index-CDN.js")
+  const out = await withFetch(
+    () =>
+      getIndexHtmlWithCdn(
+        { ASSET_URLS: "https://cdn-a.example.com/dist" },
+        LOCAL_HTML,
+      ),
+    cdnImpl({ asset: false, html: cdnHtml, log }),
+  )
+  assert.deepEqual(log, [
+    "HEAD https://cdn-a.example.com/dist/assets/index-LOCAL.js",
+  ])
+  assert.doesNotMatch(out, /index-CDN\.js/)
+  assert.match(out, /index-LOCAL\.js/)
+})
+
 test("getIndexHtmlWithCdn: 探测失败且 CDN 拦截 .html 时降级为不注入", async () => {
   // npmmirror registry 端点：.html 返回 451 {"error":"blocked"}，资产探测也失败
   const log: string[] = []
   const out = await withFetch(
     () =>
       getIndexHtmlWithCdn(
-        { ASSET_URLS: "https://registry.npmmirror.com/@pkg/9.9.9/files/dist" },
+        {
+          ASSET_URLS:
+            "https://registry.npmmirror.com/@pkg/9.9.9/files/dist",
+          ASSETS_ALLOW_CDN_HTML: "1",
+        },
         LOCAL_HTML,
       ),
     cdnImpl({ asset: false, html: null, log }),
@@ -435,7 +464,10 @@ test("getIndexHtmlWithCdn: $version 用本地 HTML 的版本戳解析 CDN 地址
   await withFetch(
     () =>
       getIndexHtmlWithCdn(
-        { ASSET_URLS: "https://cdn-ver.example.com/@pkg@$version/dist" },
+        {
+          ASSET_URLS: "https://cdn-ver.example.com/@pkg@$version/dist",
+          ASSETS_ALLOW_CDN_HTML: "1",
+        },
         INDEX_HTML,
       ),
     cdnImpl({ asset: false, log }),

@@ -2,7 +2,10 @@ import { Hono } from "hono"
 import type { Context } from "hono"
 import { cors } from "hono/cors"
 import { getDb, getKvStatus } from "../internal/model/db"
-import { isServerlessRuntime, NO_STORAGE_MESSAGE } from "../internal/model/store/backend"
+import {
+  isServerlessRuntime,
+  NO_STORAGE_MESSAGE,
+} from "../internal/model/store/backend"
 import { fsRouter } from "./fs"
 import {
   authRouter,
@@ -21,6 +24,7 @@ import { taskRouter } from "./task"
 import { ssoRouter } from "./sso"
 import { webauthnRouter } from "./webauthn"
 import { updatePwdHandler } from "./user"
+import { clientIpFromContext } from "../pkg/client-ip"
 
 // --- 尽力而为的进程内限流 ---
 // 实现管理后台的 ip_limit（每 IP 每分钟请求数）与 traffic_limit（每 IP 每小时
@@ -30,12 +34,7 @@ const ipReqCounts = new Map<string, { start: number; count: number }>()
 const ipTraffic = new Map<string, { start: number; bytes: number }>()
 
 function getClientIp(c: any): string {
-  return (
-    c.req.header("CF-Connecting-IP") ||
-    c.req.header("x-real-ip") ||
-    c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ||
-    "unknown"
-  )
+  return clientIpFromContext(c)
 }
 
 function cleanupMaps() {
@@ -52,7 +51,7 @@ function cleanupMaps() {
   }
 }
 
-async function rateLimitMiddleware(c: any, next: () => Promise<void>) {
+export async function rateLimitMiddleware(c: any, next: () => Promise<void>) {
   const ip = getClientIp(c)
   const now = Date.now()
   let ipLimit = 0
@@ -230,9 +229,7 @@ export function setupRouter(app: Hono) {
         const env = (c as any).env || {}
         const allowedOriginsRaw =
           env.ALLOW_URLS ||
-          (typeof process !== "undefined"
-            ? process.env?.ALLOW_URLS
-            : "") ||
+          (typeof process !== "undefined" ? process.env?.ALLOW_URLS : "") ||
           ""
         const allowedOrigins = allowedOriginsRaw
           .split(",")

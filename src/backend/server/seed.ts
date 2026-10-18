@@ -1,6 +1,18 @@
 import { Hono } from "hono"
-import { getUserFromContext } from "./middlewares"
-import { canWrite, getActualPath, can, PermissionBit } from "../pkg/permission"
+import { AUTHED_USER_KEY, getUserFromContext } from "./middlewares"
+import {
+  canWrite,
+  getActualPath,
+  can,
+  canSeeHides,
+  PermissionBit,
+} from "../pkg/permission"
+import {
+  canAccess,
+  canWrite as canWriteMeta,
+  getNearestMeta,
+  isHidden,
+} from "../pkg/meta"
 import { assertSafeUrl } from "../pkg/http"
 import { safeErrorMessage } from "../pkg/errs"
 import { getDb, getSettings, resolvePath, saveDb } from "../internal/model/db"
@@ -47,15 +59,42 @@ function envNumber(c: any, key: string, fallback: number): number {
   return Number.isSafeInteger(value) && value > 0 ? value : fallback
 }
 
-function storageContext(c: any) {
+function storageContext(c: any, user?: any) {
+  // seed 的读取/写入也走存储 op，必须把请求者身份带进去：写入侧由此套用
+  // meta.write_users。此前这里只返回 waitUntil，putItem 拿不到 user，
+  // 目录管理员配置的写白名单对 /seed/* 完全无效。
+  let authed = user ?? null
+  if (!authed) {
+    try {
+      authed = c.get?.(AUTHED_USER_KEY) ?? null
+    } catch {}
+  }
+  const ctx: any = { env: c.env, user: authed }
   try {
-    if (typeof c.executionCtx?.waitUntil !== "function") return undefined
-    return {
-      waitUntil: (promise: Promise<unknown>) =>
-        c.executionCtx.waitUntil(promise),
+    if (typeof c.executionCtx?.waitUntil === "function") {
+      ctx.waitUntil = (promise: Promise<unknown>) =>
+        c.executionCtx.waitUntil(promise)
     }
   } catch {
-    return undefined
+    // 无 executionCtx：仅缺少 waitUntil
+  }
+  return ctx
+}
+
+/** seed 读取前校验 meta 密码 / read_users；失败一律拒绝。 */
+async function assertSeedReadable(c: any, user: any, path: string) {
+  const meta = await getNearestMeta(path, c.env).catch(() => null)
+  if (!canAccess(user, meta, path, "")) {
+    throw new Error(`permission denied: cannot read ${path}`)
+  }
+  return meta
+}
+
+/** seed 直接调驱动写入（分片/直传）时补 meta.write_users 门禁。 */
+async function assertSeedWritable(c: any, user: any, path: string) {
+  const meta = await getNearestMeta(path, c.env).catch(() => null)
+  if (!canWriteMeta(user, meta, path)) {
+    throw new Error(`permission denied: not in write_users for ${path}`)
   }
 }
 
@@ -288,9 +327,10 @@ async function readStoredSeed(
   path: string,
 ): Promise<Uint8Array> {
   const actualPath = getActualPath(user, normalizeVirtualPath(path))
+  await assertSeedReadable(c, user, actualPath)
   const { item, rawUrl: apiRawUrl } = await getItem(
     actualPath,
-    storageContext(c),
+    storageContext(c, user),
   )
   const max = envNumber(c, "SEED_MAX_METADATA_SIZE", DEFAULT_MAX_SEED_BYTES)
   if (item.is_dir || item.size < 0 || item.size > max)
@@ -387,9 +427,10 @@ async function collectSourceFiles(
     if (result.length >= maxFiles)
       throw new Error(`Seed file count exceeds the ${maxFiles} file limit`)
     const actualPath = getActualPath(user, virtualPath)
+    const meta = await assertSeedReadable(c, user, actualPath)
     const { item, rawUrl: apiRawUrl } = await getItem(
       actualPath,
-      storageContext(c),
+      storageContext(c, user),
     )
     if (!item.is_dir) {
       // 同 readStoredSeed：直链优先，否则用 getItem 的代理地址（前缀/编码已定）
@@ -408,8 +449,10 @@ async function collectSourceFiles(
       })
       return
     }
-    const { content } = await listItems(actualPath, storageContext(c))
+    const { content } = await listItems(actualPath, storageContext(c, user))
     for (const child of content) {
+      // hide 规则在 seed 递归里同样生效，否则隐藏文件会被打包进种子元数据。
+      if (!canSeeHides(user) && isHidden(meta, actualPath, child.name)) continue
       const childVirtual = joinVirtualPath(virtualPath, child.name)
       const childRelative = `${relativePath.replace(/\/$/, "")}/${child.name}`
       await visit(childVirtual, childRelative)
@@ -492,7 +535,7 @@ async function saveEncodedSeed(
 ): Promise<void> {
   if (!path) return
   const actualPath = writableActualPath(user, path)
-  await putItem(actualPath, Buffer.from(bytes), storageContext(c))
+  await putItem(actualPath, Buffer.from(bytes), storageContext(c, user))
 }
 
 async function loadDefaultMatrix(): Promise<Record<string, any> | undefined> {
@@ -727,6 +770,8 @@ async function uploadStreamToDriver(
   const name = parts.pop()
   if (!name) throw new Error("Target file name is required")
   const dir = "/" + parts.join("/")
+  // 目标可能落在带 write_users 的目录下；这些分支直接调驱动，不经过 op 层门禁。
+  await assertSeedWritable(c, user, actualTarget)
   const resolved = await resolvePath(actualTarget)
   const resolvedDir = await resolvePath(dir)
   if (resolved.isVirtual || resolvedDir.isVirtual || !resolved.storage) {
@@ -898,7 +943,7 @@ async function uploadStreamToDriver(
       resolved.storage.driver,
       resolved.storage,
       driver,
-      storageContext(c),
+      storageContext(c, user),
     )
   }
 }

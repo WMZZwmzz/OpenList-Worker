@@ -2,16 +2,44 @@ import { Hono } from "hono"
 import { getDb, saveDb } from "../internal/model/db"
 import { adminAuthMiddleware, getUserFromContext } from "./middlewares"
 import { can, PermissionBit, isAdmin, getActualPath } from "../pkg/permission"
+import { decodePathFully, hasParentSegment } from "../pkg/path"
+import { canAccess, getNearestMeta } from "../pkg/meta"
 
 export const shareRouter = new Hono()
 
+/**
+ * 校验并清理分享路径。
+ *
+ * 旧实现只对字面 `..` 段报错，于是 `%2e%2e` 能原样入库；而读取时 resolvePath 会
+ * 先做多重百分号解码再折叠 `..`，分享就被抬到创建者根目录之外，变成一个任何人
+ * 都可读的公开链接。这里在判定前先取「解码视图」，与 resolvePath 对齐。
+ */
 function sanitizePath(p: string): string {
-  const normalized = (p || "").replace(/\\/g, "/").replace(/\/+/g, "/")
-  const segments = normalized.split("/").filter((s) => s && s !== ".")
-  if (segments.some((s) => s === "..")) {
+  const raw = p || ""
+  const normalized = raw.replace(/\\/g, "/").replace(/\/+/g, "/")
+  if (
+    hasParentSegment(normalized) ||
+    hasParentSegment(decodePathFully(raw).replace(/\\/g, "/"))
+  ) {
     throw new Error("Path traversal segment '..' is not allowed")
   }
+  const segments = normalized.split("/").filter((s) => s && s !== ".")
   return "/" + segments.join("/")
+}
+
+/** 分享路径必须落在创建者自己的可见范围内：先映射 base_path，再套 meta 读权限。 */
+async function assertShareTargetsAccessible(
+  user: any,
+  paths: string[],
+  env: any,
+): Promise<string | null> {
+  for (const p of paths) {
+    const meta = await getNearestMeta(p, env)
+    if (!canAccess(user, meta, p, "")) {
+      return `No permission to share path: ${p}`
+    }
+  }
+  return null
 }
 
 // 分享管理接口需要管理员权限（list/get/update/delete）
@@ -74,6 +102,12 @@ shareRouter.post("/create", async (c) => {
         400,
       )
     }
+    // 分享会把路径的读权限直接授予匿名访客，因此创建者自己必须能读到该路径：
+    // 否则 meta 密码 / read_users 只需转手分享一次即失效。
+    const denied = await assertShareTargetsAccessible(user, files, c.env)
+    if (denied) {
+      return c.json({ code: 403, message: denied, data: null }, 403)
+    }
   }
 
   // 校验自定义 ID 格式
@@ -87,6 +121,19 @@ shareRouter.post("/create", async (c) => {
         data: null,
       },
       400,
+    )
+  }
+
+  // 自定义分享 ID 是独立权限位：未授予者只能使用随机 ID，避免短/可猜测的
+  // 分享标识被用于撞库与定向枚举。
+  if (rawId && !can(user, PermissionBit.CUSTOMIZE_SHARE_ID)) {
+    return c.json(
+      {
+        code: 403,
+        message: "Permission denied: CUSTOMIZE_SHARE_ID",
+        data: null,
+      },
+      403,
     )
   }
 
@@ -166,6 +213,26 @@ shareRouter.post("/update", async (c) => {
         message: "share id already exists",
         data: null,
       })
+    }
+  }
+
+  // 更新同样要过一遍清洗：分享路径最终会被 resolvePath 二次解码后折叠，
+  // 脏数据一旦入库就等于把一个可解码成 `..` 的路径永久留在分享白名单里。
+  let updatedFiles = db.shares[idx].files
+  if (body.files !== undefined) {
+    if (!Array.isArray(body.files)) {
+      return c.json(
+        { code: 400, message: "files must be an array", data: null },
+        400,
+      )
+    }
+    try {
+      updatedFiles = body.files.map((f: string) => sanitizePath(String(f)))
+    } catch (err: any) {
+      return c.json(
+        { code: 400, message: err.message || "Invalid file path", data: null },
+        400,
+      )
     }
   }
 

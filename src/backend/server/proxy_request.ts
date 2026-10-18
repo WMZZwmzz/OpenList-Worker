@@ -224,11 +224,10 @@ export function exceedsProxyPayloadLimit(
   if (!Number.isFinite(limit) || limit <= 0) return false
   if (!Number.isFinite(size) || size <= 0) return false
   if (range) {
-    try {
-      return parseRangeHeader(range, size).chunksize > limit
-    } catch {
-      return false
-    }
+    const parsed = parseRangeHeader(range, size)
+    // 解析不出来的 Range 不视为分片请求（服务端会按整份处理），
+    // 因此退回整份大小判断。
+    if (parsed) return parsed.chunksize > limit
   }
   return size > limit
 }

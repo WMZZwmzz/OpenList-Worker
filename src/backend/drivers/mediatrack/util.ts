@@ -1,3 +1,4 @@
+import { safeRedirectUrl } from "../../pkg/http"
 import {
   MediatrackAddition,
   MediatrackBaseResp,
@@ -134,6 +135,8 @@ export class MediatrackApiClient {
     })
 
     const location = headRes.headers.get("location")
-    return location || redirectUrl
+    return location
+      ? safeRedirectUrl(location, redirectUrl) || redirectUrl
+      : redirectUrl
   }
 }

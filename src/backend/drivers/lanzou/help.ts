@@ -5,6 +5,8 @@
  * - HTML / JS 动态变量与表单提取
  */
 
+import { escapeRegExp } from "../../pkg/path"
+
 const timeSplitReg = /([0-9.]*)\s*([\u4e00-\u9fa5]+)/
 const sizeSplitReg = /([0-9.]+)\s*([bkm]+)/i
 const findAcwScV2Reg = /arg1='([0-9A-Z]+)'/i
@@ -185,11 +187,14 @@ function findJSVarFunc(key: string, data: string): string {
   }
 
   if (key !== "sasign") {
+    // key 来自远端 HTML（不可信）：必须按字面量转义后再拼进 RegExp，
+    // 否则 `(a+)+$` 之类的值会变成灾难性回溯模式，或直接让正则构造抛错。
+    const keyLiteral = escapeRegExp(key)
     // 1. var key = 'val'; or let key = "val"; or const key = val;
     const matches1 = Array.from(
       data.matchAll(
         new RegExp(
-          `(?:var|let|const)\\s+${key}\\s*=\\s*['"]?([\\s\\S]*?)['"]?;`,
+          `(?:var|let|const)\\s+${keyLiteral}\\s*=\\s*['"]?([\\s\\S]*?)['"]?;`,
           "gi",
         ),
       ),
@@ -202,7 +207,10 @@ function findJSVarFunc(key: string, data: string): string {
     // 2. key = 'val';
     const matches2 = Array.from(
       data.matchAll(
-        new RegExp(`(?:^|[;,\\s])${key}\\s*=\\s*['"]?([\\s\\S]*?)['"]?;`, "gim"),
+        new RegExp(
+          `(?:^|[;,\\s])${keyLiteral}\\s*=\\s*['"]?([\\s\\S]*?)['"]?;`,
+          "gim",
+        ),
       ),
     )
     if (matches2.length) {
@@ -213,7 +221,10 @@ function findJSVarFunc(key: string, data: string): string {
     // 3. 'key' : 'val'
     const matches3 = Array.from(
       data.matchAll(
-        new RegExp(`['"]?${key}['"]?\\s*:\\s*['"]?([\\s\\S]*?)['"]?`, "gi"),
+        new RegExp(
+          `['"]?${keyLiteral}['"]?\\s*:\\s*['"]?([\\s\\S]*?)['"]?`,
+          "gi",
+        ),
       ),
     )
     if (matches3.length) {
@@ -224,7 +235,7 @@ function findJSVarFunc(key: string, data: string): string {
     const matches = Array.from(
       data.matchAll(
         new RegExp(
-          `(?:var|let|const)?\\s*${key}\\s*=\\s*['"]?([\\s\\S]*?)['"]?;`,
+          `(?:var|let|const)?\\s*${escapeRegExp(key)}\\s*=\\s*['"]?([\\s\\S]*?)['"]?;`,
           "gi",
         ),
       ),
@@ -309,7 +320,10 @@ export function htmlJsonToMap(
  * 查找并提取 HTML 中的指定 JS 函数源码
  */
 export function getJSFunctionByName(html: string, name: string): string {
-  const fnReg = new RegExp(`function\\s+${name}\\s*\\([^)]*\\)\\s*\\{`, "i")
+  const fnReg = new RegExp(
+    `function\\s+${escapeRegExp(name)}\\s*\\([^)]*\\)\\s*\\{`,
+    "i",
+  )
   const match = html.search(fnReg)
   if (match === -1) {
     throw new Error(`[Lanzou] 未找到函数 ${name}`)

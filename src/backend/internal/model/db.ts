@@ -13,6 +13,7 @@ import {
   writePersistedSecret,
 } from "./store/json"
 import { getStoreBackend, readCipher } from "./store/backend"
+import { decodePathFully } from "../../pkg/path"
 
 // 保持外部（middlewares.ts / router.ts / admin.ts）对 getKvBinding / getKvStatus
 // 的既有引用不变，从 json 后端 re-export。
@@ -497,6 +498,14 @@ export const defaultDb = {
       value: "false",
       type: "bool",
       help: "Webauthn Login Enabled",
+      group: 4,
+      flag: 0,
+    },
+    {
+      key: "webauthn_rp_id",
+      value: "",
+      type: "string",
+      help: "WebAuthn Relying Party ID (e.g. example.com). Required when WebAuthn is enabled.",
       group: 4,
       flag: 0,
     },
@@ -1412,6 +1421,8 @@ let encryptionKeyWarned = false
 let unsealKeyWarned = false
 /** 一次性告警：配置了 DB_CIPHER 却没有密钥，只能明文落盘 */
 let sealKeyMissingWarned = false
+/** 一次性告警：静态加密处于关闭状态，敏感字段明文落盘 */
+let plaintextAtRestWarned = false
 /** 一次性提示：旧部署的密文在 DB_CIPHER=none 下会被自动迁移为明文 */
 let plaintextMigrationLogged = false
 
@@ -2036,10 +2047,7 @@ async function sealDb(
  */
 const UNSEAL_CONCURRENCY = 16
 
-async function unsealDb(
-  data: any,
-  cipherChain: FieldCipher[],
-): Promise<void> {
+async function unsealDb(data: any, cipherChain: FieldCipher[]): Promise<void> {
   if (cipherChain.length === 0 || !data) return
 
   // 并行解密（带并发上限）：
@@ -2099,7 +2107,11 @@ async function unsealDb(
       const sealedValue = target.otp_secret
       const identity = `users:${u.id ?? i}:otp_secret`
       tasks.push(async () => {
-        target.otp_secret = await unsealValue(sealedValue, cipherChain, identity)
+        target.otp_secret = await unsealValue(
+          sealedValue,
+          cipherChain,
+          identity,
+        )
       })
     }
     // 密码解密
@@ -2114,7 +2126,9 @@ async function unsealDb(
   }
 
   for (let i = 0; i < tasks.length; i += UNSEAL_CONCURRENCY) {
-    await Promise.all(tasks.slice(i, i + UNSEAL_CONCURRENCY).map((run) => run()))
+    await Promise.all(
+      tasks.slice(i, i + UNSEAL_CONCURRENCY).map((run) => run()),
+    )
   }
 }
 
@@ -2212,7 +2226,19 @@ export const saveDb = async (
     console.log(
       `[DB] saveDb: cipher=${cipher}, persisting to ${backend.name}, storages=${data.storages?.length || 0}`,
     )
-    const fieldCipher = cipher === "none" ? null : await resolveFieldCipher(activeEnv)
+    const fieldCipher =
+      cipher === "none" ? null : await resolveFieldCipher(activeEnv)
+    if (cipher === "none" && !plaintextAtRestWarned && !sealKeyMissingWarned) {
+      // 默认不加密是刻意的设计（见本文件「静态加密」注释块），但默认值不等于
+      // 安全：明文落盘时口令哈希、otp_secret、驱动密钥都能被读到存储的人拿走。
+      // 这里只提示一次，避免每次写库都刷屏。
+      plaintextAtRestWarned = true
+      console.warn(
+        "[DB] DB_CIPHER=none：敏感字段以明文落盘。生产部署建议设置 " +
+          "DB_CIPHER=aes-256-gcm（Cloudflare 已在 wrangler.jsonc 里配置，" +
+          "EdgeOne / ESA / 自托管需在各自平台的环境变量中配置）。",
+      )
+    }
     if (cipher !== "none" && !fieldCipher && !sealKeyMissingWarned) {
       // 只在首次告警：密钥缺失会持续到密钥可用为止，逐次写入都打印只会刷屏。
       sealKeyMissingWarned = true
@@ -2260,36 +2286,10 @@ export async function resolvePath(virtualPath: string, envCtx?: any) {
   const db = await getDb(envCtx)
 
   // ============ 路径遍历防护增强 (2026-09-08) ============
-  // 1. URL 解码（防止 %2e%2e 等编码绕过）
-  let path = virtualPath
-  try {
-    path = decodeURIComponent(String(path || ""))
-  } catch {
-    // 解码失败，使用原始值
-  }
-
-  // 2. 多重解码检测（防止双重编码绕过）
-  let prevPath = ""
-  let decodeAttempts = 0
-  while (path !== prevPath && decodeAttempts < 3) {
-    prevPath = path
-    try {
-      const decoded = decodeURIComponent(path)
-      if (decoded === path) break // 没有更多编码
-      path = decoded
-      decodeAttempts++
-    } catch {
-      break
-    }
-  }
-
-  // 3. 规范化路径分隔符和特殊字符
-  path = path
-    .replace(/\\/g, "/") // 反斜杠 -> 正斜杠
-    .replace(/%5c/gi, "/") // URL 编码的反斜杠
-    .replace(/%2f/gi, "/") // URL 编码的正斜杠
-    .replace(/\.{3,}/g, "..") // 多个点规范化为 ..
-    .replace(/\/+/g, "/") // 多个斜杠合并为一个
+  // 1-3. 解码到稳定，并统一分隔符/点段/斜杠。必须与 pkg/path.decodePathFully
+  // 完全同源：固定次数解码会让 `%2525252e%2525252e`（5 层）在判定时仍是普通段，
+  // 真正落盘时再被解码成 `..`，从而越过租户根目录（SEC-001/002）。
+  let path = decodePathFully(String(virtualPath || ""))
 
   // 4. 检测非法字符
   const illegalChars = ["\0", "\r", "\n", "\t"]

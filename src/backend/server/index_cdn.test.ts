@@ -100,7 +100,11 @@ test("集成[本地 HTML 路径]: CDN 有本地哈希时用本地 HTML，不拉 
 
 test("集成[CDN HTML 路径]: 本地哈希不在 CDN 上时改用 CDN 的 index.html（哈希同源）", async () => {
   const log: string[] = []
-  const env = { ASSETS: makeFakeAssets(), ASSET_URLS: "https://cdn-i1.example.com/dist" }
+  const env = {
+    ASSETS: makeFakeAssets(),
+    ASSET_URLS: "https://cdn-i1.example.com/dist",
+    ASSETS_ALLOW_CDN_HTML: "1",
+  }
   const res = await withFetch(
     () => app.request("/", { headers }, env as any),
     cdnImpl({ asset: false, log }),

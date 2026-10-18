@@ -23,11 +23,7 @@ import {
   isCacheActive,
 } from "../internal/cache"
 // 脱敏 / 截断 / 摘要 / 建议组装：与全局 503 拦截（index.ts）共用同一套规则
-import {
-  reasonLines,
-  redact,
-  storageErrorSummary,
-} from "./storage-error"
+import { reasonLines, redact, storageErrorSummary } from "./storage-error"
 
 export const publicRouter = new Hono()
 
@@ -554,7 +550,25 @@ publicRouter.get("/offline_download_tools", (c) => {
 publicRouter.get("/plugins", async (c) => {
   const db = await getDb(c.env)
   const plugins = db.plugins || []
-  const activePlugins = plugins.filter((p: any) => p.enabled)
+  const activePlugins = plugins
+    .filter((p: any) => p.enabled)
+    .map((p: any) => {
+      // 匿名端点：config_values 是管理员喂给插件的任意配置，实践里常是 token /
+      // cookie / app_secret。保留键名（前端按 key 渲染占位）但清空取值。
+      const values = p?.config_values
+      const redacted =
+        values && typeof values === "object" && !Array.isArray(values)
+          ? Object.fromEntries(
+              Object.keys(values as Record<string, unknown>).map((k) => [
+                k,
+                "",
+              ]),
+            )
+          : values
+            ? []
+            : values
+      return { ...p, config_values: redacted }
+    })
   return c.json({
     code: 200,
     message: "success",
@@ -659,14 +673,24 @@ publicRouter.post("/init/setup", async (c) => {
   const siteTitle = String(body.site_title || "").trim()
 
   if (!username) {
-    return c.json({ code: 400, message: "username is required", data: null }, 400)
+    return c.json(
+      { code: 400, message: "username is required", data: null },
+      400,
+    )
   }
   if (!password) {
-    return c.json({ code: 400, message: "password is required", data: null }, 400)
+    return c.json(
+      { code: 400, message: "password is required", data: null },
+      400,
+    )
   }
   if (password.length < 4) {
     return c.json(
-      { code: 400, message: "password must be at least 4 characters", data: null },
+      {
+        code: 400,
+        message: "password must be at least 4 characters",
+        data: null,
+      },
       400,
     )
   }

@@ -1,6 +1,12 @@
 import { resolvePath, getDb, getSettings, saveDb } from "../model/db"
 import { encodeDownloadPath } from "../../pkg/path"
 import { singleflight } from "../../pkg/singleflight"
+import {
+  canWrite as canWriteMeta,
+  getNearestMeta,
+  type Meta,
+} from "../../pkg/meta"
+import type { UserPermissionObj } from "../../pkg/permission"
 import { canUseProxyEndpoint, normalizeExtList } from "../driver/proxy"
 import { FileItem, StorageDriver, calcFileType } from "../driver/base"
 import {
@@ -152,6 +158,50 @@ function setDriverCache(key: string, driver: StorageDriver): void {
 export interface StorageRequestContext {
   waitUntil?: (promise: Promise<unknown>) => void
   env?: any // ESA/Cloudflare env，用于请求级缓存复用
+  /**
+   * 发起本次操作的已认证用户。写入类 op 在带上 user 时会套用目录 meta 的
+   * write_users 白名单；内部调用（管理员任务、迁移、驱动自调）不传即保持原语义。
+   */
+  user?: UserPermissionObj | null
+}
+
+/**
+ * meta.write_users 写入门禁。对齐 Go common.CanWrite：只有当某个覆盖该路径的
+ * meta 显式配置了 write_users，且请求者不在名单内时才拒绝。
+ * 放在 op 层是为了让 /fs/*、/dav/*、/s3/* 以及任何后续写入路径共用同一道闸，
+ * 而不是依赖每个 handler 记得检查。
+ */
+async function assertMetaWritable(
+  virtualPath: string,
+  requestContext?: StorageRequestContext,
+): Promise<void> {
+  const user = requestContext?.user
+  if (!user) return
+  let meta: Meta | null = null
+  try {
+    meta = await getNearestMeta(virtualPath, requestContext?.env)
+  } catch {
+    meta = null
+  }
+  if (!canWriteMeta(user, meta, virtualPath)) {
+    throw new Error("permission denied: not in write_users")
+  }
+}
+
+/** 同一存储判定：优先用存储 id，退化到 mount_path + driver */
+function assertSameStorage(src: any, dst: any): void {
+  const a = src?.storage
+  const b = dst?.storage
+  if (!a || !b) return
+  const same =
+    a.id !== undefined && b.id !== undefined
+      ? a.id === b.id
+      : a.mount_path === b.mount_path && a.driver === b.driver
+  if (!same) {
+    throw new Error(
+      "failed to move/copy: source and destination are on different storages",
+    )
+  }
 }
 
 export interface GetDriverOptions {
@@ -1247,8 +1297,8 @@ export async function getDriver(
 ): Promise<StorageDriver> {
   const deferTokenPersistence = Boolean(
     options.deferTokenPersistence &&
-      storageConfig &&
-      typeof storageConfig === "object",
+    storageConfig &&
+    typeof storageConfig === "object",
   )
   if (deferTokenPersistence) deferredTokenPersistence.add(storageConfig)
 
@@ -1674,6 +1724,7 @@ export async function makeDirectory(
   virtualPath: string,
   requestContext?: StorageRequestContext,
 ): Promise<void> {
+  await assertMetaWritable(virtualPath, requestContext)
   const resolved = await resolvePath(virtualPath, requestContext?.env)
   if (resolved.isVirtual) {
     throw new Error("failed get storage: storage not found")
@@ -1698,6 +1749,7 @@ export async function renameItem(
   newName: string,
   requestContext?: StorageRequestContext,
 ): Promise<void> {
+  await assertMetaWritable(virtualPath, requestContext)
   const resolved = await resolvePath(virtualPath, requestContext?.env)
   if (resolved.isVirtual) {
     throw new Error("failed get storage: storage not found")
@@ -1726,6 +1778,7 @@ export async function removeItems(
 ): Promise<void> {
   for (const name of names) {
     const itemVirtual = `${dir}/${name}`
+    await assertMetaWritable(itemVirtual, requestContext)
     const resolved = await resolvePath(itemVirtual, requestContext?.env)
     if (resolved.isVirtual) {
       throw new Error("failed get storage: storage not found")
@@ -1755,11 +1808,17 @@ export async function moveItems(
   for (const name of names) {
     const srcVirtual = `${srcDir}/${name}`
     const dstVirtual = `${dstDir}/${name}`
+    await assertMetaWritable(srcVirtual, requestContext)
+    await assertMetaWritable(dstVirtual, requestContext)
     const srcResolved = await resolvePath(srcVirtual, requestContext?.env)
     const dstResolved = await resolvePath(dstVirtual, requestContext?.env)
     if (srcResolved.isVirtual || dstResolved.isVirtual) {
       throw new Error("failed get storage: storage not found")
     }
+    // 源与目标解析到不同存储时，绝不能把「目标的物理路径」交给「源存储的驱动」：
+    // local 驱动会直接写到宿主机上的另一个位置，其它驱动则把别的存储的命名空间
+    // 当成本驱动的路径。跨存储搬运需要下载+上传两条链路，这里不支持。
+    assertSameStorage(srcResolved, dstResolved)
 
     const driver = await getDriver(
       srcResolved.storage!.driver,
@@ -1795,11 +1854,17 @@ export async function copyItems(
   for (const name of names) {
     const srcVirtual = `${srcDir}/${name}`
     const dstVirtual = `${dstDir}/${name}`
+    await assertMetaWritable(srcVirtual, requestContext)
+    await assertMetaWritable(dstVirtual, requestContext)
     const srcResolved = await resolvePath(srcVirtual, requestContext?.env)
     const dstResolved = await resolvePath(dstVirtual, requestContext?.env)
     if (srcResolved.isVirtual || dstResolved.isVirtual) {
       throw new Error("failed get storage: storage not found")
     }
+    // 源与目标解析到不同存储时，绝不能把「目标的物理路径」交给「源存储的驱动」：
+    // local 驱动会直接写到宿主机上的另一个位置，其它驱动则把别的存储的命名空间
+    // 当成本驱动的路径。跨存储搬运需要下载+上传两条链路，这里不支持。
+    assertSameStorage(srcResolved, dstResolved)
 
     const driver = await getDriver(
       srcResolved.storage!.driver,
@@ -1831,6 +1896,7 @@ export async function putItem(
   content: Buffer,
   requestContext?: StorageRequestContext,
 ): Promise<void> {
+  await assertMetaWritable(virtualPath, requestContext)
   const resolved = await resolvePath(virtualPath, requestContext?.env)
   if (resolved.isVirtual) {
     throw new Error("failed get storage: storage not found")

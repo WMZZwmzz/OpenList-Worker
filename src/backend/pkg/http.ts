@@ -396,6 +396,61 @@ export function assertSafeUrl(
 }
 
 /**
+ * 校验第三方 3xx 的 `Location`：解析为绝对地址并做一次 SSRF 断言。
+ *
+ * 为什么需要：驱动/网关返回 302 时，跟随重定向的是**服务端**（fetch redirect:
+ * follow），而 `assertSafeUrl` 只校验了用户给出的初始 URL —— 上游完全可以用
+ * `Location: http://127.0.0.1/` 把请求引到内网。不安全或无法解析时返回空串，
+ * 调用方应回退到原 URL 或报错。
+ */
+export function safeRedirectUrl(
+  location: string,
+  base: string,
+  allowHosts?: ReadonlySet<string> | string[],
+): string {
+  try {
+    const next = new URL(location, base)
+    if (!isSafeUrl(next.toString(), allowHosts)) return ""
+    return next.toString()
+  } catch {
+    return ""
+  }
+}
+
+/**
+ * 浏览器侧危险目标：环回 / 云元数据 / `.internal` 等。
+ *
+ * 驱动返回的 raw_url 会直接进 `<img src>` / `<a href>`，由**用户浏览器**发起
+ * 请求。RFC1918 内网可能是正常的局域网存储，故这里只拦环回与元数据；更严格的
+ * 全内网拦截交给服务端 assertSafeUrl。
+ */
+export function isBrowserUnsafeUrl(urlStr: string): boolean {
+  try {
+    const u = new URL(urlStr)
+    if (u.protocol !== "http:" && u.protocol !== "https:") return false
+    const host = u.hostname.toLowerCase().replace(/\.+$/, "")
+    if (
+      host === "localhost" ||
+      host.endsWith(".localhost") ||
+      host.endsWith(".local") ||
+      host.endsWith(".internal") ||
+      host === "metadata" ||
+      host === "metadata.google.internal" ||
+      host === "169.254.169.254" ||
+      host === "100.100.100.200" ||
+      host === "0.0.0.0"
+    ) {
+      return true
+    }
+    if (/^127\./.test(host)) return true
+    if (host === "[::1]" || host === "::1") return true
+    return false
+  } catch {
+    return false
+  }
+}
+
+/**
  * 从存储配置 addition 中提取管理员配置的受信 host。
  *
  * 背景：SSRF 防护针对的是「用户/第三方可控」的 URL。而 addition 的所有字段都是

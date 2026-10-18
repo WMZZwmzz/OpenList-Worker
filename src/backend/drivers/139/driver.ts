@@ -248,12 +248,15 @@ export class Yun139Driver implements StorageDriver {
     )
     if (folder) {
       await this.client.deleteCatalog(folder.catalogID)
-    } else {
-      const file = disk.files.find((f) => this.nameEquals(f.contentName, name))
-      if (file && file.contentID) {
-        await this.client.deleteFile(file.contentID)
-      }
+      return
     }
+    const file = disk.files.find((f) => this.nameEquals(f.contentName, name))
+    if (file && file.contentID) {
+      await this.client.deleteFile(file.contentID)
+      return
+    }
+    // 目标不存在时不能静默成功：否则调用方会以为文件已删除。
+    throw new Error(`139 driver: file not found for ${clean}`)
   }
 
   async move(
@@ -264,6 +267,7 @@ export class Yun139Driver implements StorageDriver {
     dstPhys: string,
   ): Promise<void> {
     console.warn(`[139] move from ${srcPhys} to ${dstPhys}`)
+    throw new Error("139 driver: move is not supported")
   }
 
   async copy(
@@ -274,6 +278,7 @@ export class Yun139Driver implements StorageDriver {
     dstPhys: string,
   ): Promise<void> {
     console.warn(`[139] copy from ${srcPhys} to ${dstPhys}`)
+    throw new Error("139 driver: copy is not supported")
   }
 
   async put(
@@ -282,6 +287,7 @@ export class Yun139Driver implements StorageDriver {
     content: Buffer | Uint8Array,
   ): Promise<void> {
     console.warn(`[139] put for ${physicalPath}`)
+    throw new Error("139 driver: put is not supported")
   }
 
   async getDetails(): Promise<{ total_space?: number; used_space?: number }> {

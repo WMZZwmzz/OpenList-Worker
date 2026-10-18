@@ -16,6 +16,7 @@ export interface SearchOptions {
   /** Max items to collect before truncating (default 500) */
   max_results?: number
   /**
+  /**
    * 访问者。提供时对每个结果做 meta 判定过滤（密码保护 + read_users 白名单），
    * 对齐 Go handles.Search 传给 SearchFiltered 的 filter 闭包；不提供时
    * （内部调用 / 管理员构建索引）不做过滤，与历史行为一致。
@@ -23,6 +24,12 @@ export interface SearchOptions {
   user?: UserPermissionObj | null
   /** 目录访问密码（meta.password） */
   password?: string
+  /**
+   * 调用方补充的可见性判定（hide 规则等）。listItems 本身不套 meta，搜索必须
+   * 由调用方给出这道过滤，否则密码目录 / read_users / hide 规则会被搜索结果
+   * 原样吐出来。返回 false 的条目既不进结果，也不递归进入。
+   */
+  isVisible?: (parent: string, item: FileItem) => boolean | Promise<boolean>
 }
 
 export interface SearchResultItem extends FileItem {
@@ -81,6 +88,7 @@ export async function search(
     for (const item of items) {
       if (matches.length >= maxResults) break
 
+      const isDir = !!item.is_dir
       const subPath =
         dirPath === "/" ? `/${item.name}` : `${dirPath}/${item.name}`
 
@@ -94,8 +102,11 @@ export async function search(
         continue
       }
 
+      // 调用方的可见性过滤（hide 规则等）：不可见的条目既不作为结果返回，也不
+      // 向下递归，否则搜索结果会把子树整个暴露出去。
+      if (opts.isVisible && !(await opts.isVisible(dirPath, item))) continue
+
       const nameMatch = !keyword || item.name.toLowerCase().includes(keyword)
-      const isDir = !!item.is_dir
       // 挂载点虚拟文件夹（storage.ts 合并虚拟子挂载时 sign 为空），
       // 本身不显示，但仍需递归进入搜索其内部文件
       const isMountPoint = isDir && !item.sign
