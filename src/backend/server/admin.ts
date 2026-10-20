@@ -4460,14 +4460,18 @@ adminRouter.post("/setting/set_thunderx", async (c) => {
 })
 
 adminRouter.post("/setting/reset_token", async (c) => {
-  const newToken = generateSecureToken(32)
-  await updateSettingValue(c.env, { token: newToken })
-  // `token` 设置是链接/下载签名密钥（对应 Go 的 sign.Instance()），
-  // 变更后旧的下载链接签名立即失效——与 Go ResetToken 行为一致。
+  // M-4：这个端点以前把随机串写进 `token` 设置 —— 而 `token` 是 115 / PikPak /
+  // Thunder 驱动的凭据槽位，下载签名密钥根本不读它（签名密钥由 JWT_SECRET 派生）。
+  // 结果：旧直链一条都没失效（link_expiration=0 时永久有效），反而把这三个驱动的
+  // 配置改坏。
   //
-  // 注意：JWT 密钥来自 env.JWT_SECRET / 持久化的 openlist_jwt_secret，与这里的
-  // `token` 设置无关，所以清 JWT 缓存**不会**让已签发的 JWT 失效；这里调用只是
-  // 让进程内缓存与最新的 env/持久化值保持一致。
+  // 现在改为轮换专用的 `download_sign_secret`：签名层优先使用它（见
+  // pkg/sign.ts:getDownloadSignKey），因此这里一改，所有已签发的直链立即失效，
+  // 且不影响任何驱动配置。
+  const newToken = generateSecureToken(32)
+  await updateSettingValue(c.env, { download_sign_secret: newToken })
+  // JWT 与下载签名现在都不再依赖 `settings.token`；这里清缓存只是让进程内
+  // 派生密钥与最新配置保持一致（签名密钥本身每次从 DB 读取，不清也不会用旧值）。
   const { resetJwtSecretCache } = await import("./middlewares")
   resetJwtSecretCache()
   return c.json({ code: 200, message: "success", data: newToken })

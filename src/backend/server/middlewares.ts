@@ -3,6 +3,7 @@ import { verify } from "hono/jwt"
 import { checkAdminAuth, isStaticApiToken } from "../pkg/utils"
 import { findUserByTokenPayload, jwtClaimsAcceptable } from "../pkg/permission"
 import { clientIpFromContext } from "../pkg/client-ip"
+import { isOtpPendingPayload } from "../pkg/otp-pending"
 import {
   getDb,
   readPersistedSecret,
@@ -220,17 +221,53 @@ export async function getJwtSecret(c?: Context | any): Promise<string> {
   return readCachedJwtSecret(env) as string
 }
 
-// ---- JWT 注销黑名单（尽力而为：进程内 Set + KV 持久化）----
-// 说明：Serverless 多实例下各实例独立缓存，KV 持久化仅在冷启动时加载一次，
-// 因此跨实例的「即时」失效不能保证精确，但能在单实例内立即生效，并随新实例
-// 冷启动逐步收敛。exp 过期后条目自动清理，不会无限增长。
+// ---- JWT 注销黑名单（按 jti 单键 + 内存短 TTL 负缓存）----
+//
+// M-2：原先只有一个整表 blob `openlist_revoked_tokens`，且**仅在 isolate 冷启动
+// 时加载一次**。于是实例 A 登出写入 KV 后，早已在运行的实例 B 永远看不到这条
+// 记录 —— 被登出的旧 token 在其它实例上最长还能用 7 天。
+//
+// 现在：
+//   - 写入：每个 jti 单独一个键 `revoked_jti:<jti>`，带 expirationTtl（到期自动
+//     消失，不会无限增长）；同时继续写整表 blob，兼容尚未升级的实例。
+//   - 读取：内存 Set（确定已撤销）→ 负缓存 → KV 单键查询。负缓存 TTL 很短，
+//     把「每个认证请求一次 KV 读」压到最多每 60 秒一次。
 const REVOKED_KV_KEY = "openlist_revoked_tokens"
+const REVOKED_JTI_PREFIX = "revoked_jti:"
 const revokedJtis = new Set<string>()
+/** jti -> 可以确认「未撤销」的截止时刻（避免每请求回源 KV） */
+const revokedNegativeCache = new Map<string, number>()
+const REVOKED_NEGATIVE_TTL_MS = 60 * 1000
+const REVOKED_NEGATIVE_MAX = 4096
 let revokedLoaded = false
 // 加载失败后的重试时刻（避免「一次 KV 抖动就把注销能力永久关掉」）
 let revokedNextTryAt = 0
 const REVOKED_RETRY_MS = 30 * 1000
 
+function rememberNotRevoked(jti: string): void {
+  if (revokedNegativeCache.size >= REVOKED_NEGATIVE_MAX) {
+    const now = Date.now()
+    for (const [k, until] of revokedNegativeCache) {
+      if (until <= now) revokedNegativeCache.delete(k)
+    }
+    // 仍然过大就整体清空：负缓存只是性能优化，丢掉只会多一次 KV 读
+    if (revokedNegativeCache.size >= REVOKED_NEGATIVE_MAX) {
+      revokedNegativeCache.clear()
+    }
+  }
+  revokedNegativeCache.set(jti, Date.now() + REVOKED_NEGATIVE_TTL_MS)
+}
+
+async function readKvText(binding: any, mode: string, key: string): Promise<any> {
+  if (mode === "blob") return await binding.get(key)
+  try {
+    return await binding.get(key, "text")
+  } catch {
+    return await binding.get(key)
+  }
+}
+
+/** 兼容老版本：整表 blob 里可能有尚未按 jti 落键的注销记录，冷启动读一次。 */
 async function ensureRevokedLoaded(env: any): Promise<void> {
   if (revokedLoaded || Date.now() < revokedNextTryAt) return
   try {
@@ -241,20 +278,11 @@ async function ensureRevokedLoaded(env: any): Promise<void> {
       revokedLoaded = true
       return
     }
-    const { binding, mode } = kvInfo
-    let val: any = null
-    if (mode === "blob") {
-      val = await binding.get(REVOKED_KV_KEY)
-    } else {
-      try {
-        val = await binding.get(REVOKED_KV_KEY, "text")
-      } catch {
-        val = await binding.get(REVOKED_KV_KEY)
-      }
-    }
-    if (val && typeof val.text === "function") val = await val.text()
-    if (val) {
-      const arr = JSON.parse(String(val))
+    const val = await readKvText(kvInfo.binding, kvInfo.mode, REVOKED_KV_KEY)
+    let text = val
+    if (text && typeof text.text === "function") text = await text.text()
+    if (text) {
+      const arr = JSON.parse(String(text))
       const now = Math.floor(Date.now() / 1000)
       for (const item of arr) {
         if (item && item.jti && item.exp > now) revokedJtis.add(item.jti)
@@ -278,38 +306,51 @@ export async function revokeToken(
 ): Promise<void> {
   if (!jti) return
   revokedJtis.add(jti)
+  revokedNegativeCache.delete(jti)
   try {
     const { getKvBinding } = await import("../internal/model/db")
     const kvInfo = await getKvBinding(env)
     if (kvInfo.mode === "none" || !kvInfo.binding) return
     const { binding, mode } = kvInfo
-    let arr: Array<{ jti: string; exp: number }> = []
-    if (mode === "blob") {
-      const val = await binding.get(REVOKED_KV_KEY)
-      if (val) arr = typeof val === "string" ? JSON.parse(val) : val
-    } else {
-      try {
-        const val = await binding.get(REVOKED_KV_KEY, "text")
-        if (val) arr = JSON.parse(String(val))
-      } catch {
-        const val = await binding.get(REVOKED_KV_KEY)
-        if (val) arr = typeof val === "string" ? JSON.parse(val) : val
-      }
-    }
+
+    // 1. 主路径：单键写入。任何实例（包括早已在运行的）查同一个键都能看到。
     const now = Math.floor(Date.now() / 1000)
-    arr = arr.filter((i) => i && i.exp > now)
-    arr.push({ jti, exp })
-    const payload = JSON.stringify(arr)
-    if (mode === "blob") {
-      if (typeof binding.set === "function")
-        await binding.set(REVOKED_KV_KEY, payload)
-      else if (typeof binding.put === "function")
-        await binding.put(REVOKED_KV_KEY, payload)
-    } else {
-      if (typeof binding.put === "function")
-        await binding.put(REVOKED_KV_KEY, payload)
-      else if (typeof binding.set === "function")
-        await binding.set(REVOKED_KV_KEY, payload)
+    const ttl = Math.max(60, Number(exp || 0) - now || 7 * 24 * 3600)
+    const key = REVOKED_JTI_PREFIX + jti
+    try {
+      if (typeof binding.put === "function" && mode !== "blob") {
+        await binding.put(key, "1", { expirationTtl: ttl })
+      } else if (typeof binding.set === "function") {
+        await binding.set(key, "1")
+      } else if (typeof binding.put === "function") {
+        await binding.put(key, "1")
+      }
+    } catch (e) {
+      console.warn("[JWT] 单键注销写入失败，退回整表模式:", e)
+    }
+
+    // 2. 兼容路径：整表 blob（供未升级的实例读取）。失败不影响主路径。
+    try {
+      let arr: Array<{ jti: string; exp: number }> = []
+      const raw = await readKvText(binding, mode, REVOKED_KV_KEY)
+      const text = raw && typeof raw.text === "function" ? await raw.text() : raw
+      if (text) arr = typeof text === "string" ? JSON.parse(String(text)) : text
+      arr = arr.filter((i) => i && i.exp > now)
+      arr.push({ jti, exp })
+      const payload = JSON.stringify(arr)
+      if (mode === "blob") {
+        if (typeof binding.set === "function")
+          await binding.set(REVOKED_KV_KEY, payload)
+        else if (typeof binding.put === "function")
+          await binding.put(REVOKED_KV_KEY, payload)
+      } else {
+        if (typeof binding.put === "function")
+          await binding.put(REVOKED_KV_KEY, payload)
+        else if (typeof binding.set === "function")
+          await binding.set(REVOKED_KV_KEY, payload)
+      }
+    } catch {
+      // 整表只是兼容层，写不进去也没关系
     }
   } catch (e) {
     console.warn("[JWT] Failed to persist revoked token to KV:", e)
@@ -318,8 +359,36 @@ export async function revokeToken(
 
 export async function isTokenRevoked(jti: string, env: any): Promise<boolean> {
   if (!jti) return false
-  await ensureRevokedLoaded(env)
-  return revokedJtis.has(jti)
+  if (revokedJtis.has(jti)) return true
+
+  const cachedUntil = revokedNegativeCache.get(jti)
+  if (cachedUntil && cachedUntil > Date.now()) return false
+
+  try {
+    const { getKvBinding } = await import("../internal/model/db")
+    const kvInfo = await getKvBinding(env)
+    if (kvInfo.mode === "none" || !kvInfo.binding) {
+      // 没有共享存储时只能靠内存：不再缓存，避免把「可能已撤销」当成「未撤销」
+      await ensureRevokedLoaded(env)
+      return revokedJtis.has(jti)
+    }
+    const val = await readKvText(
+      kvInfo.binding,
+      kvInfo.mode,
+      REVOKED_JTI_PREFIX + jti,
+    )
+    if (val !== null && val !== undefined && val !== "") {
+      revokedJtis.add(jti)
+      revokedNegativeCache.delete(jti)
+      return true
+    }
+  } catch {
+    // 读取失败：不写负缓存（否则一次抖动会让撤销在 60 秒内失效），按未撤销处理
+    return revokedJtis.has(jti)
+  }
+
+  rememberNotRevoked(jti)
+  return false
 }
 
 export async function adminAuthMiddleware(
@@ -591,6 +660,29 @@ export async function getUserFromContext(
   return user
 }
 
+/** 请求是否携带了登录凭据（Authorization 头或 query 令牌）。 */
+export function requestHasCredential(c: Context): boolean {
+  if (c.req.header("Authorization")) return true
+  return !!(c.req.query("token") || c.req.query("access_token"))
+}
+
+/**
+ * 解析「真实登录」的请求身份：**不做 guest 回退**。
+ *
+ * 为什么需要（M-1）：`allow_guest` 默认 true，任何没有 Authorization 的请求都会
+ * 拿到一个真实存在的 guest 用户对象（带 id / role / permission）。读路径这样
+ * 处理是合理的（游客视图），但写/管理类端点若照用，就等于：
+ *   - 匿名可以给 guest 注册、删除、枚举 Passkey；
+ *   - 匿名可以调用 seed 的写/计算端点，消耗服务端 CPU 与网盘流量；
+ *   - 一旦管理员把 guest 的 role 改成 2，匿名请求直接成为管理员。
+ */
+export async function requireAuthenticatedUser(
+  c: Context,
+): Promise<AuthedUser | null> {
+  if (!requestHasCredential(c)) return null
+  return await getUserFromContext(c)
+}
+
 async function resolveUserFromContext(c: Context): Promise<AuthedUser | null> {
   // 仅静态 API token（api_token / API_TOKEN）命中才视为匿名管理员；
   // JWT 管理员走下方正常解析，避免用户名被硬编码成 "api-token"。
@@ -654,6 +746,8 @@ async function resolveUserFromContext(c: Context): Promise<AuthedUser | null> {
     const secret = await getJwtSecret(c)
     const payload: any = await verify(token, secret, "HS256")
     if (!jwtClaimsAcceptable(payload)) return null
+    // 2FA 未完成的待兑换令牌只能拿去 /api/auth/otp/login 兑换，不得作为会话凭证
+    if (isOtpPendingPayload(payload)) return null
     if (await isTokenRevoked(payload?.jti, c.env)) return null
     const db = await getDb(c.env)
     const user = findUserByTokenPayload(db.users, payload)

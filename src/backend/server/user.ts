@@ -3,6 +3,7 @@ import { getDb, saveDb } from "../internal/model/db"
 import { authUserFromReq, generateRandomPassword, verifyUserPassword } from "./auth"
 import { setUserPassword } from "../pkg/password"
 import { listUserSshKeys, deleteUserSshKey } from "../internal/op/sshkey"
+import { bumpTokenEpoch } from "../pkg/permission"
 
 export const userRouter = new Hono()
 
@@ -165,6 +166,8 @@ userRouter.post("/update", async (c) => {
 
   if (body.password && body.password.trim() !== "") {
     await setUserPassword(user, body.password.trim())
+    // M-3：管理员重置他人密码同样要让对方已签发的 token 立即失效
+    bumpTokenEpoch(user)
   }
 
   if (body.role !== undefined) user.role = parseInt(body.role, 10)
@@ -258,6 +261,8 @@ userRouter.post("/cancel_2fa", async (c) => {
     return c.json({ code: 404, message: "User not found", data: null }, 404)
   }
   delete user.otp_secret
+  // M-3：关闭 2FA 属于降低账号安全性，旧 token 必须一起作废
+  bumpTokenEpoch(user)
   await saveDb(db, c.env)
   return c.json({ code: 200, message: "success", data: null })
 })
@@ -297,6 +302,9 @@ export const updatePwdHandler = async (c: any) => {
     }
 
     await setUserPassword(user, newPassword)
+    // M-3：改密即撤销该用户此前签发的全部 token（含当前这一个），
+    // 客户端需重新登录。
+    bumpTokenEpoch(user)
     db.users[userIdx] = user
     await saveDb(db, c.env)
 

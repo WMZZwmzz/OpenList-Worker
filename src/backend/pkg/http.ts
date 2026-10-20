@@ -225,7 +225,8 @@ function embeddedIpv4(host: string): string | null {
   return null
 }
 
-/** IPv6 自身的受限范围：环回、未指定、fc00::/7（ULA）、fe80::/10（链路本地） */
+/** IPv6 自身的受限范围：环回、未指定、fc00::/7（ULA）、fe80::/10（链路本地）、
+ *  fec0::/10（站点本地，RFC 3879 已废弃但仍有实现）、ff00::/8（组播） */
 function isBlockedIpv6Range(host: string): boolean {
   const raw = host.replace(/^\[|\]$/g, "").toLowerCase()
   if (!raw.includes(":")) return false
@@ -238,6 +239,8 @@ function isBlockedIpv6Range(host: string): boolean {
     if (!Number.isNaN(head)) {
       if ((head & 0xfe00) === 0xfc00) return true // fc00::/7
       if ((head & 0xffc0) === 0xfe80) return true // fe80::/10
+      if ((head & 0xffc0) === 0xfec0) return true // fec0::/10（站点本地，废弃）
+      if ((head & 0xff00) === 0xff00) return true // ff00::/8（组播）
     }
   }
   return false

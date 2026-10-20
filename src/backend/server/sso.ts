@@ -2,7 +2,7 @@ import { Hono } from "hono"
 import { sign } from "hono/jwt"
 import { getDb, saveDb } from "../internal/model/db"
 import { getJwtSecret } from "./middlewares"
-import { generateRandomPassword } from "./auth"
+import { generateRandomPassword, issueOtpPendingToken } from "./auth"
 import { clientIpFromContext } from "../pkg/client-ip"
 import { setUserPassword } from "../pkg/password"
 import { JWT_ISSUER, JWT_AUDIENCE } from "../pkg/permission"
@@ -24,7 +24,13 @@ import { assertSafeUrl } from "../pkg/http"
 export const ssoRouter = new Hono()
 
 const STATE_EXPIRE_MS = 5 * 60 * 1000
-const stateStore = new Map<string, { ip: string; exp: number }>()
+interface StateRecord {
+  ip: string
+  exp: number
+  /** OIDC 的 nonce：回调时必须与 id_token 里的 nonce 一致（M-5） */
+  nonce?: string
+}
+const stateStore = new Map<string, StateRecord>()
 
 function getSetting(db: any, key: string, def = ""): string {
   const item = (db.settings || []).find((s: any) => s.key === key)
@@ -35,6 +41,12 @@ function getSetting(db: any, key: string, def = ""): string {
 function getBool(db: any, key: string): boolean {
   const v = getSetting(db, key, "false")
   return v === "true" || v === "1"
+}
+
+function randomHex(bytes = 16): string {
+  const buf = new Uint8Array(bytes)
+  crypto.getRandomValues(buf)
+  return Array.from(buf, (b) => b.toString(16).padStart(2, "0")).join("")
 }
 
 function clientIpOf(c: any): string {
@@ -49,25 +61,32 @@ function apiOrigin(c: any): string {
   }
 }
 
-function generateState(clientId: string, ip: string): string {
-  const bytes = new Uint8Array(16)
-  crypto.getRandomValues(bytes)
-  const state = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join(
-    "",
-  )
+function generateState(clientId: string, ip: string, nonce?: string): string {
+  const state = randomHex(16)
   stateStore.set(`${clientId}_${state}`, {
     ip,
     exp: Date.now() + STATE_EXPIRE_MS,
+    nonce,
   })
   return state
 }
 
-function verifyState(clientId: string, ip: string, state: string): boolean {
+/** 单次消费：无论校验成功与否都删除记录，防止 state 重放。 */
+function consumeState(
+  clientId: string,
+  ip: string,
+  state: string,
+): StateRecord | null {
   const key = `${clientId}_${state}`
   const rec = stateStore.get(key)
-  if (!rec) return false
+  if (!rec) return null
   stateStore.delete(key)
-  return rec.ip === ip && rec.exp > Date.now()
+  if (rec.ip !== ip || rec.exp <= Date.now()) return null
+  return rec
+}
+
+function verifyState(clientId: string, ip: string, state: string): boolean {
+  return consumeState(clientId, ip, state) !== null
 }
 
 /** 平台预设端点 */
@@ -180,6 +199,7 @@ async function oidcDiscovery(
   authUrl: string
   tokenUrl: string
   userUrl: string
+  issuer: string
 }> {
   const url = discoveryUrl.endsWith("/.well-known/openid-configuration")
     ? discoveryUrl
@@ -205,6 +225,7 @@ async function oidcDiscovery(
     authUrl: doc.authorization_endpoint,
     tokenUrl: doc.token_endpoint,
     userUrl: doc.userinfo_endpoint || "",
+    issuer: typeof doc.issuer === "string" ? doc.issuer : "",
   }
 }
 
@@ -221,6 +242,8 @@ async function generateToken(user: any, c: any): Promise<string> {
       typeof crypto.randomUUID === "function"
         ? crypto.randomUUID()
         : generateRandomPassword(),
+    // M-3：token 版本号（改密 / 关 2FA 后旧 token 立即失效）
+    epoch: Number(user.token_epoch ?? 0) || 0,
   }
   const secret = await getJwtSecret(c)
   return await sign(payload, secret)
@@ -231,6 +254,7 @@ async function autoRegister(
   db: any,
   username: string,
   ssoId: string,
+  env?: any,
 ): Promise<any> {
   let uname = username || ssoId
   if (db.users.some((u: any) => u.username === uname)) {
@@ -254,7 +278,9 @@ async function autoRegister(
   // SSO 用户不通过本地口令登录，但仍以双层哈希存储随机口令，避免存明文
   await setUserPassword(user, generateRandomPassword())
   db.users.push(user)
-  await saveDb(db, db.env)
+  // L-4：必须透传请求 env。此前传 `db.env`（通常 undefined），只能靠模块级
+  // globalEnvCtx 兜底——并发/多环境场景下会写到错误的后端。
+  await saveDb(db, env)
   return user
 }
 
@@ -271,6 +297,29 @@ function postMessageHtml(field: string, value: string): string {
 <body>
 <script>
 window.opener.postMessage({"${field}":"${safe}"}, window.location.origin)
+window.close()
+</script>
+</body>`
+}
+
+/**
+ * 同源 postMessage 回传任意 JSON 载荷（用于 2FA 待兑换流程：opener 需要同时
+ * 拿到 `otp_required` 标记与待兑换令牌）。
+ *
+ * 转义 `<`/`>`/`&` 与行分隔符，避免载荷内容提前闭合 <script> 或破坏 JS 字面量。
+ */
+function postMessageJson(payload: Record<string, unknown>): string {
+  const json = JSON.stringify(payload)
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
+    .replace(/&/g, "\\u0026")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029")
+  return `<!DOCTYPE html>
+<head></head>
+<body>
+<script>
+window.opener.postMessage(${json}, window.location.origin)
 window.close()
 </script>
 </body>`
@@ -305,13 +354,16 @@ ssoRouter.get("/sso", async (c) => {
   try {
     if (platform === "OIDC") {
       const ep = await oidcDiscovery(discoveryUrl || ssoLoginUrl, c)
-      const state = generateState(clientId, clientIpOf(c))
+      // M-5：带上 nonce 并在回调时校验，防止 id_token 被替换/重放
+      const nonce = randomHex(16)
+      const state = generateState(clientId, clientIpOf(c), nonce)
       const params = new URLSearchParams({
         response_type: "code",
         client_id: clientId,
         redirect_uri: redirectUri,
         scope: ssoScopes || "openid profile",
         state,
+        nonce,
       })
       return c.redirect(`${ep.authUrl}?${params.toString()}`, 302)
     }
@@ -370,9 +422,15 @@ ssoRouter.get("/sso_callback", async (c) => {
   const discoveryUrl = getSetting(db, "sso_oidc_discovery_url")
 
   try {
-    // state 校验前置到所有平台共用：verifyState 是单次消费的（校验即删除），
+    // state 校验前置到所有平台共用：consumeState 是单次消费的（校验即删除），
     // 因此 OIDC 分支不再重复校验。缺少这一步的非 OIDC 平台可被用于登录 CSRF。
-    if (!verifyState(clientId, clientIpOf(c), c.req.query("state") || "")) {
+    // 返回值里还带着 OIDC 的 nonce，供下面校验 id_token（M-5）。
+    const stateRec = consumeState(
+      clientId,
+      clientIpOf(c),
+      c.req.query("state") || "",
+    )
+    if (!stateRec) {
       return c.text("incorrect or expired state parameter", 400)
     }
 
@@ -411,6 +469,13 @@ ssoRouter.get("/sso_callback", async (c) => {
       const tokenData: any = await tokenResp.json().catch(() => ({}))
       accessToken = tokenData.access_token
       if (!accessToken) throw new Error("no access_token in token response")
+      // M-5：id_token 只做 payload 校验（签名需 JWKS，这里不做），至少要验
+      // iss / aud / exp，并在本次授权请求带了 nonce 时校验 nonce。
+      const idTokenOpts = {
+        clientId,
+        issuer: ep.issuer,
+        nonce: stateRec.nonce,
+      }
       if (userUrl) {
         assertSsoUrl(userUrl, c)
         const uResp = await fetch(userUrl, {
@@ -429,7 +494,7 @@ ssoRouter.get("/sso_callback", async (c) => {
           // 回退：解析 id_token payload 的 name 字段
           const idToken = tokenData.id_token
           if (idToken) {
-            const payload = parseJwtPayload(idToken)
+            const payload = validateIdTokenClaims(idToken, idTokenOpts)
             userInfo = userInfo || {}
             userInfo.sub = userInfo.sub || payload?.sub
             userInfo.name =
@@ -440,7 +505,7 @@ ssoRouter.get("/sso_callback", async (c) => {
       } else {
         const idToken = tokenData.id_token
         if (!idToken) throw new Error("no id_token and no userinfo endpoint")
-        userInfo = parseJwtPayload(idToken) || {}
+        userInfo = validateIdTokenClaims(idToken, idTokenOpts) || {}
         userInfo.sub = userInfo.sub || userInfo.name || ""
       }
     } else {
@@ -538,16 +603,46 @@ ssoRouter.get("/sso_callback", async (c) => {
       const username = String(
         userInfo?.login ?? userInfo?.[usernameField] ?? userInfo?.name ?? "",
       )
-      user = await autoRegister(db, username || userID, userID)
+      user = await autoRegister(db, username || userID, userID, c.env)
     }
     // 禁用账号不得借 SSO 拿到新 token（登录侧同样拒绝），否则封禁可被绕过。
     if (user.disabled) {
       return c.text("account is disabled", 403)
     }
+
+    // 2FA（H-2）：账号开了 TOTP 时，SSO 这一路不能直接发完整令牌——否则
+    // 「IdP 侧一个会话 + 一次回调」就绕过了 6 位验证码。改为只发 5 分钟的
+    // 待兑换令牌，前端拿到 otp_required 后向 POST /api/auth/otp/login 兑换。
+    if (user.otp_secret) {
+      const pending = await issueOtpPendingToken(user, c)
+      if (useCompat) {
+        // 兼容模式沿用「令牌放 URL」的既有契约（M-5 的 URL 契约改造已按决策
+        // 跳过）：pending 令牌 5 分钟过期、且不兑换 TOTP 就拿不到任何业务权限。
+        return c.redirect(
+          `${apiOrigin(c)}/@login?otp_required=1&token=${encodeURIComponent(pending)}`,
+          302,
+        )
+      }
+      return c.html(postMessageJson({ otp_required: true, token: pending }))
+    }
+
     const token = await generateToken(user, c)
     if (useCompat) {
+      // M-5（**部分修复**）：兼容模式默认仍把完整 JWT 放进 URL —— 改动这一点
+      // 会直接打断现有前端的 `/@login?token=` 契约，按决策跳过。
+      //
+      // 需要收紧时设置 SSO_COMPAT_EXCHANGE_CODE=1：改为 60 秒、单次消费的
+      // 兑换码，由 GET /api/auth/sso_exchange?code=... 换回 token，令牌本身
+      // 不再进浏览器历史 / Referer / 反代访问日志。
+      if (!useCompatExchangeCode(c)) {
+        return c.redirect(
+          `${apiOrigin(c)}/@login?token=${encodeURIComponent(token)}`,
+          302,
+        )
+      }
+      const code = await issueSsoExchangeCode(c, { token })
       return c.redirect(
-        `${apiOrigin(c)}/@login?token=${encodeURIComponent(token)}`,
+        `${apiOrigin(c)}/@login?code=${encodeURIComponent(code)}`,
         302,
       )
     }
@@ -569,4 +664,149 @@ function parseJwtPayload(token: string): any {
   } catch {
     return null
   }
+}
+
+// ---------------- M-5：SSO 兼容模式的一次性兑换码 ----------------
+//
+// 兼容模式原先直接把完整 JWT 拼进 `/@login?token=...`：令牌会进浏览器历史、
+// Referer 头、以及所有中间反代的访问日志。这里改为 60 秒、单次消费的兑换码，
+// 由 GET /api/auth/sso_exchange?code=... 换回令牌。
+
+const SSO_EXCHANGE_PREFIX = "sso_exchange:"
+const SSO_EXCHANGE_TTL_SEC = 60
+const SSO_EXCHANGE_TTL_MS = SSO_EXCHANGE_TTL_SEC * 1000
+const ssoExchangeCodes = new Map<string, { exp: number; payload: any }>()
+
+/**
+ * 兼容模式是否走一次性兑换码（M-5，默认关闭）。
+ *
+ * 关闭时保持既有契约 `/@login?token=<jwt>`（现有前端依赖它）；打开后改为
+ * `/@login?code=<60 秒单次码>`，需前端改调 `GET /api/auth/sso_exchange`。
+ */
+function useCompatExchangeCode(c: any): boolean {
+  const env = c?.env || {}
+  const raw =
+    env.SSO_COMPAT_EXCHANGE_CODE ??
+    (typeof process !== "undefined"
+      ? process.env?.SSO_COMPAT_EXCHANGE_CODE
+      : "")
+  return raw === "1" || raw === "true"
+}
+
+async function ssoKv(c: any): Promise<any | null> {
+  try {
+    const { getKvBinding } = await import("../internal/model/db")
+    const kvInfo = await getKvBinding(c?.env)
+    if (kvInfo.mode === "none" || !kvInfo.binding) return null
+    return kvInfo
+  } catch {
+    return null
+  }
+}
+
+async function issueSsoExchangeCode(
+  c: any,
+  payload: { token: string; otp_required?: boolean },
+): Promise<string> {
+  const code = randomHex(24)
+  const now = Date.now()
+  if (ssoExchangeCodes.size > 1024) {
+    for (const [k, v] of ssoExchangeCodes) {
+      if (v.exp <= now) ssoExchangeCodes.delete(k)
+    }
+  }
+  ssoExchangeCodes.set(code, { exp: now + SSO_EXCHANGE_TTL_MS, payload })
+  const kv = await ssoKv(c)
+  if (kv) {
+    try {
+      if (typeof kv.binding.put === "function") {
+        await kv.binding.put(SSO_EXCHANGE_PREFIX + code, JSON.stringify(payload), {
+          expirationTtl: SSO_EXCHANGE_TTL_SEC,
+        })
+      } else if (typeof kv.binding.set === "function") {
+        await kv.binding.set(SSO_EXCHANGE_PREFIX + code, JSON.stringify(payload))
+      }
+    } catch {
+      // KV 写失败时本实例的内存记录仍然有效
+    }
+  }
+  return code
+}
+
+async function consumeSsoExchangeCode(
+  c: any,
+  code: string,
+): Promise<any | null> {
+  if (!code) return null
+  const mem = ssoExchangeCodes.get(code)
+  if (mem) {
+    ssoExchangeCodes.delete(code)
+    return mem.exp > Date.now() ? mem.payload : null
+  }
+  const kv = await ssoKv(c)
+  if (!kv) return null
+  const key = SSO_EXCHANGE_PREFIX + code
+  try {
+    let raw = await kv.binding.get(key, "text")
+    if (raw && typeof raw.text === "function") raw = await raw.text()
+    if (raw === null || raw === undefined || raw === "") return null
+    if (typeof kv.binding.delete === "function") {
+      try {
+        await kv.binding.delete(key)
+      } catch {}
+    }
+    return JSON.parse(String(raw))
+  } catch {
+    return null
+  }
+}
+
+// GET /api/auth/sso_exchange?code=...  →  { token, otp_required? }
+ssoRouter.get("/sso_exchange", async (c) => {
+  const payload = await consumeSsoExchangeCode(c, c.req.query("code") || "")
+  if (!payload) {
+    return c.json(
+      { code: 400, message: "invalid or expired code", data: null },
+      400,
+    )
+  }
+  return c.json({ code: 200, message: "success", data: payload })
+})
+
+/**
+ * 校验 id_token 的 payload（M-5）：iss / aud / exp 必查，本次授权请求带了
+ * nonce 时再校验 nonce。签名验证需要 JWKS，本实现不含（依赖不可伪造的
+ * code→token 交换通道），但 payload 校验能挡住「换一个 id_token / 跨站点重放」。
+ *
+ * 校验失败直接抛错——调用方已在外层 try 中把错误转成 500/400。
+ */
+function validateIdTokenClaims(
+  idToken: string,
+  opts: { clientId: string; issuer?: string; nonce?: string },
+): any {
+  const payload = parseJwtPayload(idToken)
+  if (!payload) throw new Error("id_token is not a valid JWT")
+  const nowSec = Math.floor(Date.now() / 1000)
+  const skew = 60
+  const exp = Number(payload.exp)
+  if (!Number.isFinite(exp)) throw new Error("id_token missing exp")
+  if (exp + skew < nowSec) throw new Error("id_token expired")
+
+  const aud = payload.aud
+  const audList = Array.isArray(aud)
+    ? aud.map((a: any) => String(a))
+    : aud
+      ? [String(aud)]
+      : []
+  if (audList.length === 0) throw new Error("id_token missing aud")
+  if (opts.clientId && !audList.includes(String(opts.clientId))) {
+    throw new Error("id_token audience mismatch")
+  }
+  if (opts.issuer && String(payload.iss || "") !== String(opts.issuer)) {
+    throw new Error("id_token issuer mismatch")
+  }
+  if (opts.nonce && String(payload.nonce || "") !== String(opts.nonce)) {
+    throw new Error("id_token nonce mismatch")
+  }
+  return payload
 }

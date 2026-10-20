@@ -33,6 +33,7 @@ import {
   getHeader,
   canWriteContentBypassUserPerms,
   isHidden,
+  isSafeHidePattern,
   canWrite as canWriteMeta,
 } from "../pkg/meta"
 import type { Meta } from "../pkg/meta"
@@ -55,6 +56,7 @@ import {
   decodePathFully,
   encodeDownloadPath,
   hasParentSegment,
+  safeDecodeComponent,
 } from "../pkg/path"
 import { search } from "../internal/op/search"
 import {
@@ -105,6 +107,15 @@ function sessionBelongsTo(session: MultipartSession | undefined, user: any) {
 
 export const fsRouter = new Hono()
 fsRouter.route("/seed", seedRouter)
+
+/**
+ * 批量重命名单次处理的文件数上限。
+ *
+ * 正则本身的安全性由 pkg/meta 的 isSafeHidePattern 保证（拒绝 ReDoS 形状），
+ * 这里限制的是「量」：超大目录下每个 rename 都是一次远程驱动调用，不限量
+ * 就等于给一个 RENAME 权限请求无限期的执行时间。
+ */
+const REGEX_RENAME_MAX_FILES = 500
 
 const getStorageRequestContext = (c: any) => {
   // 始终返回上下文对象：存储写入层要靠它拿到本次请求的已认证用户，才能套用
@@ -833,6 +844,19 @@ function validateDirPath(p: any): string {
   return p
 }
 
+/**
+ * child 是否等于 root 或位于 root 之下（纯字符串判定，两侧均为已规范化的
+ * 虚拟路径、无尾部斜杠）。用于递归类端点把「驱动返回的条目名」拼进路径后
+ * 再做一次兜底检查。
+ */
+function isSameOrInside(child: string, root: string): boolean {
+  const base =
+    root.length > 1 && root.endsWith("/") ? root.replace(/\/+$/, "") : root
+  if (child === base) return true
+  if (base === "/") return child.startsWith("/")
+  return child.startsWith(base + "/")
+}
+
 fsRouter.post("/mkdir", async (c) => {
   const user = await getUserFromContext(c)
   if (!canWrite(user)) return permissionDenied(c)
@@ -974,7 +998,14 @@ fsRouter.post("/copy", async (c) => {
 fsRouter.put("/put", async (c) => {
   const user = await getUserFromContext(c)
   if (!canWrite(user)) return permissionDenied(c)
-  const rawPath = decodeURIComponent(c.req.header("File-Path") || "")
+  // L-12：畸形百分号编码返回 400，而不是让 decodeURIComponent 抛成 500
+  const rawPath = safeDecodeComponent(c.req.header("File-Path") || "")
+  if (rawPath === null) {
+    return c.json(
+      { code: 400, message: "Bad Request: malformed path encoding", data: null },
+      400,
+    )
+  }
   if (!rawPath.trim()) {
     return c.json(
       { code: 400, message: "Missing File-Path header", data: null },
@@ -1016,7 +1047,14 @@ fsRouter.put("/put", async (c) => {
 fsRouter.put("/form", async (c) => {
   const user = await getUserFromContext(c)
   if (!canWrite(user)) return permissionDenied(c)
-  const rawPath = decodeURIComponent(c.req.header("File-Path") || "")
+  // L-12：畸形百分号编码返回 400，而不是让 decodeURIComponent 抛成 500
+  const rawPath = safeDecodeComponent(c.req.header("File-Path") || "")
+  if (rawPath === null) {
+    return c.json(
+      { code: 400, message: "Bad Request: malformed path encoding", data: null },
+      400,
+    )
+  }
   if (!rawPath.trim()) {
     return c.json(
       { code: 400, message: "Missing File-Path header", data: null },
@@ -1089,6 +1127,15 @@ fsRouter.post("/upload/create", async (c) => {
       data: null,
     })
   }
+  // L-14：file_name 会被驱动直接拼进对象 key / 分片键名。各驱动自己怎么兜底不可控，
+  // 入口必须先过一遍 validateFileName（拒绝 `..`、`/`、`\`、NUL 以及解码后变成
+  // 分隔符的写法），与 /fs/get_direct_upload_info 保持一致。
+  let safeUploadName: string
+  try {
+    safeUploadName = validateFileName(file_name)
+  } catch (e: any) {
+    return c.json({ code: 400, message: e.message, data: null }, 400)
+  }
   try {
     const resolved = await resolvePath(dirPath)
     if (resolved.isVirtual) {
@@ -1104,7 +1151,7 @@ fsRouter.post("/upload/create", async (c) => {
       info = await (driver as any).createUploadSession(
         dirPath,
         resolved.physical!,
-        file_name,
+        safeUploadName,
         Number(size) || 0,
         md5 || "",
       )
@@ -1127,7 +1174,13 @@ fsRouter.put("/upload/part", async (c) => {
   if (!canWrite(user)) return permissionDenied(c)
   const session = c.req.header("X-Upload-Session") || ""
   const partNumber = parseInt(c.req.header("X-Part-Number") || "0", 10)
-  const rawDirPath = decodeURIComponent(c.req.header("Upload-Path") || "")
+  const rawDirPath = safeDecodeComponent(c.req.header("Upload-Path") || "")
+  if (rawDirPath === null) {
+    return c.json(
+      { code: 400, message: "Bad Request: malformed path encoding", data: null },
+      400,
+    )
+  }
   const dirPath = getActualPath(user, rawDirPath)
   const requestContext = getStorageRequestContext(c)
   if (!(await metaWritable(c, user, dirPath))) return permissionDenied(c)
@@ -1367,17 +1420,57 @@ fsRouter.post("/regex_rename", async (c) => {
       400,
     )
   }
+  // 用户可控正则直接 new RegExp 是 ReDoS 入口：`(a+)+$` 在 30 字符的文件名上
+  // 就能把一个 isolate 的 CPU 打满（RENAME 权限即可触发）。复用 meta.hide 那套
+  // 灾难性回溯形状检测（长度上限 256、嵌套量词、反向引用、重叠分支、无界量词数）。
+  if (typeof src_name_regex !== "string" || !isSafeHidePattern(src_name_regex)) {
+    return c.json(
+      {
+        code: 400,
+        message: "src_name_regex is rejected as unsafe (too long or ReDoS-prone)",
+        data: null,
+      },
+      400,
+    )
+  }
+  if (
+    new_name_regex !== undefined &&
+    new_name_regex !== null &&
+    typeof new_name_regex !== "string"
+  ) {
+    return c.json(
+      { code: 400, message: "new_name_regex must be a string", data: null },
+      400,
+    )
+  }
   const dirPath = getActualPath(user, src_dir || "/")
   const requestContext = getStorageRequestContext(c)
   try {
     const srcRegex = new RegExp(src_name_regex)
     const { content } = await listItems(dirPath, requestContext)
+    // 单次处理数量上限：即便正则本身是安全的，超大目录下逐个 rename 也足以
+    // 把请求拖到超时（驱动侧每个 rename 都是一次远程调用）。
+    let renamed = 0
     for (const item of content) {
+      if (renamed >= REGEX_RENAME_MAX_FILES) {
+        return c.json(
+          {
+            code: 400,
+            message: `Too many matches; at most ${REGEX_RENAME_MAX_FILES} files per request`,
+            data: null,
+          },
+          400,
+        )
+      }
       if (!item.is_dir && srcRegex.test(item.name)) {
         const newName = item.name.replace(srcRegex, new_name_regex || "")
+        // item.name 来自驱动（可能是攻击者可控的 WebDAV/AutoIndex 存储），
+        // 与 newName 一样必须先校验再拼路径。
+        validateFileName(item.name)
         validateFileName(newName)
         const fullPath = `${dirPath}/${item.name}`.replace(/\/{2,}/g, "/")
         await renameItem(fullPath, newName, requestContext)
+        renamed++
       }
     }
     return c.json({ code: 200, message: "success", data: null })
@@ -1411,8 +1504,16 @@ fsRouter.post("/recursive_move", async (c) => {
       const dir = queue.shift()!
       const { content } = await listItems(dir, requestContext)
       for (const item of content) {
+        // 条目名由驱动返回（WebDAV / AutoIndex / url_tree 这些存储的内容受
+        // 攻击者控制），`../..` 会让队列路径折叠后越出 src_dir 甚至 base_path，
+        // 进而把文件移动到别人的目录。同文件其它端点都过了 validateFileName，
+        // 唯独这两个递归端点漏了。
+        validateFileName(item.name)
         if (item.is_dir) {
-          queue.push(`${dir}/${item.name}`.replace(/\/{2,}/g, "/"))
+          const child = `${dir}/${item.name}`.replace(/\/{2,}/g, "/")
+          // 纵深防御：递归目标必须仍在本次请求的源目录之内
+          if (!isSameOrInside(child, srcPath)) continue
+          queue.push(child)
         } else {
           if (existing.has(item.name)) {
             if (policy === "cancel") {
@@ -1456,14 +1557,23 @@ fsRouter.post("/remove_empty_directory", async (c) => {
       const { content } = await listItems(dir, requestContext)
       for (const item of content) {
         if (item.is_dir) {
-          await removeEmptyDirs(`${dir}/${item.name}`.replace(/\/{2,}/g, "/"))
+          // 同 recursive_move：驱动返回的条目名必须先校验，否则 `../..` 会让
+          // 递归路径折叠到上级目录，随后被当作「空目录」删掉。
+          validateFileName(item.name)
+          const child = `${dir}/${item.name}`.replace(/\/{2,}/g, "/")
+          if (!isSameOrInside(child, srcPath)) continue
+          await removeEmptyDirs(child)
         }
       }
       if (dir === srcPath) return // 不删除根目录本身
       const after = await listItems(dir, requestContext)
       if (after.content.length === 0) {
-        const parent = dir.split("/").slice(0, -1).join("/") || "/"
-        const name = dir.split("/").pop()!
+        // 用最后一段分隔符派生 parent/name（不再靠 split("/") 后拼回字符串），
+        // 并对 name 复校验一次：删除动作本身不可逆，不能带上可疑段。
+        const slash = dir.lastIndexOf("/")
+        const parent = slash <= 0 ? "/" : dir.slice(0, slash)
+        const name = dir.slice(slash + 1)
+        validateFileName(name)
         await removeItems(parent, [name], requestContext)
       }
     }
@@ -1596,7 +1706,13 @@ fsRouter.post("/multipart/init", async (c) => {
   const user = await getUserFromContext(c)
   if (!canWrite(user)) return permissionDenied(c)
 
-  const rawPath = decodeURIComponent(c.req.header("File-Path") || "")
+  const rawPath = safeDecodeComponent(c.req.header("File-Path") || "")
+  if (rawPath === null) {
+    return c.json(
+      { code: 400, message: "Bad Request: malformed path encoding", data: null },
+      400,
+    )
+  }
   const size = parseInt(c.req.header("X-File-Size") || "0", 10)
   const rawChunk = parseInt(c.req.header("X-Chunk-Size") || "0", 10)
   const md5 = c.req.header("X-File-Md5") || ""
@@ -1927,7 +2043,11 @@ async function fetchArchiveBytes(
   const driver = await getDriver(resolved.storage!.driver, resolved.storage)
   let item: any
   try {
-    item = await driver.get(virtualPath, resolved.physical!)
+    // L-8：必须传**实际的**挂载路径（actual），与上面 resolvePath / 鉴权用的
+    // 路径同源。此前传的是用户原始输入 virtualPath：当用户带 base_path 或
+    // 编码差异时，驱动拿到的路径与实际存储位置不一致（部分驱动会因此返回
+    // 错误条目的 raw_url，甚至绕过 meta 判定的那一份路径）。
+    item = await driver.get(actual, resolved.physical!)
   } finally {
     await flushPendingDriverState(
       resolved.storage!.driver,

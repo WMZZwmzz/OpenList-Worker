@@ -90,6 +90,21 @@ export function canonicalVirtualPath(value: string): string {
 }
 
 /**
+ * `decodeURIComponent` 的兜底版本（L-12）。
+ *
+ * 畸形百分号编码（`100%.txt`、`%E0%A4`）会让原生函数抛 URIError，冒泡到路由层
+ * 就是 500 + 堆栈日志。调用方拿到 null 时应返回 400，而不是让请求变成服务端错误。
+ */
+export function safeDecodeComponent(value: unknown): string | null {
+  if (typeof value !== "string") return null
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return null
+  }
+}
+
+/**
  * 逐段百分号编码下载路径（对齐 Go pkg/utils.EncodePath(path, true)）。
  *
  * Go 用的是 url.PathEscape 的 encodePath 模式：非保留字符 A-Za-z0-9-._~

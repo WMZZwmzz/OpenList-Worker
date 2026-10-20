@@ -155,9 +155,16 @@ shareRouter.post("/create", async (c) => {
     new_id: body.new_id || shareId,
     // 对齐 Go CreateSharing：管理员恢复分享时可通过 creator/creator_role 字段
     // 保留原创建者，否则默认当前登录用户。
-    creator: body.creator || user.username || "user",
+    //
+    // 但 creator/creator_role 决定了分享解压时的「创建者根目录」兜底
+    // （withinCreatorRoot），普通用户若能自填就等于把自己的分享挂到别人名下，
+    // 从而绕过 base_path 约束。因此只允许管理员覆盖。
+    creator:
+      isAdmin(user) && body.creator ? body.creator : user.username || "user",
     creator_role:
-      body.creator_role !== undefined ? body.creator_role : (user.role ?? 1),
+      isAdmin(user) && body.creator_role !== undefined
+        ? body.creator_role
+        : (user.role ?? 1),
     accessed: body.accessed ?? 0,
     expires: body.expires || null,
     pwd: body.pwd || "",
@@ -188,6 +195,9 @@ function generateShareId(): string {
 shareRouter.post("/update", async (c) => {
   const body = await c.req.json().catch(() => ({}))
   const db = await getDb(c.env)
+  // adminAuthMiddleware 已确保调用者是管理员 / 静态 API 令牌；这里取身份仅用于
+  // 路径规范化和 meta 读权限校验（与 /create 同源）。
+  const user = await getUserFromContext(c)
 
   if (!body.id) {
     return c.json({ code: 400, message: "share id is required", data: null })
@@ -218,6 +228,10 @@ shareRouter.post("/update", async (c) => {
 
   // 更新同样要过一遍清洗：分享路径最终会被 resolvePath 二次解码后折叠，
   // 脏数据一旦入库就等于把一个可解码成 `..` 的路径永久留在分享白名单里。
+  //
+  // 注意：清洗结果**必须回写**（历史实现算完即弃，落库的仍是 body.files 原文，
+  // 于是 `%2e%2e` 这类编码路径照样入库）；并且要像 /create 一样校验创建者对
+  // 目标路径的读权限，否则管理员账号被盗后可把任意越界路径挂进分享。
   let updatedFiles = db.shares[idx].files
   if (body.files !== undefined) {
     if (!Array.isArray(body.files)) {
@@ -227,12 +241,23 @@ shareRouter.post("/update", async (c) => {
       )
     }
     try {
-      updatedFiles = body.files.map((f: string) => sanitizePath(String(f)))
+      updatedFiles = body.files.map((f: string) => {
+        const clean = sanitizePath(String(f))
+        return user && isAdmin(user) ? clean : getActualPath(user as any, clean)
+      })
     } catch (err: any) {
       return c.json(
         { code: 400, message: err.message || "Invalid file path", data: null },
         400,
       )
+    }
+    const denied = await assertShareTargetsAccessible(
+      user as any,
+      updatedFiles,
+      c.env,
+    )
+    if (denied) {
+      return c.json({ code: 403, message: denied, data: null }, 403)
     }
   }
 
@@ -258,7 +283,7 @@ shareRouter.post("/update", async (c) => {
       body.extract_folder !== undefined
         ? body.extract_folder
         : db.shares[idx].extract_folder,
-    files: body.files !== undefined ? body.files : db.shares[idx].files,
+    files: body.files !== undefined ? updatedFiles : db.shares[idx].files,
     remark: body.remark !== undefined ? body.remark : db.shares[idx].remark,
     readme: body.readme !== undefined ? body.readme : db.shares[idx].readme,
     header: body.header !== undefined ? body.header : db.shares[idx].header,

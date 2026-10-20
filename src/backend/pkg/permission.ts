@@ -66,13 +66,33 @@ export function findUserByTokenPayload(
   payload: any,
 ): any {
   if (!Array.isArray(users) || !payload) return null
+  let user: any = null
   if (payload.id !== undefined && payload.id !== null) {
-    return users.find((u: any) => String(u.id) === String(payload.id)) || null
+    user =
+      users.find((u: any) => String(u.id) === String(payload.id)) || null
+  } else if (payload.username) {
+    user = users.find((u: any) => u.username === payload.username) || null
   }
-  if (payload.username) {
-    return users.find((u: any) => u.username === payload.username) || null
-  }
-  return null
+  if (!user) return null
+
+  // M-3：token 版本号。改密 / 管理员改密 / 关闭 2FA 会递增它，从而让该用户
+  // 此前签发的所有 JWT 立即失效（此前只能等 7 天自然过期）。没有该字段的
+  // 历史 token / 历史用户都按 0 处理，升级不影响已登录用户。
+  const payloadEpoch = Number(payload?.epoch ?? 0) || 0
+  const userEpoch = Number(user.token_epoch ?? 0) || 0
+  if (payloadEpoch !== userEpoch) return null
+
+  return user
+}
+
+/**
+ * 递增用户的 token 版本号，使其已签发的 JWT 全部失效（M-3）。
+ *
+ * 调用点：用户自助改密、管理员改他人密码、关闭 2FA。调用方负责 saveDb。
+ */
+export function bumpTokenEpoch(user: any): void {
+  if (!user) return
+  user.token_epoch = (Number(user.token_epoch ?? 0) || 0) + 1
 }
 
 export function isGuest(user?: UserPermissionObj | null): boolean {

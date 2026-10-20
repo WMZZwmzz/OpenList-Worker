@@ -1,7 +1,22 @@
 /**
  * CSRF (Cross-Site Request Forgery) 防护模块
  * 添加日期: 2026-09-05
- * 
+ *
+ * ⚠️ 已废弃，不要在本项目里使用（L-1，2026-10-20 安全复审）。
+ *
+ * 现状与原因：
+ *   - 本项目的会话凭证只走 `Authorization: Bearer`（登录响应体返回，前端存
+ *     localStorage），服务端从不签发承载身份的 Cookie。跨站表单/fetch 无法自带
+ *     攻击者不知道的 Authorization 头，因此传统 CSRF 在这里不成立。
+ *   - 本模块提供的是 Cookie/双重提交实现，与 `server/middlewares.ts` 里的
+ *     `csrfProtection`（校验 X-CSRF-Token）是两套互不兼容的实现，**都没有挂载**。
+ *   - `GET /api/auth/csrf` 仍会返回 token，但对上述实现而言是死代码，容易让人
+ *     误以为有 CSRF 防护覆盖。
+ *
+ * 若将来引入 Cookie 会话（例如 HttpOnly JWT），必须同时：挂载
+ * `middlewares.csrfProtection`、把 Cookie 设为 SameSite=Strict/Lax，并删除本文件
+ * 以避免再次出现两套实现。
+ *
  * 实现基于 Token 的 CSRF 防护
  * 支持两种模式：
  * 1. Double Submit Cookie - Cookie + Header 双重验证

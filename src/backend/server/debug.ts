@@ -1,8 +1,14 @@
 import { Hono } from "hono"
 import { getDb, getStoreStatus } from "../internal/model/db"
 import { checkAdminAuth } from "../pkg/utils"
+import { adminAuthMiddleware } from "./middlewares"
 
 export const debugRouter = new Hono()
+
+// L-5：整个 /debug 收进管理员鉴权。此前匿名请求也能拿到存储后端指纹
+// （driver / format / KV·D1·MySQL 是否生效），是一次零成本的侦察面；
+// 需要匿名探活时用 /healthz。
+debugRouter.use("/info", adminAuthMiddleware)
 
 debugRouter.get("/info", async (c) => {
   const isAdmin = await checkAdminAuth(c)

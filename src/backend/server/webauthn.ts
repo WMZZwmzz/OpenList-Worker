@@ -1,7 +1,8 @@
 import { Hono } from "hono"
 import { sign } from "hono/jwt"
 import { getDb, saveDb } from "../internal/model/db"
-import { getJwtSecret, getUserFromContext } from "./middlewares"
+import { getJwtSecret, requireAuthenticatedUser } from "./middlewares"
+import { issueOtpPendingToken } from "./auth"
 import { hmacSha256 } from "../pkg/crypto"
 import { JWT_ISSUER, JWT_AUDIENCE } from "../pkg/permission"
 
@@ -274,36 +275,98 @@ interface SessionData {
 }
 
 /**
- * 本实例签发过的 challenge 登记表。
+ * 本实例签发过的 challenge 登记表 + 共享存储（KV）。
  *
  * session 头是一段客户端可自造的 base64 JSON：finish_* 里「clientDataJSON.challenge
  * 与 blob 里的 challenge 相等」这条校验，攻击者自己造一个 blob 就能满足，等于没有
- * 校验。登记表把 challenge 锚定到「确实由服务端发出过」。冷启动 / 跨实例时表为空，
- * 无从核对，此时保持可用（不因为边缘调度的实例漂移而拒绝正常登录）。
+ * 校验。登记表把 challenge 锚定到「确实由服务端发出过」。
+ *
+ * M-6：原实现在登记表为空时**直接放行**（`issuedChallenges.size === 0` 返回 true），
+ * 理由是「冷启动 / 跨实例时无从核对」。代价是：新实例上任何一个自造 challenge 都
+ * 能通过，截获一次 finish_login 请求即可重放拿新 token。现在改为：
+ *   1. 签发时同时写入 KV（带 TTL），跨实例/冷启动也能核对；
+ *   2. 校验时先内存、再 KV，**两边都查不到一律拒绝**（fail-closed）。
  */
 const issuedChallenges = new Map<string, number>()
 const CHALLENGE_TTL_MS = 5 * 60 * 1000
+const CHALLENGE_KV_PREFIX = "wa_challenge:"
 
-function rememberChallenge(challenge?: string): void {
-  if (!challenge) return
-  const now = Date.now()
+async function challengeKv(c: any): Promise<any | null> {
+  try {
+    const { getKvBinding } = await import("../internal/model/db")
+    const kvInfo = await getKvBinding(c?.env)
+    if (kvInfo.mode === "none" || !kvInfo.binding) return null
+    return kvInfo
+  } catch {
+    return null
+  }
+}
+
+async function readKvValue(kvInfo: any, key: string): Promise<any> {
+  try {
+    const val = await kvInfo.binding.get(key, "text")
+    return val && typeof val.text === "function" ? await val.text() : val
+  } catch {
+    return await kvInfo.binding.get(key)
+  }
+}
+
+function pruneIssuedChallenges(now: number): void {
   for (const [k, exp] of issuedChallenges) {
     if (exp <= now) issuedChallenges.delete(k)
   }
-  issuedChallenges.set(challenge, now + CHALLENGE_TTL_MS)
 }
 
-function isIssuedChallenge(challenge?: string): boolean {
+function rememberChallenge(challenge?: string, c?: any): void {
+  if (!challenge) return
+  const now = Date.now()
+  pruneIssuedChallenges(now)
+  issuedChallenges.set(challenge, now + CHALLENGE_TTL_MS)
+  // 写 KV 是尽力而为：失败不影响本实例内的校验，只是跨实例会退化为 fail-closed
+  void (async () => {
+    const kvInfo = await challengeKv(c)
+    if (!kvInfo) return
+    try {
+      if (typeof kvInfo.binding.put === "function") {
+        await kvInfo.binding.put(CHALLENGE_KV_PREFIX + challenge, "1", {
+          expirationTtl: Math.ceil(CHALLENGE_TTL_MS / 1000),
+        })
+      } else if (typeof kvInfo.binding.set === "function") {
+        await kvInfo.binding.set(CHALLENGE_KV_PREFIX + challenge, "1")
+      }
+    } catch {}
+  })()
+}
+
+/** 单次消费：内存命中即删；否则查 KV 并删除。两边都没有 → false（fail-closed）。 */
+async function consumeIssuedChallenge(
+  challenge: string | undefined,
+  c: any,
+): Promise<boolean> {
   if (!challenge) return false
-  if (issuedChallenges.size === 0) return true
+  const now = Date.now()
   const exp = issuedChallenges.get(challenge)
-  if (exp === undefined) return false
-  issuedChallenges.delete(challenge) // 单次消费
-  return exp > Date.now()
+  if (exp !== undefined) {
+    issuedChallenges.delete(challenge)
+    return exp > now
+  }
+  const kvInfo = await challengeKv(c)
+  if (!kvInfo) return false
+  const key = CHALLENGE_KV_PREFIX + challenge
+  try {
+    const val = await readKvValue(kvInfo, key)
+    if (val === null || val === undefined || val === "") return false
+    if (typeof kvInfo.binding.delete === "function") {
+      await kvInfo.binding.delete(key)
+    }
+    return true
+  } catch {
+    return false
+  }
 }
 
 function sessionToB64(sd: SessionData, c: any): Promise<string> {
-  rememberChallenge(sd.challenge)
+  rememberChallenge(sd.challenge, c)
   return signSessionPayload(b64Encode(new TextEncoder().encode(JSON.stringify(sd))), c)
 }
 
@@ -347,6 +410,8 @@ async function generateToken(user: any, c: any): Promise<string> {
       typeof crypto.randomUUID === "function"
         ? crypto.randomUUID()
         : b64urlEncode(newChallenge()),
+    // M-3：token 版本号（改密 / 关 2FA 后旧 token 立即失效）
+    epoch: Number(user.token_epoch ?? 0) || 0,
   }
   const secret = await getJwtSecret(c)
   return await sign(payload, secret)
@@ -444,7 +509,7 @@ webauthnRouter.post("/webauthn_finish_login", async (c) => {
         400,
       )
     }
-    if (!isIssuedChallenge(sd.challenge)) {
+    if (!(await consumeIssuedChallenge(sd.challenge, c))) {
       return c.json(
         {
           code: 400,
@@ -516,6 +581,19 @@ webauthnRouter.post("/webauthn_finish_login", async (c) => {
       )
     }
 
+    // M-6：begin_login 已经给出 allowCredentials 白名单（该用户名下的凭据集合），
+    // finish 时必须校验，否则这份白名单形同虚设。
+    if (
+      Array.isArray(sd.allowedCredentials) &&
+      sd.allowedCredentials.length > 0 &&
+      !sd.allowedCredentials.some((cred: any) => cred && cred.id === body.id)
+    ) {
+      return c.json(
+        { code: 400, message: "credential not in allowCredentials", data: null },
+        400,
+      )
+    }
+
     // 4. 验证签名（credential 存储 JWK 公钥）
     const jwk = credential.publicKey
     if (!jwk) {
@@ -565,17 +643,30 @@ webauthnRouter.post("/webauthn_finish_login", async (c) => {
       )
     }
 
-    // 5. 更新 signCount（防重放，可选）
+    // 5. 更新 signCount（防重放）
     const signCount =
       (authData[33] << 24) |
       (authData[34] << 16) |
       (authData[35] << 8) |
       authData[36]
-    if (
-      credential.sign_count !== undefined &&
-      signCount !== 0 &&
-      signCount <= credential.sign_count
-    ) {
+    // M-6：原实现是 `signCount !== 0 && signCount <= credential.sign_count`，
+    // 于是 signCount 恒为 0 的 authenticator（部分平台 Passkey）上重放检测完全
+    // 失效——截获一次 finish_login 请求可以反复换新 token。现在：
+    //   - 历史计数 > 0 而本次为 0 → 一律拒绝（计数器不能倒退）；
+    //   - 历史与本次都为 0 → 该 authenticator 不支持计数器，只能依赖
+    //     challenge 单次消费（已改为 KV 持久化 + fail-closed）兜底。
+    const storedSignCount = Number(credential.sign_count ?? 0) || 0
+    if (storedSignCount > 0 && signCount === 0) {
+      return c.json(
+        {
+          code: 400,
+          message: "signCount regressed to zero (possible cloned authenticator)",
+          data: null,
+        },
+        400,
+      )
+    }
+    if (signCount !== 0 && storedSignCount !== 0 && signCount <= storedSignCount) {
       return c.json(
         { code: 400, message: "stale signCount (possible replay)", data: null },
         400,
@@ -591,6 +682,18 @@ webauthnRouter.post("/webauthn_finish_login", async (c) => {
         { code: 403, message: "account is disabled", data: null },
         403,
       )
+    }
+
+    // 2FA（H-2）：账号开了 TOTP 时不得直接发完整令牌 —— 否则一枚已注册的
+    // Passkey 就是一个绕开 6 位验证码的永久后门。只发 5 分钟待兑换令牌，
+    // 由 POST /api/auth/otp/login 校验 TOTP / 恢复码后才换发会话令牌。
+    if (user.otp_secret) {
+      const pending = await issueOtpPendingToken(user, c)
+      return c.json({
+        code: 200,
+        message: "otp required",
+        data: { otp_required: true, token: pending },
+      })
     }
 
     const token = await generateToken(user, c)
@@ -612,8 +715,9 @@ webauthnRouter.post("/webauthn_begin_registration", async (c) => {
       403,
     )
   }
-  const user = await getUserFromContext(c)
-  if (!user || user.disabled) {
+  // 凭据管理端点必须真实登录：guest 回退会让匿名者给 guest 注册 Passkey（M-1）
+  const user = await requireAuthenticatedUser(c)
+  if (!user || user.disabled || user.id === undefined) {
     return c.json({ code: 401, message: "Unauthorized", data: null }, 401)
   }
   const rpId = rpIdOf(c, db)
@@ -672,8 +776,9 @@ webauthnRouter.post("/webauthn_finish_registration", async (c) => {
       403,
     )
   }
-  const user = await getUserFromContext(c)
-  if (!user || user.disabled) {
+  // 凭据管理端点必须真实登录：guest 回退会让匿名者给 guest 注册 Passkey（M-1）
+  const user = await requireAuthenticatedUser(c)
+  if (!user || user.disabled || user.id === undefined) {
     return c.json({ code: 401, message: "Unauthorized", data: null }, 401)
   }
   const sessionHeader = c.req.header("Session") || c.req.header("session") || ""
@@ -700,7 +805,7 @@ webauthnRouter.post("/webauthn_finish_registration", async (c) => {
         400,
       )
     }
-    if (!isIssuedChallenge(sd.challenge)) {
+    if (!(await consumeIssuedChallenge(sd.challenge, c))) {
       return c.json(
         {
           code: 400,
@@ -777,8 +882,9 @@ webauthnRouter.post("/webauthn_finish_registration", async (c) => {
 
 // POST /api/authn/delete_authn (需已登录，body: {id})
 webauthnRouter.post("/delete_authn", async (c) => {
-  const user = await getUserFromContext(c)
-  if (!user || user.disabled) {
+  // 凭据管理端点必须真实登录：guest 回退会让匿名者给 guest 注册 Passkey（M-1）
+  const user = await requireAuthenticatedUser(c)
+  if (!user || user.disabled || user.id === undefined) {
     return c.json({ code: 401, message: "Unauthorized", data: null }, 401)
   }
   const body = await c.req.json().catch(() => ({}))
@@ -803,8 +909,9 @@ webauthnRouter.post("/delete_authn", async (c) => {
 
 // GET /api/authn/getcredentials (需已登录)
 webauthnRouter.get("/getcredentials", async (c) => {
-  const user = await getUserFromContext(c)
-  if (!user || user.disabled) {
+  // 凭据管理端点必须真实登录：guest 回退会让匿名者给 guest 注册 Passkey（M-1）
+  const user = await requireAuthenticatedUser(c)
+  if (!user || user.disabled || user.id === undefined) {
     return c.json({ code: 401, message: "Unauthorized", data: null }, 401)
   }
   const creds = getUserCredentials(user).map((cred: any) => ({

@@ -14,6 +14,7 @@ import {
 } from "../pkg/body_limit"
 import { canWrite, canRemove, getActualPath } from "../pkg/permission"
 import { canAccess, getNearestMeta } from "../pkg/meta"
+import { safeDecodeComponent } from "../pkg/path"
 
 /**
  * S3 网关（简化版，挂载于 /s3/*）。
@@ -54,7 +55,11 @@ function parseS3Path(c: any): { bucket: string; key: string } {
   const p = pathname.replace(/^\/s3\/?/, "")
   const parts = p.split("/").filter(Boolean)
   const bucket = parts[0] || ""
-  const key = parts.slice(1).map(decodeURIComponent).join("/")
+  // L-12：畸形编码不让整个请求变 500；解不开的段保留原样（后续查不到即 404）
+  const key = parts
+    .slice(1)
+    .map((seg) => safeDecodeComponent(seg) ?? seg)
+    .join("/")
   return { bucket, key }
 }
 

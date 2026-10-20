@@ -28,6 +28,7 @@ import { sqlFormat } from "./format/sql"
 import {
   DB_CIPHER_VALUES,
   DEFAULT_DB_CIPHER,
+  WEAK_DB_CIPHERS,
   resolveDbCipher,
   type DbCipher,
 } from "../../../pkg/crypto"
@@ -110,6 +111,19 @@ export function readFormat(env?: any): StorageFormat {
  * 取值无法识别时告警并回退 none（而不是静默启用某个算法）。注意：读取时
  * 解密算法由密文前缀决定，与本函数取值无关 —— 拼错变量只会影响**新写入**。
  */
+/**
+ * 弱算法自动升级为 AES-256-GCM 时的一次性告警。
+ *
+ * M-13：`DB_CIPHER=des` / `3des` / `v5` / `v6` 会启用 56-bit 单 DES 或已弃用的
+ * 3DES 来**保护本应用自己的数据库**（区别于驱动内复刻厂商协议的 DES/ECB，
+ * 那不算漏洞）。解密是「由密文前缀驱动」的，因此把**写入**算法改成 AES-GCM
+ * 不会让历史密文读不出来——它们会在下一次 saveDb 时自动迁移。
+ *
+ * 确需继续用弱算法（例如对齐某个外部校验环境）时设置
+ * `DB_CIPHER_ALLOW_INSECURE=1`。
+ */
+let weakCipherUpgradedWarned = false
+
 export function readCipher(env?: any): DbCipher {
   const raw = readEnv("DB_CIPHER", DEFAULT_DB_CIPHER, env)
   const { cipher, known } = resolveDbCipher(raw)
@@ -118,6 +132,20 @@ export function readCipher(env?: any): DbCipher {
       `[DB] Unknown DB_CIPHER "${raw}"; falling back to "${DEFAULT_DB_CIPHER}". ` +
         `Valid values: ${DB_CIPHER_VALUES.join(", ")}.`,
     )
+  }
+  if (cipher !== "none" && WEAK_DB_CIPHERS.includes(cipher)) {
+    const allow = readEnv("DB_CIPHER_ALLOW_INSECURE", "", env)
+    if (!(allow === "1" || allow === "true")) {
+      if (!weakCipherUpgradedWarned) {
+        weakCipherUpgradedWarned = true
+        console.warn(
+          `[DB] DB_CIPHER=${cipher} 属于不安全算法（单 DES 56-bit / 3DES 已弃用），` +
+            "已自动改为用 aes-256-gcm 写入；历史密文仍可按前缀正常解密，并在下次" +
+            "保存时迁移为 AES-GCM。确需保留弱算法请设置 DB_CIPHER_ALLOW_INSECURE=1。",
+        )
+      }
+      return "aes-256-gcm"
+    }
   }
   return cipher
 }

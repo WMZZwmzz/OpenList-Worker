@@ -171,7 +171,16 @@ export function setupRouter(app: Hono) {
         } catch {}
         return null
       },
-      allowHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
+      // L-6：WebAuthn 的会话数据走 `Session` 头，写操作可能带 `X-CSRF-Token`。
+      // 缺这两个头会让前后端分离部署（跨源）的 WebAuthn / CSRF 流程在预检阶段
+      // 就被浏览器拦掉。
+      allowHeaders: [
+        "Content-Type",
+        "Authorization",
+        "X-Requested-With",
+        "Session",
+        "X-CSRF-Token",
+      ],
       allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
       exposeHeaders: ["Content-Length", "Content-Type"],
       maxAge: 600,

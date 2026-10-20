@@ -1395,8 +1395,19 @@ export const getDb = async (envCtx?: any) => {
 //       换算法   → 既有密文按旧算法解开，下次写入按新算法落盘；
 //       明文数据 → 不带前缀，原样返回，升级不丢数据。
 // ============================================================
+/**
+ * 需要静态加密的 settings 键。
+ *
+ * H-4（2026-10-20 复审）：`api_token` 曾漏在清单外。它是等价管理员的静态
+ * API 令牌（pkg/utils.ts 的 checkAdminAuth 直接采信），一旦明文落盘，任何能
+ * 读存储后端的人（KV 控制台 / D1·MySQL 运维 / 备份文件）拿到它就能调用全部
+ * `/api/admin/*`，等于完整接管实例——而 `hasSealedValues` 只看清单内字段，
+ * 所以这种状态不会触发任何告警。
+ */
 const SENSITIVE_SETTING_KEYS = new Set([
   "token",
+  "api_token",
+  "download_sign_secret",
   "sso_client_secret",
   "sso_client_id",
   "ldap_bind_password",
@@ -1916,6 +1927,14 @@ function hasSealedValues(data: any): boolean {
       return true
     }
   }
+  // H-4：shares[].pwd / metas[].password 现在也在加密范围内，判定必须同步，
+  // 否则「数据里有密文」会被误判为「全是明文」，加载路径跳过解密。
+  for (const sh of data.shares || []) {
+    if (sh && detectCipherPrefix(sh.pwd)) return true
+  }
+  for (const m of data.metas || []) {
+    if (m && detectCipherPrefix(m.password)) return true
+  }
   return false
 }
 
@@ -1927,11 +1946,38 @@ function hasSealedValues(data: any): boolean {
  *
  * @returns null 表示「未启用加密」或「需要但拿不到密钥」。后者由调用方告警。
  */
+/**
+ * 弱密钥告警（M-12）。
+ *
+ * `aes-256-gcm`（v2）的密钥材料是 1~2 次 SHA-256，没有 salt、没有迭代；而
+ * `readEnvEncryptionKey` 只要求「非空」。运维填一个 8 位口令时，拿到存储快照的
+ * 人可以用 GPU 离线爆破（10^10~10^11 候选/天），破出后即可解密全部网盘
+ * refresh_token、OTP 种子与密码哈希。
+ *
+ * 这里**不改变密钥派生**（改了会让既有密文无法解密，风险远大于收益），而是把
+ * 弱密钥变成一个有名字的错误级告警。彻底修复需要新增「带拉力 + 随机 salt」的
+ * 密文格式（v7）并把 salt 与密钥一起持久化，属于下一批的独立变更。
+ */
+const MIN_STRONG_KEY_LENGTH = 32
+let weakEncryptionKeyWarned = false
+
+function warnWeakEncryptionKey(secret: string): void {
+  if (weakEncryptionKeyWarned || secret.length >= MIN_STRONG_KEY_LENGTH) return
+  weakEncryptionKeyWarned = true
+  console.error(
+    `[DB] 🔴 静态加密密钥仅 ${secret.length} 字符（建议 >= ${MIN_STRONG_KEY_LENGTH}）。` +
+      "当前派生方式无 salt、无迭代，弱口令等同弱密钥：拿到存储快照的人可以离线爆破，" +
+      "破出后即可解密全部网盘凭据 / OTP 种子 / 密码哈希。" +
+      "请改用 `openssl rand -hex 32` 生成的高熵 JWT_SECRET。",
+  )
+}
+
 async function resolveFieldCipher(env: any): Promise<FieldCipher | null> {
   const cipher = readCipher(env)
   if (cipher === "none") return null
   const secret = await getEncryptionKey(env)
   if (!secret) return null
+  warnWeakEncryptionKey(secret)
   return createFieldCipher(cipher, secret)
 }
 
@@ -1954,6 +2000,8 @@ async function sealDb(
   let storagesOut: any[] | undefined
   let settingsOut: any[] | undefined
   let usersOut: any[] | undefined
+  let sharesOut: any[] | undefined
+  let metasOut: any[] | undefined
 
   // 1. 存储配置中的 addition 字段（网盘凭据）
   const srcStorages: any[] = Array.isArray(data.storages) ? data.storages : []
@@ -2018,13 +2066,49 @@ async function sealDb(
     }
   }
 
+  // 4. 分享口令（H-4）：`shares[].pwd` 是分享提取码，明文落盘等于把「分享
+  // 链接 + 提取码」这套唯一的弱保护直接交给存储快照持有者。
+  const srcShares: any[] = Array.isArray(data.shares) ? data.shares : []
+  for (let i = 0; i < srcShares.length; i++) {
+    const sh = srcShares[i]
+    if (!sh || !sh.pwd) continue
+    const sealed = await sealValue(
+      String(sh.pwd),
+      fieldCipher,
+      `shares:${sh.id ?? i}:pwd`,
+    )
+    if (sealed === sh.pwd) continue
+    if (!sharesOut) sharesOut = srcShares.slice()
+    sharesOut![i] = { ...sh, pwd: sealed }
+  }
+
+  // 5. 目录访问口令（H-4）：`metas[].password` 保护的是目录本身，
+  // 明文落盘后任何人都能直接读出受保护目录的口令。
+  const srcMetas: any[] = Array.isArray(data.metas) ? data.metas : []
+  for (let i = 0; i < srcMetas.length; i++) {
+    const m = srcMetas[i]
+    if (!m || !m.password) continue
+    const sealed = await sealValue(
+      String(m.password),
+      fieldCipher,
+      `metas:${m.id ?? i}:password`,
+    )
+    if (sealed === m.password) continue
+    if (!metasOut) metasOut = srcMetas.slice()
+    metasOut![i] = { ...m, password: sealed }
+  }
+
   // 没有任何字段被修改：直接复用原对象（与深拷贝版本落盘结果一致）
-  if (!storagesOut && !settingsOut && !usersOut) return data
+  if (!storagesOut && !settingsOut && !usersOut && !sharesOut && !metasOut) {
+    return data
+  }
 
   const out: any = { ...data }
   if (storagesOut) out.storages = storagesOut
   if (settingsOut) out.settings = settingsOut
   if (usersOut) out.users = usersOut
+  if (sharesOut) out.shares = sharesOut
+  if (metasOut) out.metas = metasOut
   return out
 }
 
@@ -2052,6 +2136,36 @@ async function unsealDb(data: any, cipherChain: FieldCipher[]): Promise<void> {
   // 密钥派生（v2 的 HKDF）由 fieldCipher 内部缓存，本次加载只发生一次。
   const tasks: Array<() => Promise<void>> = []
 
+  // M-16：v1（PBKDF2 10 万轮）密文的解密成本是「字段数 × 候选密钥数」，攻击者只要
+  // 能写存储（伪造几百个 enc:v1: 字段）就能让每次加载 CPU 超限、实例对所有请求
+  // 不可用。这里双保险：单次加载最多尝试 V1_MAX_ATTEMPTS 个；且第一个解不开即判定
+  // 「本部署拿不到 v1 密钥」，后续 v1 字段直接跳过（同一批候选密钥都解不开）。
+  const V1_MAX_ATTEMPTS = 32
+  let v1Attempts = 0
+  let v1GiveUp = false
+  let v1Skipped = 0
+  const scheduleUnseal = (
+    target: any,
+    prop: string,
+    sealedValue: string,
+    identity: string,
+  ) => {
+    const isLegacyV1 =
+      detectCipherPrefix(sealedValue)?.cipher === "aes-256-gcm-pbkdf2"
+    if (isLegacyV1) {
+      if (v1GiveUp || v1Attempts >= V1_MAX_ATTEMPTS) {
+        v1Skipped++
+        return
+      }
+      v1Attempts++
+    }
+    tasks.push(async () => {
+      const plain = await unsealValue(sealedValue, cipherChain, identity)
+      if (isLegacyV1 && plain === sealedValue) v1GiveUp = true
+      target[prop] = plain
+    })
+  }
+
   // 1. 解密存储配置（算法由密文前缀决定，与当前 DB_CIPHER 无关）
   const srcStorages: any[] = Array.isArray(data.storages) ? data.storages : []
   for (let i = 0; i < srcStorages.length; i++) {
@@ -2060,9 +2174,7 @@ async function unsealDb(data: any, cipherChain: FieldCipher[]): Promise<void> {
       const target = s
       const sealedValue = target.addition
       const identity = `storages:${s.id ?? i}:addition`
-      tasks.push(async () => {
-        target.addition = await unsealValue(sealedValue, cipherChain, identity)
-      })
+      scheduleUnseal(target, "addition", sealedValue, identity)
     }
   }
 
@@ -2079,9 +2191,7 @@ async function unsealDb(data: any, cipherChain: FieldCipher[]): Promise<void> {
       const target = st
       const sealedValue = target.value
       const identity = `settings:${st.key}:value`
-      tasks.push(async () => {
-        target.value = await unsealValue(sealedValue, cipherChain, identity)
-      })
+      scheduleUnseal(target, "value", sealedValue, identity)
     }
   }
 
@@ -2095,28 +2205,51 @@ async function unsealDb(data: any, cipherChain: FieldCipher[]): Promise<void> {
       const target = u
       const sealedValue = target.otp_secret
       const identity = `users:${u.id ?? i}:otp_secret`
-      tasks.push(async () => {
-        target.otp_secret = await unsealValue(
-          sealedValue,
-          cipherChain,
-          identity,
-        )
-      })
+      scheduleUnseal(target, "otp_secret", sealedValue, identity)
     }
     // 密码解密
     if (typeof u.password === "string" && isSealedCiphertext(u.password)) {
       const target = u
       const sealedValue = target.password
       const identity = `users:${u.id ?? i}:password`
-      tasks.push(async () => {
-        target.password = await unsealValue(sealedValue, cipherChain, identity)
-      })
+      scheduleUnseal(target, "password", sealedValue, identity)
+    }
+  }
+
+  // 4. 分享口令
+  const srcShares: any[] = Array.isArray(data.shares) ? data.shares : []
+  for (let i = 0; i < srcShares.length; i++) {
+    const sh = srcShares[i]
+    if (sh && typeof sh.pwd === "string" && isSealedCiphertext(sh.pwd)) {
+      const target = sh
+      const sealedValue = target.pwd
+      const identity = `shares:${sh.id ?? i}:pwd`
+      scheduleUnseal(target, "pwd", sealedValue, identity)
+    }
+  }
+
+  // 5. 目录访问口令
+  const srcMetas: any[] = Array.isArray(data.metas) ? data.metas : []
+  for (let i = 0; i < srcMetas.length; i++) {
+    const m = srcMetas[i]
+    if (m && typeof m.password === "string" && isSealedCiphertext(m.password)) {
+      const target = m
+      const sealedValue = target.password
+      const identity = `metas:${m.id ?? i}:password`
+      scheduleUnseal(target, "password", sealedValue, identity)
     }
   }
 
   for (let i = 0; i < tasks.length; i += UNSEAL_CONCURRENCY) {
     await Promise.all(
       tasks.slice(i, i + UNSEAL_CONCURRENCY).map((run) => run()),
+    )
+  }
+
+  if (v1Skipped > 0) {
+    console.warn(
+      `[DB] 跳过 ${v1Skipped} 个 legacy enc:v1 字段的解密（超过尝试上限或密钥不匹配）；` +
+        "这些字段会保持密文状态，直到 JWT_SECRET / ENCRYPTION_SECRET 与封存时一致。",
     )
   }
 }

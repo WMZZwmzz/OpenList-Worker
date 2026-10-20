@@ -14,6 +14,7 @@ import {
 import { safeErrorMessage } from "../pkg/errs"
 import { secureLog, secureWarn, secureError } from "../pkg/secure-log"
 import { encodeDownloadPath } from "../pkg/path"
+import { assertLocalPathInsideRoot } from "../pkg/local-fs-guard"
 import { assertSafeUrl, getTrustedHosts } from "../pkg/http"
 import {
   resolveProxyDecision,
@@ -717,6 +718,9 @@ rawRouter.get("/*", async (c) => {
       return c.text("Local file streaming not supported in Edge Runtime", 500)
     }
 
+    // 软链越界校验（M-9）：本地直读不经过 storage 驱动，必须在这里单独把一次关，
+    // 否则存储根内一条指向外部的软链就能通过 /d 读到根外文件。
+    await assertLocalPathInsideRoot(resolved.physical, resolved.rootFolder)
     const stat = await fsPromises.stat(resolved.physical)
     if (stat.isDirectory()) {
       return c.text("Cannot download directory", 400)

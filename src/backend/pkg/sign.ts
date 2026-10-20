@@ -172,10 +172,26 @@ async function isReadUsersRestricted(
   c: any,
   reqPath: string,
 ): Promise<boolean> {
-  const meta = await getNearestMeta(c, reqPath)
-  if (!meta || !Array.isArray(meta.read_users) || meta.read_users.length === 0)
+  let metas: any[] = []
+  try {
+    const db = await getDb(c?.env)
+    metas = db.metas || []
+  } catch {
     return false
-  return metaCoversPath(meta.path, reqPath, !!meta.r_sub)
+  }
+  // 必须遍历**所有**覆盖该路径的 meta，而不是只看最近的一条：
+  //   - 最近 meta 可能只是子目录的 readme/hide 配置（无 read_users），
+  //     若只看它，祖先目录的 read_users 白名单就被整体忽略；
+  //   - 子目录开关字段是 `read_users_sub`（meta.ts:115/:140 的 canAccess/
+  //     canRead 用的就是它）。这里曾误写成 `r_sub`——那是 readme 的子目录
+  //     开关，默认 false，于是「只配 read_users、不开密码」的目录在 /d 上
+  //     对任意子路径都判定为「无需签名」，比 meta.path 深一层即可匿名下载。
+  for (const meta of metas) {
+    if (!meta || !Array.isArray(meta.read_users) || meta.read_users.length === 0)
+      continue
+    if (metaCoversPath(meta.path, reqPath, !!meta.read_users_sub)) return true
+  }
+  return false
 }
 
 export async function needDownloadSign(
@@ -213,8 +229,28 @@ export async function getSignExpiresIn(c: any): Promise<number> {
  * 下载签名专用子密钥：由 JWT 签名密钥派生，但不直接复用同一字符串。
  * 一把密钥同时用于「会话 JWT」和「下载链接签名」时，任何一侧的签名 oracle
  * 都可能被拿去伪造另一侧的凭证。
+ *
+ * M-4：优先使用 `settings.download_sign_secret`（管理端
+ * `POST /api/admin/setting/reset_token` 写入的轮换密钥）。这样「重置链接密钥」
+ * 才真的能让既有直链立即失效；此前该端点写的是 `settings.token`——那是 115 /
+ * PikPak / Thunder 驱动的凭据槽位，签名层根本不读，结果旧直链一条都没失效，
+ * 反而把驱动配置改坏。
  */
 async function getDownloadSignKey(c: any): Promise<string> {
+  try {
+    const db = await getDb(c?.env)
+    const row = (db.settings || []).find(
+      (s: any) => s.key === "download_sign_secret",
+    )
+    const secret = row?.value ? String(row.value).trim() : ""
+    if (secret) {
+      // 再套一层 HMAC：数据库里的值即使被读走，也不能直接当 HMAC 原钥使用
+      const jwtSecret = await getJwtSecret(c)
+      return await hmacSha256(`openlist-download-sign-v2:${secret}`, jwtSecret)
+    }
+  } catch {
+    // 读不到配置时回退到纯 JWT 派生，保持既有的签名可用性
+  }
   const jwtSecret = await getJwtSecret(c)
   return hmacSha256("openlist-download-sign-v1", jwtSecret)
 }
