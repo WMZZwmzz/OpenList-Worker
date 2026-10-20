@@ -96,3 +96,9 @@ docs/code-review-*.md
 wrangler.d1.jsonc
 .wrangler-dryrun/
 .tmp-dryrun/
+
+# Local tooling artifacts（本地工具产物：不参与构建，也不该进仓库）
+# .workbuddy/ 是项目记忆与会话产物，删掉会丢上下文，只忽略不删除
+.workbuddy/
+.qoder-credits/
+.zcodeignore
