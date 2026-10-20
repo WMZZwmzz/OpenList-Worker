@@ -1,6 +1,7 @@
 import { getDb } from "../internal/model/db"
 import type { UserPermissionObj } from "./permission"
 import { isAdmin } from "./permission"
+import { canonicalVirtualPath } from "./path"
 
 /**
  * Meta 消费层（对齐 Go server/common/check.go）。
@@ -77,11 +78,18 @@ export function metaCoversPath(
   return false
 }
 
+/**
+ * 路径规范化（L-7）。
+ *
+ * 历史上这里只合并斜杠、不折叠 `..`，而 `pkg/sign.ts` 与 `resolvePath` 用的是
+ * 「多重解码 + 段折叠」的 canonicalVirtualPath。两套实现并存时，meta 覆盖判定
+ * （字符串比较）与真正定位存储的路径会分叉：`/public/../secret/x` 可能被判成
+ * 「不在 meta 保护范围内」，实际却读到 `/secret/x`。
+ *
+ * 现在统一到 canonicalVirtualPath，与签名判定、存储解析同源。
+ */
 function fixAndCleanPath(p: string): string {
-  const normalized = (p || "/").replace(/\\/g, "/").replace(/\/+/g, "/").trim()
-  if (normalized === "" || normalized === "/") return "/"
-  const cleaned = "/" + normalized.split("/").filter(Boolean).join("/")
-  return cleaned
+  return canonicalVirtualPath(p)
 }
 
 /**
@@ -242,7 +250,7 @@ function hasRiskyQuantifiedAlternation(pattern: string): boolean {
   return false
 }
 
-function isSafeHidePattern(pattern: string): boolean {
+export function isSafeHidePattern(pattern: string): boolean {
   if (pattern.length > HIDE_PATTERN_MAX_LEN) return false
   if (NESTED_QUANTIFIER.test(pattern)) return false
   if (BACKREFERENCE.test(pattern)) return false

@@ -5,6 +5,7 @@ import { getDb, readPersistedSecret, ENCRYPTION_SECRET_KV_KEY } from "../interna
 import { findUserByTokenPayload, jwtClaimsAcceptable } from "../pkg/permission"
 import { clientIpFromContext } from "../pkg/client-ip"
 import { isPasswordStampValid } from "../pkg/password"
+import { isOtpPendingPayload } from "../pkg/otp-pending"
 
 // 不再硬编码 JWT 密钥。优先使用环境变量 JWT_SECRET（推荐在生产配置），
 // 否则从持久化后端读取一个随机密钥（首次生成后复用，重启不失效），
@@ -235,6 +236,7 @@ const revokedJtis = new Set<string>()
 let revokedLoadedAt = 0
 let revokedInflight: Promise<void> | null = null
 
+/** 按 TTL 回读整表黑名单，让其他实例的注销在有限时间内收敛。 */
 async function ensureRevokedLoaded(env: any): Promise<void> {
   if (Date.now() - revokedLoadedAt < REVOKED_RELOAD_MS) return
   if (revokedInflight) return revokedInflight
@@ -569,6 +571,29 @@ export async function getUserFromContext(
   return user
 }
 
+/** 请求是否携带了登录凭据（Authorization 头或 query 令牌）。 */
+export function requestHasCredential(c: Context): boolean {
+  if (c.req.header("Authorization")) return true
+  return !!(c.req.query("token") || c.req.query("access_token"))
+}
+
+/**
+ * 解析「真实登录」的请求身份：**不做 guest 回退**。
+ *
+ * 为什么需要（M-1）：`allow_guest` 默认 true，任何没有 Authorization 的请求都会
+ * 拿到一个真实存在的 guest 用户对象（带 id / role / permission）。读路径这样
+ * 处理是合理的（游客视图），但写/管理类端点若照用，就等于：
+ *   - 匿名可以给 guest 注册、删除、枚举 Passkey；
+ *   - 匿名可以调用 seed 的写/计算端点，消耗服务端 CPU 与网盘流量；
+ *   - 一旦管理员把 guest 的 role 改成 2，匿名请求直接成为管理员。
+ */
+export async function requireAuthenticatedUser(
+  c: Context,
+): Promise<AuthedUser | null> {
+  if (!requestHasCredential(c)) return null
+  return await getUserFromContext(c)
+}
+
 async function resolveUserFromContext(c: Context): Promise<AuthedUser | null> {
   // 仅静态 API token（api_token / API_TOKEN）命中才视为匿名管理员；
   // JWT 管理员走下方正常解析，避免用户名被硬编码成 "api-token"。
@@ -632,6 +657,8 @@ async function resolveUserFromContext(c: Context): Promise<AuthedUser | null> {
     const secret = await getJwtSecret(c)
     const payload: any = await verify(token, secret, "HS256")
     if (!jwtClaimsAcceptable(payload)) return null
+    // 2FA 未完成的待兑换令牌只能拿去 /api/auth/otp/login 兑换，不得作为会话凭证
+    if (isOtpPendingPayload(payload)) return null
     if (await isTokenRevoked(payload?.jti, c.env)) return null
     const db = await getDb(c.env)
     const user = findUserByTokenPayload(db.users, payload)

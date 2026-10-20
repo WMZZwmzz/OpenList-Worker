@@ -1,5 +1,9 @@
 import { Hono } from "hono"
-import { AUTHED_USER_KEY, getUserFromContext } from "./middlewares"
+import {
+  AUTHED_USER_KEY,
+  getUserFromContext,
+  requestHasCredential,
+} from "./middlewares"
 import {
   canWrite,
   getActualPath,
@@ -45,6 +49,24 @@ import {
 
 export const seedRouter = new Hono()
 
+/**
+ * seed 的写 / 计算类端点不接受匿名 guest（M-1）。
+ *
+ * guest 回退让「没有 Authorization 的请求」也能拿到真实 guest 用户对象，
+ * 于是匿名者可以触发离线转存、哈希计算、种子解析等重活，消耗实例 CPU 与
+ * 网盘流量；一旦管理员把 guest 的 role 调成 2，匿名请求更是直接成为管理员。
+ * 读类端点（GET）仍保留 guest 语义。
+ */
+seedRouter.use("*", async (c, next) => {
+  if (["GET", "HEAD", "OPTIONS"].includes(c.req.method.toUpperCase())) {
+    return next()
+  }
+  if (!requestHasCredential(c)) {
+    return errorResponse(c, 401, "Unauthorized")
+  }
+  return next()
+})
+
 const DEFAULT_MAX_SEED_BYTES = 10 * 1024 * 1024
 const DEFAULT_MAX_HASH_BYTES = 512 * 1024 * 1024
 const DEFAULT_MAX_FILES = 1_000
@@ -85,7 +107,9 @@ function storageContext(c: any, user?: any) {
 async function assertSeedReadable(c: any, user: any, path: string) {
   const meta = await getNearestMeta(path, c.env).catch(() => null)
   if (!canAccess(user, meta, path, "")) {
-    throw new Error(`permission denied: cannot read ${path}`)
+    // L-13：错误文案不回显虚拟路径 —— 否则攻击者可拿候选路径批量试错，
+    // 从「路径不存在」与「无权读取」的差异里枚举目录结构。
+    throw new Error("permission denied: cannot read the requested path")
   }
   return meta
 }
@@ -94,7 +118,8 @@ async function assertSeedReadable(c: any, user: any, path: string) {
 async function assertSeedWritable(c: any, user: any, path: string) {
   const meta = await getNearestMeta(path, c.env).catch(() => null)
   if (!canWriteMeta(user, meta, path)) {
-    throw new Error(`permission denied: not in write_users for ${path}`)
+    // L-13：同上，不回显路径
+    throw new Error("permission denied: not in write_users for the requested path")
   }
 }
 

@@ -20,6 +20,20 @@ import app, { setSpaFallbackHtml } from "./src/backend/index"
 import INDEX_HTML from "./dist/index.html"
 // 构建期内联 dist/index.html 作为 SPA 兜底壳
 setSpaFallbackHtml(INDEX_HTML)
+
+// ---- 日志开关（L-19）----
+// ESA_LOG_ENV=1：只在首个请求打印一次 env 变量名清单（排障用）
+// ESA_LOG_REQUESTS=1：逐请求打印方法 + 路径（默认关闭，避免日志洪水）
+let esaEnvLogged = false
+let esaVerboseLog = false
+function esaEnvLogEnabled(env: any): boolean {
+  const raw = env?.ESA_LOG_ENV ?? (globalThis as any)?.process?.env?.ESA_LOG_ENV
+  return raw === "1" || raw === "true"
+}
+function readEsaLogFlag(env: any, key: string): boolean {
+  const raw = env?.[key] ?? (globalThis as any)?.process?.env?.[key]
+  return raw === "1" || raw === "true"
+}
 // 模块级：探测 EdgeKV 全局构造器（ESA 运行时可能挂在不同的全局对象上）
 function detectEdgeKVCtor(): any {
   const candidates: any[] = []
@@ -166,15 +180,24 @@ export default {
     const url = new URL(request.url)
     const isApiRequest = url.pathname.startsWith("/api")
     const reqId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
+    esaVerboseLog = readEsaLogFlag(env, "ESA_LOG_REQUESTS")
     // 【关键】每次请求创建独立的 KV 缓存 Map，隔离不同请求，避免数据污染
     const kvCache = new Map<string, string | null>()
 
     if (isApiRequest) {
-      const envKeys = env ? Object.keys(env) : []
-      console.log(
-        `[ESA/req:${reqId}] ${request.method} ${url.pathname}, ` +
-          `env keys=[${envKeys.join(",")}], context type=${typeof context}`,
-      )
+      // L-19：原来每个 /api 请求都打印一次 env 变量名清单（含绑定名、内部
+      // 变量名），既是日志噪音，也等于把部署结构写进访问日志。改为仅在显式
+      // 打开诊断开关时（ESA_LOG_ENV=1）打印一次。
+      if (!esaEnvLogged && esaEnvLogEnabled(env)) {
+        esaEnvLogged = true
+        const envKeys = env ? Object.keys(env) : []
+        console.log(
+          `[ESA] env keys=[${envKeys.join(",")}], context type=${typeof context}`,
+        )
+      }
+      if (esaVerboseLog) {
+        console.log(`[ESA/req:${reqId}] ${request.method} ${url.pathname}`)
+      }
     }
     const edgeKvCtor = getEdgeKVCtorAtRequestTime()
     if (env && typeof env !== "undefined") {

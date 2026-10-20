@@ -50,6 +50,11 @@ function envFor(cipher?: string): any {
     JWT_SECRET: SECRET,
   }
   if (cipher !== undefined) env.DB_CIPHER = cipher
+  // M-13 之后弱算法（DES/3DES）默认会被升级为 aes-256-gcm。这里仍要覆盖
+  // 「历史弱算法密文能被解开」这条路径，故显式打开逃生口。
+  if (cipher && ["des-cbc-hmac", "3des-cbc-hmac"].includes(cipher)) {
+    env.DB_CIPHER_ALLOW_INSECURE = "1"
+  }
   return env
 }
 
@@ -108,11 +113,17 @@ test("readCipher：默认 none，别名可用，非法值回退 none", () => {
   assert.equal(readCipher({ DB_CIPHER: "chacha20" }), "chacha20-poly1305")
   assert.equal(readCipher({ DB_CIPHER: "ChaCha20-Poly1305" }), "chacha20-poly1305")
   assert.equal(readCipher({ DB_CIPHER: "v4" }), "chacha20-poly1305")
-  assert.equal(readCipher({ DB_CIPHER: "des" }), "des-cbc-hmac")
-  assert.equal(readCipher({ DB_CIPHER: "v5" }), "des-cbc-hmac")
-  assert.equal(readCipher({ DB_CIPHER: "3des" }), "3des-cbc-hmac")
-  assert.equal(readCipher({ DB_CIPHER: "tripledes" }), "3des-cbc-hmac")
-  assert.equal(readCipher({ DB_CIPHER: "v6" }), "3des-cbc-hmac")
+  // M-13：弱算法别名默认被升级为 aes-256-gcm（写入侧），历史密文仍可解密
+  assert.equal(readCipher({ DB_CIPHER: "des" }), "aes-256-gcm")
+  assert.equal(readCipher({ DB_CIPHER: "v5" }), "aes-256-gcm")
+  assert.equal(readCipher({ DB_CIPHER: "3des" }), "aes-256-gcm")
+  assert.equal(readCipher({ DB_CIPHER: "tripledes" }), "aes-256-gcm")
+  assert.equal(readCipher({ DB_CIPHER: "v6" }), "aes-256-gcm")
+  // 显式允许时才保留弱算法（仅用于兼容既有部署）
+  const insecure = { DB_CIPHER_ALLOW_INSECURE: "1" }
+  assert.equal(readCipher({ ...insecure, DB_CIPHER: "des" }), "des-cbc-hmac")
+  assert.equal(readCipher({ ...insecure, DB_CIPHER: "3des" }), "3des-cbc-hmac")
+  assert.equal(readCipher({ ...insecure, DB_CIPHER: "v6" }), "3des-cbc-hmac")
 
   // 拼错不得静默启用某个算法
   assert.equal(readCipher({ DB_CIPHER: "rot13" }), "none")
@@ -120,7 +131,11 @@ test("readCipher：默认 none，别名可用，非法值回退 none", () => {
   assert.equal(resolveDbCipher("aes-256-gcm").known, true)
 
   for (const cipher of DB_CIPHER_VALUES) {
-    assert.equal(readCipher({ DB_CIPHER: cipher }), cipher)
+    const expected =
+      cipher === "des-cbc-hmac" || cipher === "3des-cbc-hmac"
+        ? "aes-256-gcm"
+        : cipher
+    assert.equal(readCipher({ DB_CIPHER: cipher }), expected)
   }
 })
 

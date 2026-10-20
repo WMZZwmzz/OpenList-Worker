@@ -488,13 +488,38 @@ publicRouter.get("/settings", async (c) => {
 
   // Second line of defense: even if a credential-shaped key is ever added to
   // the allowlist above by mistake, still refuse to echo it.
+  //
+  // M-8：`ocr_api` 是这次补的关键——它的键名既不含 `api_key` 也不含 `secret`，
+  // 旧正则放行，而 OCR 端点常把密钥放在 query 里，匿名读到这里就等于拿到它。
+  // 下面这份「管理员专用」清单是对正则的结构性补充：这些键即使出现在默认值
+  // 对象里（因而进了 allowlist），也一律不回显。
   const SENSITIVE_KEY =
-    /(secret|password|passwd|pwd|cookie|token|credential|private[_-]?key|api[_-]?key|access[_-]?key|jwt|salt|signature|webhook)/i
+    /(secret|password|passwd|pwd|cookie|token|credential|private[_-]?key|api[_-]?key|access[_-]?key|jwt|salt|signature|webhook|ocr)/i
+
+  const ADMIN_ONLY_SETTING_KEYS = new Set([
+    "ocr_api",
+    // 隐私/审核正则：泄露的是防护规则本身，等于告诉爬虫怎么绕过
+    "privacy_regs",
+    // iframe/外链预览模板：可含内网探测 URL，且属于站点配置而非展示内容
+    "iframe_previews",
+    "external_previews",
+    // 文件名隐藏规则：泄露等于公开「被隐藏了什么」
+    "hide_files",
+    "handle_hook_after_writing",
+    "token",
+    "api_token",
+    "download_sign_secret",
+    "sso_client_id",
+    "sso_client_secret",
+    "ldap_bind_dn",
+    "ldap_bind_password",
+  ])
 
   // Override with user-configured settings from database
   db.settings.forEach((s: any) => {
     if (s.key && s.value !== undefined) {
       if (!PUBLIC_SETTING_KEYS.has(s.key)) return
+      if (ADMIN_ONLY_SETTING_KEYS.has(s.key)) return
       if (SENSITIVE_KEY.test(s.key)) return
       settingsObj[s.key] = s.value
       // Handle legacy key alias
@@ -503,6 +528,10 @@ publicRouter.get("/settings", async (c) => {
       }
     }
   })
+
+  // 默认值对象里也带着这些键（例如 `ocr_api: ""`），必须从载荷里删掉：
+  // 否则键名本身仍在公开响应里，且一旦哪天默认值被改成非空就是直接泄露。
+  for (const key of ADMIN_ONLY_SETTING_KEYS) delete settingsObj[key]
 
   // 动态检查是否存在且启用了 guest 账号
   const guest = (db.users || []).find((u: any) => u.username === "guest")

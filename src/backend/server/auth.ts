@@ -3,6 +3,7 @@ import { sign, verify } from "hono/jwt"
 import { getDb, saveDb } from "../internal/model/db"
 import {
   findUserByTokenPayload,
+  bumpTokenEpoch,
   JWT_ISSUER,
   JWT_AUDIENCE,
   jwtClaimsAcceptable,
@@ -40,6 +41,11 @@ import {
 } from "../pkg/password"
 import { setCSRFToken, clearCSRFToken } from "../pkg/csrf"
 import { getAuditLogger } from "../pkg/audit"
+import {
+  OTP_PENDING_TYPE,
+  OTP_PENDING_TTL_SEC,
+  isOtpPendingPayload,
+} from "../pkg/otp-pending"
 
 export const authRouter = new Hono()
 export const meRouter = new Hono()
@@ -53,6 +59,14 @@ const LOGIN_MAX_FAILURES = 5
 const LOGIN_MAX_FAILURES_GLOBAL = 20
 const LOGIN_LOCK_MS = 15 * 60 * 1000
 const LOGIN_MAX_LOCK_MS = 24 * 60 * 60 * 1000 // 最长锁定 24 小时
+/**
+ * 用户名维度（与 IP 无关）锁定的**固定**时长。
+ *
+ * 这一维是全实例共享的：衰减窗口由攻击者的请求量决定，因此绝不能像 IP 维那样
+ * 指数增长——否则任何人只要持续失败就能把某个账号（例如 admin）锁到 24 小时，
+ * 被锁者自己也无法自解（解锁只发生在登录成功时）。
+ */
+const LOGIN_GLOBAL_LOCK_MS = 15 * 60 * 1000
 const loginFailures = new Map<
   string,
   { count: number; lockedUntil: number; attempts: number }
@@ -66,8 +80,50 @@ function clientIpOf(c: Context): string {
   return clientIpFromContext(c)
 }
 
-function loginKey(c: Context, username: string): string {
-  return `${clientIpOf(c)}|${String(username || "").toLowerCase()}`
+/** 拿不到可信来源 IP 时返回 null（不再用字面量 "unknown" 当键）。 */
+function loginIpOf(c: Context): string | null {
+  const ip = clientIpOf(c)
+  if (!ip || ip === "unknown") return null
+  return ip
+}
+
+let warnedNoClientIp = false
+
+/**
+ * 是否启用「IP + 用户名」维度的锁定。
+ *
+ * 不具备可信来源 IP 的部署（EdgeOne / Vercel / 自托管且未设
+ * TRUST_PROXY_HEADERS=1）里，所有请求都会落到同一个键上：攻击者匿名连打 5 次
+ * 就能让真实管理员得到 429，且锁定时长指数增长到 24h，每轮到期重复即可长期
+ * 锁死管理员。因此这一维在这种部署下必须退化为「只有用户名维度」
+ * （阈值 20、固定 15 分钟），并通过 LOGIN_LOCK_BY_IP=0 支持显式关闭。
+ */
+function loginLockByIpEnabled(c: Context): boolean {
+  const env = (c as any)?.env || {}
+  const raw =
+    env.LOGIN_LOCK_BY_IP ??
+    (typeof process !== "undefined" ? process.env?.LOGIN_LOCK_BY_IP : "")
+  if (raw === "0" || raw === "false") return false
+  const ip = loginIpOf(c)
+  if (!ip) {
+    if (!warnedNoClientIp) {
+      warnedNoClientIp = true
+      console.warn(
+        "[Auth] 无法获取可信客户端 IP（非 Cloudflare 且 TRUST_PROXY_HEADERS!=1）：" +
+          "登录锁定按 IP 维度已自动关闭，仅保留用户名维度（20 次失败 / 固定 15 分钟）。" +
+          "如需按 IP 限流，请按部署拓扑设置 TRUST_PROXY_HEADERS=1；" +
+          "如需显式关闭 IP 维度，设置 LOGIN_LOCK_BY_IP=0。",
+      )
+    }
+    return false
+  }
+  return true
+}
+
+/** IP 维度的锁定键；IP 不可信或 IP 维度已关闭时返回 null。 */
+function loginKey(c: Context, username: string): string | null {
+  if (!loginLockByIpEnabled(c)) return null
+  return `${loginIpOf(c)}|${String(username || "").toLowerCase()}`
 }
 
 // 与 IP 无关的用户名维度计数，用于抵御「伪造 IP 绕过锁定」的分布式爆破。
@@ -92,6 +148,7 @@ async function bumpLoginFailure(
   key: string,
   maxFailures: number,
   env: any,
+  maxLockMs: number = LOGIN_MAX_LOCK_MS,
 ): Promise<void> {
   const now = Date.now()
   let rec = loginFailures.get(key) || { count: 0, lockedUntil: 0, attempts: 0 }
@@ -129,7 +186,7 @@ async function bumpLoginFailure(
   rec.attempts += 1
 
   if (rec.count >= maxFailures) {
-    const lockDuration = calculateLockDuration(rec.attempts)
+    const lockDuration = Math.min(calculateLockDuration(rec.attempts), maxLockMs)
     rec.lockedUntil = now + lockDuration
     rec.count = 0
     console.warn(
@@ -173,9 +230,11 @@ export async function isLoginLocked(
   const now = Date.now()
   const ipKey = loginKey(c, username)
   const globalKey = globalLoginKey(username)
+  // IP 不可信（或 IP 维度被关闭）时只查用户名维度，绝不把所有人共用同一个键
+  const keys = ipKey ? [ipKey, globalKey] : [globalKey]
 
   // 检查内存缓存
-  let rec = loginFailures.get(ipKey)
+  let rec = ipKey ? loginFailures.get(ipKey) : undefined
   let grec = loginFailures.get(globalKey)
 
   // 尝试从 KV 读取（多实例共享）
@@ -183,7 +242,7 @@ export async function isLoginLocked(
     const { getKvBinding } = await import("../internal/model/db")
     const kvInfo = await getKvBinding(env)
     if (kvInfo.mode !== "none" && kvInfo.binding) {
-      for (const key of [ipKey, globalKey]) {
+      for (const key of keys) {
         const kvKey = `login_fail:${key}`
         let val: any = null
         try {
@@ -221,11 +280,17 @@ export async function recordLoginFailure(
   username: string,
   env: any,
 ): Promise<void> {
-  await bumpLoginFailure(loginKey(c, username), LOGIN_MAX_FAILURES, env)
+  const ipKey = loginKey(c, username)
+  if (ipKey) {
+    await bumpLoginFailure(ipKey, LOGIN_MAX_FAILURES, env, LOGIN_MAX_LOCK_MS)
+  }
+  // 用户名维度始终生效：这是「攻击者换 IP」时唯一的兜底，但锁定时长固定，
+  // 避免被用来长期锁死某个账号（见 LOGIN_GLOBAL_LOCK_MS 注释）。
   await bumpLoginFailure(
     globalLoginKey(username),
     LOGIN_MAX_FAILURES_GLOBAL,
     env,
+    LOGIN_GLOBAL_LOCK_MS,
   )
 }
 
@@ -236,16 +301,16 @@ export async function clearLoginFailures(
 ): Promise<void> {
   const ipKey = loginKey(c, username)
   const globalKey = globalLoginKey(username)
+  const keys = ipKey ? [ipKey, globalKey] : [globalKey]
 
-  loginFailures.delete(ipKey)
-  loginFailures.delete(globalKey)
+  for (const key of keys) loginFailures.delete(key)
 
   // 从 KV 中删除
   try {
     const { getKvBinding } = await import("../internal/model/db")
     const kvInfo = await getKvBinding(env)
     if (kvInfo.mode !== "none" && kvInfo.binding) {
-      for (const key of [ipKey, globalKey]) {
+      for (const key of keys) {
         const kvKey = `login_fail:${key}`
         if (typeof kvInfo.binding.delete === "function") {
           await kvInfo.binding.delete(kvKey)
@@ -436,6 +501,8 @@ export async function authUserFromReq(
     const secret = await getJwtSecret(c)
     const payload = await verify(token, secret, "HS256")
     if (!jwtClaimsAcceptable(payload)) return null
+    // 2FA 未完成的待兑换令牌绝不能当会话凭证用（H-2）
+    if (isOtpPendingPayload(payload)) return null
     if (await isTokenRevoked(payload?.jti as string, c.env)) return null
     const db = await getDb(c.env)
     if (!db.users) db.users = []
@@ -577,6 +644,135 @@ async function checkUserOtp(matchedUser: any, body: any, c: any, db: any) {
   return { ok: true, code: 200, httpStatus: 200 as const, message: "ok" }
 }
 
+/**
+ * 2FA「待兑换」令牌。
+ *
+ * 背景（H-2）：TOTP 原先只挂在 `/login` 与 `/login/hash` 上。SSO 与 WebAuthn
+ * 两条通道直接签发 7 天完整 JWT，于是「管理员开了 2FA」对这两条路径完全没有
+ * 约束——一枚已注册的 Passkey、或 IdP 侧的一个会话，就能绕过 6 位验证码。
+ *
+ * 现在这两条通道在发现账号 `otp_secret` 非空时**只签发本类型的短时令牌**
+ * （5 分钟、只能用于兑换，不能访问任何业务接口），必须带 TOTP / 恢复码到
+ * `POST /api/auth/otp/login` 兑换完整 token。
+ *
+ * 类型常量与判定放在 pkg/otp-pending（middlewares 也要用，避免循环依赖）。
+ */
+export { OTP_PENDING_TYPE, isOtpPendingPayload } from "../pkg/otp-pending"
+
+export async function issueOtpPendingToken(
+  user: any,
+  c: Context,
+): Promise<string> {
+  const payload = {
+    type: OTP_PENDING_TYPE,
+    id: user.id,
+    username: user.username,
+    iss: JWT_ISSUER,
+    aud: JWT_AUDIENCE,
+    exp: Math.floor(Date.now() / 1000) + OTP_PENDING_TTL_SEC,
+    jti: generateJti(),
+  }
+  const secret = await getJwtSecret(c)
+  return await sign(payload, secret)
+}
+
+/**
+ * 把待兑换令牌升级为完整会话令牌。
+ *
+ * 请求：`Authorization: Bearer <pending>`，body `{ otp_code }`（或 `{ code }`，
+ * 与 /login 的字段一致；恢复码走同一字段）。
+ */
+authRouter.post("/otp/login", async (c) => {
+  const body = await c.req.json().catch(() => ({}))
+  const authHeader = c.req.header("Authorization") || ""
+  const pending = authHeader.startsWith("Bearer ")
+    ? authHeader.substring(7)
+    : authHeader
+  if (!pending) {
+    return c.json(
+      { code: 401, message: "otp pending token required", data: null },
+      401,
+    )
+  }
+
+  let payload: any
+  try {
+    payload = await verify(pending, await getJwtSecret(c), "HS256")
+  } catch {
+    return c.json(
+      { code: 401, message: "invalid or expired otp pending token", data: null },
+      401,
+    )
+  }
+  if (!jwtClaimsAcceptable(payload) || !isOtpPendingPayload(payload)) {
+    return c.json(
+      { code: 401, message: "not an otp pending token", data: null },
+      401,
+    )
+  }
+  if (await isTokenRevoked(payload?.jti, c.env)) {
+    return c.json(
+      { code: 401, message: "otp pending token already used", data: null },
+      401,
+    )
+  }
+
+  const db = await getDb(c.env)
+  const user = (db.users || []).find((u: any) => u.id === payload.id)
+  if (!user || user.disabled) {
+    return c.json({ code: 401, message: "Unauthorized", data: null }, 401)
+  }
+  // 未开启 2FA 的账号不应当走这条路：pending 令牌只由 SSO/WebAuthn 在检测到
+  // otp_secret 时签发，出现这种情况说明令牌来源异常。
+  if (!user.otp_secret) {
+    return c.json(
+      { code: 400, message: "2FA is not enabled for this account", data: null },
+      400,
+    )
+  }
+
+  const otpCheck = await checkUserOtp(user, body, c, db)
+  if (!otpCheck.ok) {
+    // 与口令登录同一套锁定计数：否则 6 位码可以被无限试碰。
+    await getAuditLogger().logLoginFailure(c, user.username, "Invalid OTP code")
+    await recordLoginFailure(c, user.username, c.env)
+    return c.json(
+      { code: otpCheck.code, message: otpCheck.message, data: null },
+      otpCheck.httpStatus,
+    )
+  }
+  await clearLoginFailures(c, user.username, c.env)
+
+  // pending 令牌一次性使用：兑换成功即撤销，避免同一枚被反复尝试兑换
+  await revokeToken(
+    String(payload.jti || ""),
+    Number(payload.exp || 0),
+    c.env,
+  )
+
+  const fullPayload = {
+    id: user.id,
+    username: user.username,
+    role: user.role,
+    iss: JWT_ISSUER,
+    aud: JWT_AUDIENCE,
+    exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 7,
+    jti: generateJti(),
+    // M-3：token 版本号，改密/关 2FA 后旧 token 立即失效
+    epoch: Number(user.token_epoch ?? 0) || 0,
+  }
+  const secret = await getJwtSecret(c)
+  const token = await sign(fullPayload, secret)
+  const csrfToken = setCSRFToken(c)
+  await getAuditLogger().logLoginSuccess(c, user.username)
+
+  return c.json({
+    code: 200,
+    message: "success",
+    data: { token, csrf_token: csrfToken },
+  })
+})
+
 // POST /api/auth/login
 authRouter.post("/login", async (c) => {
   const body = await c.req.json().catch(() => ({}))
@@ -642,6 +838,8 @@ authRouter.post("/login", async (c) => {
         aud: JWT_AUDIENCE,
         exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 7,
         jti: generateJti(),
+        // M-3：token 版本号
+        epoch: Number(matchedUser.token_epoch ?? 0) || 0,
       }
       const secret = await getJwtSecret(c)
       const token = await sign(payload, secret)
@@ -734,6 +932,8 @@ authRouter.post("/login/hash", async (c) => {
         aud: JWT_AUDIENCE,
         exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 7,
         jti: generateJti(),
+        // M-3：token 版本号
+        epoch: Number(matchedUser.token_epoch ?? 0) || 0,
       }
       const secret = await getJwtSecret(c)
       const token = await sign(payload, secret)
@@ -798,6 +998,8 @@ export const meUpdateHandler = async (c: any) => {
       }
     }
     await setUserPassword(user, body.password.trim())
+    // M-3：改密后撤销该用户所有已签发 token（否则泄露的 token 还能用 7 天）
+    bumpTokenEpoch(user)
   }
 
   await saveDb(db, c.env)

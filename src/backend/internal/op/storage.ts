@@ -105,13 +105,18 @@ import { ProtonDriveDriver } from "../../drivers/proton_drive/driver"
 
 // LocalDriver is not available in Cloudflare Workers (no fs module).
 // When running in Node.js container mode, import dynamically on first use.
-let _localDriver: StorageDriver | null = null
-async function getLocalDriver(): Promise<StorageDriver> {
-  if (!_localDriver) {
-    const { LocalDriver } = await import("../../drivers/local")
-    _localDriver = new LocalDriver()
-  }
-  return _localDriver
+//
+// 按 root_folder_path 分实例缓存：驱动需要知道存储根才能在 fs 落到磁盘前做
+// realpath 越界校验（M-9），而每个 Local 存储的根都可能不同。
+const _localDrivers = new Map<string, StorageDriver>()
+async function getLocalDriver(rootFolder?: string): Promise<StorageDriver> {
+  const key = typeof rootFolder === "string" ? rootFolder : ""
+  const cached = _localDrivers.get(key)
+  if (cached) return cached
+  const { LocalDriver } = await import("../../drivers/local")
+  const driver = new LocalDriver(rootFolder)
+  _localDrivers.set(key, driver)
+  return driver
 }
 
 async function getSFTPDriver(storageConfig: any): Promise<StorageDriver> {
@@ -242,7 +247,9 @@ async function createDriver(
   if (normDriver === "local") {
     // Only available in Node.js container — not in Cloudflare Workers
     if (typeof process !== "undefined" && process.release?.name === "node") {
-      return getLocalDriver()
+      // 存储根随配置传入：驱动内部据此做软链越界校验（M-9）
+      const root = parseAddition(storageConfig)?.root_folder_path
+      return getLocalDriver(typeof root === "string" ? root : undefined)
     }
     throw new Error(
       "Local storage driver requires Node.js runtime (not available in Cloudflare Workers)",
