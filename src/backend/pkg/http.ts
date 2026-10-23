@@ -318,6 +318,8 @@ export function isSafeUrl(
       if (isZero(0, 7) && (g[7] === 0 || g[7] === 1)) return false
       // fe80::/10 链路本地
       if ((g[0] & 0xffc0) === 0xfe80) return false
+      // fec0::/10 站点本地（RFC 3879 已废弃，但仍有实现会解析/路由）
+      if ((g[0] & 0xffc0) === 0xfec0) return false
       // fc00::/7 唯一本地地址
       if ((g[0] & 0xfe00) === 0xfc00) return false
       // ff00::/8 组播

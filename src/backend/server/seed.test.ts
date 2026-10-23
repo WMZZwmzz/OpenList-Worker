@@ -8,7 +8,7 @@ import { saveDb } from "../internal/model/db"
 import { fsRouter } from "./fs"
 import { seedTestHelpers } from "./seed"
 
-const ADMIN_TOKEN = "SEED_ADMIN_TOKEN"
+const ADMIN_TOKEN = "SEED_ADMIN_TOKEN_0123456789"
 const env: any = {}
 
 function sampleSeed() {
@@ -179,7 +179,7 @@ test("seed routes expose capabilities and reject an unapproved source", async ()
 
 test("seed diagnose reports per-format conversion requirements", async () => {
   await saveDb({
-    settings: [{ key: "token", value: ADMIN_TOKEN }],
+    settings: [{ key: "api_token", value: ADMIN_TOKEN }],
     users: [],
     storages: [],
     shares: [],
@@ -199,7 +199,7 @@ test("seed diagnose reports per-format conversion requirements", async () => {
 
 test("seed upload_parse accepts multipart seed uploads", async () => {
   await saveDb({
-    settings: [{ key: "token", value: ADMIN_TOKEN }],
+    settings: [{ key: "api_token", value: ADMIN_TOKEN }],
     users: [],
     storages: [],
     shares: [],
@@ -230,7 +230,7 @@ test("seed upload_parse accepts multipart seed uploads", async () => {
 
 test("seed update_channels shares the update handler", async () => {
   await saveDb({
-    settings: [{ key: "token", value: ADMIN_TOKEN }],
+    settings: [{ key: "api_token", value: ADMIN_TOKEN }],
     users: [],
     storages: [],
     shares: [],
@@ -280,7 +280,7 @@ test("seed capability formats follow driver-provided hashes", () => {
 
 test("legacy torrent parse returns the TorrentInfo contract", async () => {
   await saveDb({
-    settings: [{ key: "token", value: ADMIN_TOKEN }],
+    settings: [{ key: "api_token", value: ADMIN_TOKEN }],
     users: [],
     storages: [],
     shares: [],
@@ -324,7 +324,7 @@ test("seed update removes files and reports share validity", async () => {
     },
   ]
   await saveDb({
-    settings: [{ key: "token", value: ADMIN_TOKEN }],
+    settings: [{ key: "api_token", value: ADMIN_TOKEN }],
     users: [],
     storages: [],
     shares: [
@@ -363,7 +363,7 @@ test("seed update removes files and reports share validity", async () => {
 
 test("seed quick_save route accepts the unified transfer body", async () => {
   await saveDb({
-    settings: [{ key: "token", value: ADMIN_TOKEN }],
+    settings: [{ key: "api_token", value: ADMIN_TOKEN }],
     users: [],
     storages: [],
     shares: [],
@@ -380,7 +380,7 @@ test("seed quick_save route accepts the unified transfer body", async () => {
 
 test("seed convert accepts target_format from the frontend contract", async () => {
   await saveDb({
-    settings: [{ key: "token", value: ADMIN_TOKEN }],
+    settings: [{ key: "api_token", value: ADMIN_TOKEN }],
     users: [],
     storages: [],
     shares: [],

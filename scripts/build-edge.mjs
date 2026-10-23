@@ -138,6 +138,14 @@ const nodeShimPlugin = {
     build.onResolve({ filter: nodeFilter }, (args) => {
       return { path: shimPath, external: false }
     })
+
+    // 内置模块的子路径（如 "fs/promises"）：上面的 filter 是整串锚定的，匹配不到
+    // 带子路径的写法，esbuild 会当成三方依赖去 node_modules 找并报
+    // Could not resolve "fs/promises"。这里同样替换成空壳。
+    const subpathFilter = new RegExp(`^(node:)?(${nodeModules.join("|")})/.+$`)
+    build.onResolve({ filter: subpathFilter }, (args) => {
+      return { path: shimPath, external: false }
+    })
   },
 }
 

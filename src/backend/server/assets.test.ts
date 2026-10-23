@@ -288,14 +288,32 @@ test("ensureManifestCredentials: 属性顺序在前（rel 后置）也能匹配"
 })
 
 test("getIndexHtmlWithCdn: CDN 的 index.html（路径 B）也被补上 use-credentials", async () => {
-  // CDN HTML 来自上游产物，构建期补丁覆盖不到，运行期必须兜底
+  // CDN HTML 来自上游产物，构建期补丁覆盖不到，运行期必须兜底。
+  // 注意：整页 HTML 来自第三方属于 origin XSS 风险面，路径 B 现为显式开启
+  // （ASSETS_ALLOW_CDN_HTML=1），默认不信任 CDN HTML。
   await withFetch(async () => {
     const out = await getIndexHtmlWithCdn(
-      { ASSET_URLS: "https://cdn-b.example.com/dist" },
+      {
+        ASSET_URLS: "https://cdn-b.example.com/dist",
+        ASSETS_ALLOW_CDN_HTML: "1",
+      },
       LOCAL_HTML,
     )
     assert.match(out, /rel="manifest" crossorigin="use-credentials"/)
   }, cdnImpl({ asset: false, html: HTML_WITH_MANIFEST }))
+})
+
+test("getIndexHtmlWithCdn: 默认不信任 CDN 的整页 HTML（防 origin XSS）", async () => {
+  const out = await withFetch(
+    () =>
+      getIndexHtmlWithCdn(
+        { ASSET_URLS: "https://cdn-b.example.com/dist" },
+        LOCAL_HTML,
+      ),
+    // CDN 无该哈希资产、但能返回整页 HTML：默认应回退本地 HTML
+    cdnImpl({ asset: false, html: HTML_WITH_MANIFEST }),
+  )
+  assert.equal(out, LOCAL_HTML)
 })
 
 // ------------------------------------------------------------ getIndexHtmlWithCdn

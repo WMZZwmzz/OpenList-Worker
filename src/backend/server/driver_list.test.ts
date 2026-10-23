@@ -10,13 +10,15 @@ import { saveDb } from "../internal/model/db"
  * 覆盖 /driver/list、/driver/names、/driver/info 与创建存储后的端到端列目录。
  */
 
-const authHeaders = { Authorization: "Bearer admin-token" }
+// SEC-012：静态管理令牌只认 `api_token` 设置（≥16 字符），不再复用驱动用的 `token`
+const ADMIN_TOKEN = "driver-list-admin-token-0123456789"
+const authHeaders = { Authorization: `Bearer ${ADMIN_TOKEN}` }
 
 async function setupEnv(): Promise<any> {
   const env: any = {}
   await saveDb(
     {
-      settings: [{ key: "token", value: "admin-token" }],
+      settings: [{ key: "api_token", value: ADMIN_TOKEN }],
       users: [],
       storages: [],
       shares: [],

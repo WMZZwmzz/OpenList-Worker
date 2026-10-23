@@ -126,13 +126,8 @@ test("SEC-009: 分片/直传/驱动 other 入口都受 meta.write_users 约束",
     },
   ])
 
-  const create = await post(
-    a,
-    "/api/fs/upload/create",
-    { path: "/protected", file_name: "x.bin", size: 10 },
-    token,
-  )
-  assert.equal(create.status, 403, await create.text())
+  // 注意：TS 专有的 /fs/upload/{create,part,complete} 会话式上传端点已随上游
+  // 移除（分片上传对齐 Go 只保留 /fs/multipart/*），故这里不再断言该路径。
 
   const init = await a.request("/api/fs/multipart/init", {
     method: "POST",
@@ -163,8 +158,8 @@ test("SEC-009: 分片/直传/驱动 other 入口都受 meta.write_users 约束",
   // 未受 write_users 限制的目录仍可正常初始化（确保闸门没有误伤）
   const allowed = await post(
     a,
-    "/api/fs/upload/create",
-    { path: "/", file_name: "ok.bin", size: 10 },
+    "/api/fs/get_direct_upload_info",
+    { path: "/", file_name: "ok.bin", file_size: 10 },
     token,
   )
   assert.notEqual(allowed.status, 403, await allowed.text())

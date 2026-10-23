@@ -41,6 +41,7 @@ import {
   signDownloadPath,
   isEncryptPath,
   getSignExpiresIn,
+  needDownloadSign,
 } from "../pkg/sign"
 import { safeErrorMessage } from "../pkg/errs"
 import { encodeDownloadPath } from "../pkg/path"
@@ -79,6 +80,36 @@ import {
   putSession,
   snapshot as mpSnapshot,
 } from "../internal/upload/multipart"
+
+/**
+ * 分享入口的目录 meta 门禁（SEC-010）。
+ *
+ * 创建分享时只能证明「创建者当时可读」，不能替代访问时的判定：分享建立后仍可能
+ * 新增密码、收紧 read_users，或分享指向一个 meta 保护的父目录。此前 /fs/list 与
+ * /fs/get 的分享分支只解析分享、不查 meta，匿名访问者因此能借分享绕过收紧后的
+ * 权限（raw.ts 的 /sd 下载早已有此闸门，两侧必须一致）。
+ *
+ * 返回 true 表示应当拒绝。管理员放行（与 pkg/meta 约定一致）。
+ */
+async function denyShareByMeta(
+  c: any,
+  user: any,
+  sharedPaths: string[],
+  password: string,
+): Promise<boolean> {
+  if (isAdmin(user)) return false
+  for (const shared of sharedPaths) {
+    let meta: Meta | null = null
+    try {
+      meta = await getNearestMeta(shared, c.env)
+    } catch {
+      meta = null
+    }
+    if (!meta) continue
+    if (!canAccess(user, meta, shared, password || "")) return true
+  }
+  return false
+}
 
 export const fsRouter = new Hono()
 fsRouter.route("/seed", seedRouter)
@@ -266,6 +297,24 @@ fsRouter.post("/dirs", async (c) => {
       if (!shareRes.ok) {
         return shareErrorResponse(c, shareRes.error)
       }
+      // SEC-010：分享浏览/详情同样受目录 meta 约束（密码用分享提取码校验）
+      if (
+        await denyShareByMeta(
+          c,
+          user,
+          shareRes.share.files || [],
+          body.password || "",
+        )
+      ) {
+        return c.json(
+          {
+            code: 403,
+            message: "Access denied (wrong password or not in read_users)",
+            data: null,
+          },
+          403,
+        )
+      }
       if (shareRes.virtualList) {
         const dirs = []
         for (const f of shareRes.share.files || []) {
@@ -366,6 +415,24 @@ fsRouter.post("/list", async (c) => {
       const shareRes = await resolveShare(reqPath, body.password || "", c.env)
       if (!shareRes.ok) {
         return shareErrorResponse(c, shareRes.error)
+      }
+      // SEC-010：分享浏览/详情同样受目录 meta 约束（密码用分享提取码校验）
+      if (
+        await denyShareByMeta(
+          c,
+          user,
+          shareRes.share.files || [],
+          body.password || "",
+        )
+      ) {
+        return c.json(
+          {
+            code: 403,
+            message: "Access denied (wrong password or not in read_users)",
+            data: null,
+          },
+          403,
+        )
       }
 
       // Multi-file share root → virtual list of the shared items
@@ -490,8 +557,10 @@ fsRouter.post("/list", async (c) => {
     // 注意：不能回退 item.sign —— sign 由本层统一签发，驱动不参与
     //（历史上 webdav/autoindex 驱动曾把远程路径/URL 塞进该字段）。
     const signPolicy = await getSignPolicy(c)
-    const encrypt = await isEncryptPath(c, reqPath)
-    const signNeeded = signPolicy.enabled || encrypt
+    // 与 raw.ts 的 needDownloadSign 保持对称：除 sign_all / 密码 meta 外，
+    // **只由 read_users 名单控制**的目录同样必须签发签名 —— 否则合法用户拿不到
+    // sign，直链反而 401（签发侧只判密码，验证侧判名单，两边不对称）。
+    const signNeeded = await needDownloadSign(c, reqPath)
     const signExpiresIn = signNeeded
       ? signPolicy.expiresIn || (await getSignExpiresIn(c))
       : 0
@@ -637,6 +706,24 @@ fsRouter.post("/get", async (c) => {
       if (!shareRes.ok) {
         return shareErrorResponse(c, shareRes.error)
       }
+      // SEC-010：分享浏览/详情同样受目录 meta 约束（密码用分享提取码校验）
+      if (
+        await denyShareByMeta(
+          c,
+          user,
+          shareRes.share.files || [],
+          body.password || "",
+        )
+      ) {
+        return c.json(
+          {
+            code: 403,
+            message: "Access denied (wrong password or not in read_users)",
+            data: null,
+          },
+          403,
+        )
+      }
 
       // Multi-file share root: report as a virtual folder so the frontend lists it
       if (shareRes.virtualList) {
@@ -706,7 +793,7 @@ fsRouter.post("/get", async (c) => {
     const { item, provider, rawUrl } = await getItem(reqPath, requestContext)
     // 与 /fs/list 同源逻辑，见上方注释
     const signPolicy = await getSignPolicy(c)
-    const signNeeded = signPolicy.enabled || (await isEncryptPath(c, reqPath))
+    const signNeeded = await needDownloadSign(c, reqPath)
     const sign =
       !item.is_dir && signNeeded
         ? await signDownloadPath(
@@ -1135,6 +1222,19 @@ fsRouter.post("/other", async (c) => {
   // 体积边界说明：这里签发的直传 URL 由客户端直接写对象存储，数据不经过本站，
   // 因此 MAX_UPLOAD / MAX_UPPART 覆盖不到该路径——上限由下游存储自行约束。
   if (!canWrite(user)) return permissionDenied(c)
+  // SEC-009：`other` 是驱动级特权入口（S3 用它签发直传 URL，属于写入），
+  // 必须与 /fs/put 一样受目录 meta.write_users 约束，否则受限用户能绕过目录
+  // 白名单拿到直传地址。目标路径与被写入的文件路径都要判。
+  const otherTargets = [reqPath]
+  if (typeof body?.file_name === "string" && body.file_name) {
+    otherTargets.push(`${reqPath === "/" ? "" : reqPath}/${body.file_name}`)
+  }
+  if (await deniedByMetaWriteAcl(c, user, otherTargets)) {
+    return c.json(
+      { code: 403, message: "Write permission denied for this path", data: null },
+      403,
+    )
+  }
   try {
     const resolved = await resolvePath(reqPath)
     if (resolved.isVirtual || !resolved.storage) {

@@ -1,7 +1,11 @@
 import { Hono } from "hono"
 import { sign } from "hono/jwt"
 import { getDb, saveDb } from "../internal/model/db"
-import { getJwtSecret, getUserFromContext } from "./middlewares"
+import {
+  getJwtSecret,
+  getUserFromContext,
+  requireAuthenticatedUser,
+} from "./middlewares"
 import { passwordStampOf } from "../pkg/password"
 
 /**
@@ -567,7 +571,9 @@ webauthnRouter.post("/webauthn_begin_registration", async (c) => {
   if (!getBoolSetting(db, "webauthn_login_enabled")) {
     return c.json({ code: 403, message: "WebAuthn is not enabled", data: null }, 403)
   }
-  const user = await getUserFromContext(c)
+  // M-1：必须是「真实凭据」，不能吃 allow_guest 的 guest 兜底 —— 否则匿名者可以
+  // 给 guest 注册/删除 Passkey，管理员把 guest 的 role 调成 2 时即成为管理员。
+  const user = await requireAuthenticatedUser(c)
   if (!user || user.disabled) {
     return c.json({ code: 401, message: "Unauthorized", data: null }, 401)
   }
@@ -622,7 +628,9 @@ webauthnRouter.post("/webauthn_finish_registration", async (c) => {
   if (!getBoolSetting(db, "webauthn_login_enabled")) {
     return c.json({ code: 403, message: "WebAuthn is not enabled", data: null }, 403)
   }
-  const user = await getUserFromContext(c)
+  // M-1：必须是「真实凭据」，不能吃 allow_guest 的 guest 兜底 —— 否则匿名者可以
+  // 给 guest 注册/删除 Passkey，管理员把 guest 的 role 调成 2 时即成为管理员。
+  const user = await requireAuthenticatedUser(c)
   if (!user || user.disabled) {
     return c.json({ code: 401, message: "Unauthorized", data: null }, 401)
   }
@@ -679,7 +687,9 @@ webauthnRouter.post("/webauthn_finish_registration", async (c) => {
 
 // POST /api/authn/delete_authn (需已登录，body: {id})
 webauthnRouter.post("/delete_authn", async (c) => {
-  const user = await getUserFromContext(c)
+  // M-1：必须是「真实凭据」，不能吃 allow_guest 的 guest 兜底 —— 否则匿名者可以
+  // 给 guest 注册/删除 Passkey，管理员把 guest 的 role 调成 2 时即成为管理员。
+  const user = await requireAuthenticatedUser(c)
   if (!user || user.disabled) {
     return c.json({ code: 401, message: "Unauthorized", data: null }, 401)
   }
@@ -699,7 +709,9 @@ webauthnRouter.post("/delete_authn", async (c) => {
 
 // GET /api/authn/getcredentials (需已登录)
 webauthnRouter.get("/getcredentials", async (c) => {
-  const user = await getUserFromContext(c)
+  // M-1：必须是「真实凭据」，不能吃 allow_guest 的 guest 兜底 —— 否则匿名者可以
+  // 给 guest 注册/删除 Passkey，管理员把 guest 的 role 调成 2 时即成为管理员。
+  const user = await requireAuthenticatedUser(c)
   if (!user || user.disabled) {
     return c.json({ code: 401, message: "Unauthorized", data: null }, 401)
   }
