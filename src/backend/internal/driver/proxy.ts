@@ -126,6 +126,11 @@ const DRIVER_FORCE_PROXY = new Set<string>([
   "quarkuc",
   "chaoxing",
   "local",
+  // D-6：Kodbox 的下载直链把**账号级 accessToken** 拼在 query 里。一旦 /d 走
+  // 302，token 就会进入 Location / 浏览器历史 / CDN 日志，等于泄露整个账号。
+  // 该驱动没有「不带凭据的直链」这一选项，因此按 OnlyProxy 处理：一律由服务端
+  // 代理取流，token 只留在服务端到上游的那一跳。
+  "kodbox",
 ])
 
 /** 默认代理（Go: Config.DefaultProxy() = PreferProxy） */

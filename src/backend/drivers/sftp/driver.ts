@@ -16,6 +16,7 @@ export function normalizeSFTPAddition(a: any): SFTPAddition {
   norm.password = norm.password || ""
   norm.private_key = norm.private_key || ""
   norm.passphrase = norm.passphrase || ""
+  norm.host_key = String(norm.host_key || "").trim()
   norm.root_folder_path = (norm.root_folder_path || "/").trim()
   if (!norm.root_folder_path.startsWith("/")) {
     norm.root_folder_path = "/" + norm.root_folder_path

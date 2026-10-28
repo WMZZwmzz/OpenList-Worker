@@ -141,7 +141,7 @@ test("Security(F-11): ADMIN_PASS still forces an explicit reset (to salted doubl
   )
 })
 
-test("user/create follows Go: no silent default password and no echoed password", async () => {
+test("user/create never stores an empty-password hash; generated password works once", async () => {
   await seed(
     [
       adminUser(
@@ -162,17 +162,25 @@ test("user/create follows Go: no silent default password and no echoed password"
   })
   assert.equal(res.status, 200)
   const json: any = await res.json()
-  // 对齐 Go：不再自动生成随机密码，也不会把密码回显给调用方
-  assert.equal(json.data, null)
+  // N-2：不填密码时服务端生成随机密码，并只在创建响应里回显一次。
+  const generated = json?.data?.password
+  assert.equal(json?.data?.generated, true)
+  assert.ok(typeof generated === "string" && generated.length >= 16)
 
   const db: any = await getDb(env)
   const created = db.users.find((u: any) => u.username === "newuser")
   assert.ok(isHex64(created.password), "stored value must be a 64-hex hash")
   assert.ok(created.salt, "stored user must carry a per-user salt")
+  // 空口令永远不能登录：旧实现会存下「空字符串的双层哈希」，verify('') 为 true。
   assert.equal(
     await verifyUserPassword(created, ""),
+    false,
+    "an empty password must never authenticate",
+  )
+  assert.equal(
+    await verifyUserPassword(created, generated),
     true,
-    'an empty password matches Go\'s SetPassword("") semantics',
+    "the generated password must authenticate",
   )
   assert.equal(
     await verifyUserPassword(created, "123456"),

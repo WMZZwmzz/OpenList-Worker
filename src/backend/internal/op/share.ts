@@ -147,25 +147,39 @@ export async function resolveShare(
   ) {
     return { ok: false, error: "share access count exceeded" }
   }
+  // S-3：只有**可信来源**才参与口令失败锁定。
+  //
+  // 历史缺陷：clientKey 拿不到时退化成 "unknown"，所有匿名访问者共享同一个
+  // 计数器 —— 攻击者故意输错 8 次即可让所有人 10 分钟内无法输入提取码
+  // （纯可用性 DoS）。登录侧的做法是「IP 不可信时关闭 IP 维度」，这里对齐。
+  const trustedSource = !!clientKey && clientKey !== "unknown"
   const pwdKey = pwdFailureKey(shareId, clientKey)
-  if (share.pwd && isPwdLocked(pwdKey)) {
+  if (share.pwd && trustedSource && isPwdLocked(pwdKey)) {
     return { ok: false, error: "too many wrong passwords, please try later" }
   }
   if (
     share.pwd &&
     !constantTimeEqual(String(share.pwd), String(password ?? ""))
   ) {
-    bumpPwdFailure(pwdKey)
+    if (trustedSource) bumpPwdFailure(pwdKey)
     return { ok: false, error: "wrong password" }
   }
-  if (share.pwd) pwdFailures.delete(pwdKey)
+  if (share.pwd && trustedSource) pwdFailures.delete(pwdKey)
   if (!share.files || share.files.length === 0) {
     return { ok: false, error: "share is empty" }
   }
 
-  // Count this access
-  share.accessed = (share.accessed || 0) + 1
-  saveDb(db, envCtx).catch(() => {})
+  /**
+   * S-2：访问计数只能记在**解析成功**之后。
+   *
+   * 历史实现把 `accessed+1` 与整库 saveDb 放在所有 containment 校验之前：
+   * 匿名者对 `/@s/{id}/random` 反复探测（必然 400）也会持续触发
+   * 「读全库 → 序列化 → 写全库」，并提前烧完 max_accessed 配额。
+   */
+  const recordAccess = () => {
+    share.accessed = (share.accessed || 0) + 1
+    saveDb(db, envCtx).catch(() => {})
+  }
 
   // FIX(C-3): containment check. Whatever normalize() produces, the result
   // must stay inside one of the explicitly shared paths.
@@ -200,6 +214,7 @@ export async function resolveShare(
       return { ok: false, error: "share is empty" }
     }
     share.files = safeFiles
+    recordAccess()
     return { ok: true, share, virtualList: true }
   }
 
@@ -210,6 +225,7 @@ export async function resolveShare(
     const single = normalize(share.files[0])
     if (!withinCreatorRoot(single))
       return { ok: false, error: "path not found in share" }
+    recordAccess()
     return { ok: true, share, realPath: single }
   }
 
@@ -224,6 +240,7 @@ export async function resolveShare(
   if (!withinShare(real) || !withinCreatorRoot(real)) {
     return { ok: false, error: "path not found in share" }
   }
+  recordAccess()
   return { ok: true, share, realPath: real }
 }
 

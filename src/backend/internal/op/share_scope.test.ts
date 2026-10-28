@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { saveDb } from "../model/db"
+import { getDb, saveDb } from "../model/db"
 import { resolveShare } from "./share"
 
 const env: any = {}
@@ -142,4 +142,33 @@ test("SEC-002: 多文件分享条目在返回虚拟列表前就被过滤到创�
   assert.equal(r.ok, true)
   assert.equal(r.virtualList, true)
   assert.deepEqual(r.share?.files, ["/u1/a.txt"])
+})
+
+test("S-3: 无可信来源时不使用全局失败计数（避免匿名锁死所有人）", async () => {
+  await seed(["/data/secret.txt"], "s3cret")
+  for (let i = 0; i < 12; i++) {
+    const r = await resolveShare("/@s/abc", `bad${i}`, env)
+    assert.equal(r.ok, false)
+  }
+  // 拿不到真实 IP 时不应累计成 `abc|unknown` 这把全局锁：
+  // 正确的提取码必须仍然可用。
+  const ok = await resolveShare("/@s/abc", "s3cret", env)
+  assert.equal(ok.ok, true, "不可信来源不得触发全局锁定")
+})
+
+test("S-2: 解析失败不计数，解析成功才 +1", async () => {
+  await seed(["/data/secret.txt"])
+  const before: any = await getDb(env)
+  assert.equal(before.shares[0].accessed, 0)
+
+  // 单文件分享的子路径探测必然失败：此前这里会先 accessed+1 再报错。
+  const bad = await resolveShare("/@s/abc/whatever", "", env)
+  assert.equal(bad.ok, false)
+  const mid: any = await getDb(env)
+  assert.equal(mid.shares[0].accessed, 0, "失败探测不得消耗访问配额")
+
+  const ok = await resolveShare("/@s/abc", "", env)
+  assert.equal(ok.ok, true)
+  const after: any = await getDb(env)
+  assert.equal(after.shares[0].accessed, 1, "成功解析才计数")
 })

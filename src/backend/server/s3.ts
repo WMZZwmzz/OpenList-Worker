@@ -167,14 +167,24 @@ async function metaWriteDenied(
   return !canWriteMeta(user, meta, path)
 }
 
-const getCtx = (c: any) => {
+/**
+ * 请求级存储上下文。
+ *
+ * N-1：必须带上已认证用户 —— op 层的 `assertMetaWritable`（meta.write_users）
+ * 只在拿到 user 时才校验，缺省实现会让 /s3/* 的目录写白名单完全失效。
+ */
+const getCtx = (c: any, user?: any) => {
   try {
     const ec = c.executionCtx
     return ec && typeof ec.waitUntil === "function"
-      ? { waitUntil: (p: Promise<unknown>) => ec.waitUntil(p), env: c.env }
-      : { env: c.env }
+      ? {
+          waitUntil: (p: Promise<unknown>) => ec.waitUntil(p),
+          env: c.env,
+          user: user ?? null,
+        }
+      : { env: c.env, user: user ?? null }
   } catch {
-    return { env: c?.env }
+    return { env: c?.env, user: user ?? null }
   }
 }
 
@@ -184,7 +194,7 @@ s3Router.get("/", async (c) => {
   if (!user) return s3Error("AccessDenied", "Authentication required", 403)
   try {
     // 仅列出用户根目录之下的「bucket」——受限 base_path 的用户不应看到整站挂载点
-    const res = await listItems(getActualPath(user, "/"), getCtx(c))
+    const res = await listItems(getActualPath(user, "/"), getCtx(c, user))
     const buckets = (res.content || [])
       .filter((it: any) => it.is_dir)
       .map(
@@ -222,7 +232,7 @@ s3Router.get("/*", async (c) => {
     return s3Error("AccessDenied", "Password required for this path", 403)
   }
   try {
-    const { item, rawUrl } = await getItem(virtualPath, getCtx(c))
+    const { item, rawUrl } = await getItem(virtualPath, getCtx(c, user))
     if (!item) return s3Error("NoSuchKey", "NoSuchKey", 404)
     if (item.is_dir) return s3Error("NoSuchKey", "NoSuchKey", 404)
     if (rawUrl) {
@@ -248,7 +258,7 @@ s3Router.on("HEAD", "/*", async (c) => {
     return s3Error("AccessDenied", "Password required for this path", 403)
   }
   try {
-    const { item } = await getItem(virtualPath, getCtx(c))
+    const { item } = await getItem(virtualPath, getCtx(c, user))
     if (!item || item.is_dir) return s3Error("NoSuchKey", "NoSuchKey", 404)
     const headers: Record<string, string> = {
       "Content-Length": String(item.size || 0),
@@ -296,7 +306,7 @@ s3Router.put("/*", async (c) => {
         400,
       )
     }
-    await putItem(virtualPath, body.buffer, getCtx(c))
+    await putItem(virtualPath, body.buffer, getCtx(c, user))
     // 不再返回伪造的 ETag。
     //
     // 历史实现返回 `Date.now().toString(16)`，不是内容摘要：依赖 ETag 做幂等/
@@ -334,7 +344,7 @@ s3Router.delete("/*", async (c) => {
   const dir = slash > 0 ? virtualPath.slice(0, slash) : "/"
   const name = virtualPath.slice(slash + 1)
   try {
-    await removeItems(dir, [name], getCtx(c))
+    await removeItems(dir, [name], getCtx(c, user))
     return new Response(null, { status: 204 })
   } catch (e: any) {
     return s3Error("NoSuchKey", safeErrorMessage(e), 404)

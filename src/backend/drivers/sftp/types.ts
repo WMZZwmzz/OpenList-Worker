@@ -8,6 +8,11 @@ export interface SFTPAddition {
   private_key?: string
   passphrase?: string
   root_folder_path?: string
+  /**
+   * 主机公钥指纹（`SHA256:...`）或公钥 base64。为空时按 TOFU 处理：
+   * 接受首次见到的主机密钥，但把指纹写进日志供运维固化。
+   */
+  host_key?: string
   ignore_symlink_error?: boolean | string
 }
 

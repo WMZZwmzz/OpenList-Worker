@@ -50,18 +50,21 @@ import { encodeDownloadPath } from "../pkg/path"
 
 export const webdavRouter = new Hono()
 
-const getStorageRequestContext = (c: any) => {
+const getStorageRequestContext = (c: any, user?: any) => {
   try {
     const executionCtx = c.executionCtx
     if (!executionCtx || typeof executionCtx.waitUntil !== "function") {
-      return undefined
+      // N-1：没有 executionCtx 也要带上 env 与用户身份，否则 op 层的
+      // meta.write_users 门禁拿不到 user，直接放行。
+      return { env: c?.env, user: user ?? null }
     }
     return {
       waitUntil: (p: Promise<unknown>) => executionCtx.waitUntil(p),
       env: c.env, // 传递 env 用于请求级 KV 缓存复用
+      user: user ?? null,
     }
   } catch {
-    return undefined
+    return { env: c?.env, user: user ?? null }
   }
 }
 
@@ -90,10 +93,14 @@ async function webdavAuth(
         (u: any) => u.username === username && !u.disabled,
       )
       if (!user) return null
-      // 空密码用户（guest）：Basic Auth 下若未提供密码则允许（与 AList 一致）
+      // 空密码用户：只允许 guest 账号（AList 兼容语义）。
+      //
+      // M-6：未初始化的实例里 admin 的 password 就是空字符串，若这里不看角色，
+      // `Basic base64("admin:")` 在 initialize 之前直接是管理员。管理员必须
+      // 走 verifyUserPassword，而它已拒绝空口令。
       if (!user.password) {
-        if (password !== "") return null
-        return { user, metaPassword: isGuest(user) ? password : "" }
+        if (password !== "" || !isGuest(user)) return null
+        return { user, metaPassword: password }
       }
       if (await verifyUserPassword(user, password)) {
         return { user, metaPassword: isGuest(user) ? password : "" }
@@ -332,7 +339,7 @@ webdavRouter.all("/*", async (c) => {
   const davPath = davPathOf(c)
   const actualPath = scopedDavPath(user, davPath)
   if (!isWithinUserRoot(user, actualPath)) return c.text("Forbidden", 403)
-  const ctx = getStorageRequestContext(c)
+  const ctx = getStorageRequestContext(c, user)
 
   try {
     switch (method) {

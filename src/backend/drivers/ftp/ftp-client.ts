@@ -304,6 +304,13 @@ export class FTPClient {
   async sendCommand(
     cmd: string,
   ): Promise<{ code: number; message: string; raw: string }> {
+    // D-3：FTP 是「一行一条命令」的行协议，CR/LF 就是命令分隔符。
+    // `rename` 的目标名、用户名、密码都来自用户配置；若透传 `\r\n`，攻击者
+    // 可以凭一个文件名追加任意 FTP 命令（如 DELE / SITE EXEC）。
+    // 命令字面量里永远不需要 CR/LF/NUL，一律拒绝。
+    if (/[\r\n\0]/.test(cmd)) {
+      throw new Error("[FTP] Illegal control character in command")
+    }
     if (!this.controlSocket || this.controlSocket.destroyed) {
       await this.connect()
     }

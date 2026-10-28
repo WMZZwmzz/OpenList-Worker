@@ -1,6 +1,10 @@
 import { Hono } from "hono"
 import { getDb, saveDb } from "../internal/model/db"
-import { authUserFromReq, verifyUserPassword } from "./auth"
+import {
+  authUserFromReq,
+  generateRandomPassword as generateTempPassword,
+  verifyUserPassword,
+} from "./auth"
 import { setUserPassword } from "../pkg/password"
 import { listUserSshKeys, deleteUserSshKey } from "../internal/op/sshkey"
 import { bumpTokenEpoch } from "../pkg/permission"
@@ -109,8 +113,15 @@ userRouter.post("/create", async (c) => {
   )
   const newId = maxId + 1
 
-  // 密码直接采用调用方传入值（对齐 Go：不传入即为空密码；不再自动生成随机
-  // 密码并回显）。
+  // N-2：空密码不能建号。
+  //
+  // 历史缺陷：`setUserPassword(user, "")` 存的是「空字符串的双层哈希」——一个
+  // 合法的 64 位 hex，非空。于是 verifyUserPassword(user, "") 照常匹配，
+  // 管理员「先建号、之后发密码」的操作会直接产出可匿名登录的账号。
+  // 这里改为生成随机密码并只在创建响应里回显一次（对齐 sso.ts 的做法）。
+  const requestedPassword =
+    typeof body.password === "string" ? body.password : ""
+  const temporaryPassword = requestedPassword ? "" : generateTempPassword()
   const newUser: any = {
     id: newId,
     username: body.username,
@@ -124,11 +135,18 @@ userRouter.post("/create", async (c) => {
     pwd_update_at: new Date().toISOString(),
   }
 
-  await setUserPassword(newUser, body.password || "")
+  await setUserPassword(newUser, requestedPassword || temporaryPassword)
   db.users.push(newUser)
   await saveDb(db, c.env)
 
-  return c.json({ code: 200, message: "success", data: null })
+  return c.json({
+    code: 200,
+    message: "success",
+    // 只有在调用方没给密码时才回显一次；调用方自行指定的密码不回显。
+    data: temporaryPassword
+      ? { password: temporaryPassword, generated: true }
+      : null,
+  })
 })
 
 // POST /api/admin/user/update

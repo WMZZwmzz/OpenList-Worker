@@ -73,7 +73,9 @@ const seed = async (root: string, settings: any[] = []) => {
           username: "tenant",
           password: "x",
           role: 0,
-          permission: 1 << 14, // SHARE：用于验证分享创建路径
+          // SHARE + WRITE/RENAME/MOVE/COPY/DELETE：既覆盖分享创建路径，
+          // 也让写类越界用例（D-1 / N-2）真的走到 handler 的门禁之后。
+          permission: 1 << 14 | 1 << 3 | 1 << 4 | 1 << 5 | 1 << 6 | 1 << 7,
           base_path: "/local/u1",
           disabled: false,
         },
@@ -219,4 +221,127 @@ test("SEC-079: 签名按规范路径计算，等价写法可验通且不可跨�
   assert.equal(noSign.status, 401, "sign_all 开启后无签名应 401")
   const stolen = await hit("/local/other/secret.txt", mine.sign)
   assert.equal(stolen.status, 401, "签名不得跨路径复用")
+})
+
+const post = (
+  a: Hono,
+  tenantToken: string,
+  route: string,
+  body: any,
+) =>
+  a.request(`/api/fs/${route}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${tenantToken}`,
+    },
+    body: JSON.stringify(body),
+  })
+
+test("D-1: /fs/remove 的 names 拒绝编码后的路径分隔符", async () => {
+  const root = makeRoot()
+  const a = newApp()
+  const t = await seed(root)
+
+  // 字面 `..`、`%2e%2e%2f`（解码后是 ../）、`...` 都必须被拒绝
+  for (const name of [
+    "../other/secret.txt",
+    "%2e%2e%2fother%2fsecret.txt",
+    ".../other/secret.txt",
+    "a%2Fb.txt",
+  ]) {
+    const res = await post(a, t, "remove", { dir: "/", names: [name] })
+    assert.equal(res.status, 400, `${name} 必须被拒绝，实际 ${res.status}`)
+  }
+  assert.equal(
+    fs.existsSync(path.join(root, "other", "secret.txt")),
+    true,
+    "sibling 目录的文件不得被删除",
+  )
+})
+
+test("D-1: /fs/move 与 /fs/copy 的 names 同样拒绝编码分隔符", async () => {
+  const root = makeRoot()
+  const a = newApp()
+  const t = await seed(root)
+  for (const route of ["move", "copy"]) {
+    const res = await post(a, t, route, {
+      src_dir: "/",
+      dst_dir: "/",
+      names: ["%2e%2e%2fother"],
+    })
+    assert.equal(res.status, 400, `${route} 必须拒绝编码分隔符`)
+  }
+})
+
+test("N-2: /fs/batch_rename 的 src_name 必须是单段文件名", async () => {
+  const root = makeRoot()
+  const a = newApp()
+  const t = await seed(root)
+  const res = await post(a, t, "batch_rename", {
+    src_dir: "/",
+    rename_objects: [{ src_name: "../other/secret.txt", new_name: "pwn.txt" }],
+  })
+  assert.equal(res.status, 400, "跨目录 src_name 必须被拒绝")
+  assert.equal(
+    fs.existsSync(path.join(root, "other", "pwn.txt")),
+    false,
+    "sibling 目录不得被改名",
+  )
+  assert.equal(
+    fs.existsSync(path.join(root, "other", "secret.txt")),
+    true,
+    "原文件必须保持不动",
+  )
+})
+
+test("N-1: /fs 写端点不再把 /@s 当作直通存储根的入口", async () => {
+  const root = makeRoot()
+  const a = newApp()
+  const t = await seed(root)
+  const res = await a.request("/api/fs/put", {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/octet-stream",
+      Authorization: `Bearer ${t}`,
+      "File-Path": "/@s/../other/pwn.txt",
+    },
+    body: "PWN",
+  })
+  // 允许 200（写到自己的根内），但绝不能落到 sibling 目录
+  assert.notEqual(res.status, 401)
+  assert.equal(
+    fs.existsSync(path.join(root, "other", "pwn.txt")),
+    false,
+    "/@s 前缀不得成为跨租户写入的跳板",
+  )
+})
+
+test("N-1: /fs/search 的 /@s/.. 不得遍历兄弟租户目录", async () => {
+  const root = makeRoot()
+  const a = newApp()
+  const t = await seed(root)
+  // 修复前：parent 原样透传，search 在 /other 上枚举出 secret.txt。
+  const res = await post(a, t, "search", {
+    parent: "/@s/../other",
+    keywords: "",
+  })
+  const text = await res.text()
+  assert.equal(
+    text.includes("secret.txt"),
+    false,
+    "分享命名空间不得被 .. 弹出后读到 sibling 目录",
+  )
+})
+
+test("N-4: /fs/search 拒绝匿名请求（不再吃 guest 兜底）", async () => {
+  const root = makeRoot()
+  const a = newApp()
+  await seed(root)
+  const res = await a.request("/api/fs/search", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ parent: "/", keywords: "secret" }),
+  })
+  assert.equal(res.status, 401, "匿名 search 必须 401")
 })

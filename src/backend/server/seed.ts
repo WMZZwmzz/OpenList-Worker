@@ -3,12 +3,14 @@ import {
   AUTHED_USER_KEY,
   getUserFromContext,
   requestHasCredential,
+  requireAuthenticatedUser,
 } from "./middlewares"
 import {
   canWrite,
   getActualPath,
   can,
   canSeeHides,
+  isWithinUserRoot,
   PermissionBit,
 } from "../pkg/permission"
 import {
@@ -141,6 +143,18 @@ async function readJson(c: any): Promise<any> {
     throw new Error(`Seed request exceeds the ${max} byte limit`)
   if (!text.trim()) return {}
   return JSON.parse(text)
+}
+
+/**
+ * D-9：`formData()` 会把整个请求体读进内存，先解析再判大小等于没有上限。
+ * 这里在解析前按声明的 Content-Length 预检（multipart 有边界与分片头开销，
+ * 留 64KiB 余量），超限直接 413。
+ */
+function assertDeclaredBodyWithin(c: any, max: number): void {
+  const declared = Number(c.req.header("Content-Length") || 0)
+  if (Number.isFinite(declared) && declared > max + 64 * 1024) {
+    throw new Error(`request body exceeds the ${max} byte limit`)
+  }
 }
 
 function normalizeVirtualPath(value: unknown, fallback = "/"): string {
@@ -1347,6 +1361,7 @@ seedRouter.post("/upload_parse", async (c) => {
   if (!user || user.disabled) return errorResponse(c, 401, "Unauthorized")
   try {
     const max = envNumber(c, "SEED_MAX_METADATA_SIZE", DEFAULT_MAX_SEED_BYTES)
+    assertDeclaredBodyWithin(c, max)
     const form = await c.req.formData()
     const upload = form.get("seed")
     if (!upload || typeof upload === "string")
@@ -1471,7 +1486,8 @@ async function transferBody(
   body: any,
   rapidOnly: boolean | ((body: any) => boolean),
 ) {
-  const user = await getUserFromContext(c)
+  // D-9：转存是重活且会写盘，不接受 allow_guest 的匿名兜底。
+  const user = await requireAuthenticatedUser(c)
   if (!canWrite(user)) return errorResponse(c, 403, "Permission denied")
   try {
     const rapid = typeof rapidOnly === "function" ? rapidOnly(body) : rapidOnly
@@ -1609,9 +1625,15 @@ async function transferBody(
         try {
           const transitTarget = joinVirtualPath(targetRoot, filePath)
           const actualTransit = getActualPath(user, transitTarget)
+          // D-8：transit 读的是任意存储路径的直链，必须与 /fs/get 同一套
+          // 读权限链（租户根 + meta 密码/read_users），否则可绕过目录密码。
+          if (!isWithinUserRoot(user, actualTransit)) {
+            throw new Error("permission denied: target path is outside the user root")
+          }
+          await assertSeedReadable(c, user, actualTransit)
           const { item, rawUrl } = await getItem(
             actualTransit,
-            storageContext(c),
+            storageContext(c, user),
           )
           const url = new URL(item.raw_url || rawUrl, c.req.url)
           const transferred = await uploadStreamToDriver(
@@ -1903,7 +1925,8 @@ function torrentInfoFromParsed(parsed: any) {
 export const torrentLegacyRouter = new Hono()
 
 torrentLegacyRouter.post("/parse", async (c) => {
-  const user = await getUserFromContext(c)
+  // D-9：legacy 路由独立于 seedRouter.use，必须自己拒绝匿名 guest 兜底。
+  const user = await requireAuthenticatedUser(c)
   if (!user || user.disabled) return errorResponse(c, 401, "Unauthorized")
   try {
     const body = await readJson(c)
@@ -1919,10 +1942,12 @@ torrentLegacyRouter.post("/parse", async (c) => {
 })
 
 torrentLegacyRouter.post("/upload_parse", async (c) => {
-  const user = await getUserFromContext(c)
+  // D-9：legacy 路由独立于 seedRouter.use，必须自己拒绝匿名 guest 兜底。
+  const user = await requireAuthenticatedUser(c)
   if (!user || user.disabled) return errorResponse(c, 401, "Unauthorized")
   try {
     const max = envNumber(c, "SEED_MAX_METADATA_SIZE", DEFAULT_MAX_SEED_BYTES)
+    assertDeclaredBodyWithin(c, max)
     const form = await c.req.formData()
     const upload = form.get("torrent")
     if (!upload || typeof upload === "string")
@@ -1964,7 +1989,8 @@ torrentLegacyRouter.post("/rapid_upload", async (c) => {
 })
 
 torrentLegacyRouter.post("/generate", async (c) => {
-  const user = await getUserFromContext(c)
+  // D-9：legacy 路由独立于 seedRouter.use，必须自己拒绝匿名 guest 兜底。
+  const user = await requireAuthenticatedUser(c)
   if (!user || user.disabled) return errorResponse(c, 401, "Unauthorized")
   try {
     const body = await readJson(c)

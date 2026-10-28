@@ -1,12 +1,12 @@
 import { resolvePath, getDb, getSettings, saveDb } from "../model/db"
-import { encodeDownloadPath } from "../../pkg/path"
+import { decodePathFully, encodeDownloadPath } from "../../pkg/path"
 import { singleflight } from "../../pkg/singleflight"
 import {
   canWrite as canWriteMeta,
   getNearestMeta,
   type Meta,
 } from "../../pkg/meta"
-import type { UserPermissionObj } from "../../pkg/permission"
+import { isWithinUserRoot, type UserPermissionObj } from "../../pkg/permission"
 import { canUseProxyEndpoint, normalizeExtList } from "../driver/proxy"
 import { FileItem, StorageDriver, calcFileType } from "../driver/base"
 import {
@@ -190,6 +190,51 @@ async function assertMetaWritable(
   }
   if (!canWriteMeta(user, meta, virtualPath)) {
     throw new Error("permission denied: not in write_users")
+  }
+}
+
+/**
+ * 租户根的第二道防线（D-1）。
+ *
+ * handler 已经把 base_path 套用进 virtualPath，但只要有任何一个入口忘了套用，
+ * 写成 `dir + "/" + name` 的路径就可能越界。只要 requestContext 带了 user，就在
+ * op 层统一复核一次，越出 base_path 直接拒绝；内部系统调用（不带 user）保持原
+ * 语义。
+ *
+ * 注意：这**不能**替代 D-5（Alias 驱动把虚拟路径映射成全局 targetFullPath 后
+ * 自调 op 层，那些内部调用不带 requestContext）。要彻底收口需要给 StorageDriver
+ * 接口补用户上下文，属下一批。
+ */
+function assertWithinUserRoot(
+  virtualPath: string,
+  requestContext?: StorageRequestContext,
+): void {
+  const user = requestContext?.user
+  if (!user) return
+  if (!isWithinUserRoot(user, virtualPath)) {
+    throw new Error("permission denied: path escapes the user base path")
+  }
+}
+
+/**
+ * 名字段（不是路径）的安全校验。
+ *
+ * 调用方会把它拼成 `dir + "/" + name` 再交给 resolvePath，而 resolvePath 对
+ * 拼接结果做多重百分号解码。`%2e%2e%2f` 在字面视图里是合法文件名，解码后却是
+ * `../`（D-1）。op 层不再信任 handler，统一在这里按解码视图拒绝分隔符与父目录段。
+ */
+function assertItemName(name: string): void {
+  const raw = String(name ?? "")
+  const decoded = decodePathFully(raw)
+  if (
+    !decoded ||
+    decoded === "." ||
+    /^\.+$/.test(decoded) ||
+    decoded.includes("/") ||
+    decoded.includes("\\") ||
+    decoded.includes("\0")
+  ) {
+    throw new Error(`illegal file name '${raw}'`)
   }
 }
 
@@ -1732,6 +1777,7 @@ export async function makeDirectory(
   requestContext?: StorageRequestContext,
 ): Promise<void> {
   await assertMetaWritable(virtualPath, requestContext)
+  assertWithinUserRoot(virtualPath, requestContext)
   const resolved = await resolvePath(virtualPath, requestContext?.env)
   if (resolved.isVirtual) {
     throw new Error("failed get storage: storage not found")
@@ -1757,6 +1803,8 @@ export async function renameItem(
   requestContext?: StorageRequestContext,
 ): Promise<void> {
   await assertMetaWritable(virtualPath, requestContext)
+  assertItemName(newName)
+  assertWithinUserRoot(virtualPath, requestContext)
   const resolved = await resolvePath(virtualPath, requestContext?.env)
   if (resolved.isVirtual) {
     throw new Error("failed get storage: storage not found")
@@ -1784,8 +1832,10 @@ export async function removeItems(
   requestContext?: StorageRequestContext,
 ): Promise<void> {
   for (const name of names) {
+    assertItemName(name)
     const itemVirtual = `${dir}/${name}`
     await assertMetaWritable(itemVirtual, requestContext)
+    assertWithinUserRoot(itemVirtual, requestContext)
     const resolved = await resolvePath(itemVirtual, requestContext?.env)
     if (resolved.isVirtual) {
       throw new Error("failed get storage: storage not found")
@@ -1813,10 +1863,13 @@ export async function moveItems(
   requestContext?: StorageRequestContext,
 ): Promise<void> {
   for (const name of names) {
+    assertItemName(name)
     const srcVirtual = `${srcDir}/${name}`
     const dstVirtual = `${dstDir}/${name}`
     await assertMetaWritable(srcVirtual, requestContext)
     await assertMetaWritable(dstVirtual, requestContext)
+    assertWithinUserRoot(srcVirtual, requestContext)
+    assertWithinUserRoot(dstVirtual, requestContext)
     const srcResolved = await resolvePath(srcVirtual, requestContext?.env)
     const dstResolved = await resolvePath(dstVirtual, requestContext?.env)
     if (srcResolved.isVirtual || dstResolved.isVirtual) {
@@ -1859,10 +1912,13 @@ export async function copyItems(
   requestContext?: StorageRequestContext,
 ): Promise<void> {
   for (const name of names) {
+    assertItemName(name)
     const srcVirtual = `${srcDir}/${name}`
     const dstVirtual = `${dstDir}/${name}`
     await assertMetaWritable(srcVirtual, requestContext)
     await assertMetaWritable(dstVirtual, requestContext)
+    assertWithinUserRoot(srcVirtual, requestContext)
+    assertWithinUserRoot(dstVirtual, requestContext)
     const srcResolved = await resolvePath(srcVirtual, requestContext?.env)
     const dstResolved = await resolvePath(dstVirtual, requestContext?.env)
     if (srcResolved.isVirtual || dstResolved.isVirtual) {
@@ -1904,6 +1960,7 @@ export async function putItem(
   requestContext?: StorageRequestContext,
 ): Promise<void> {
   await assertMetaWritable(virtualPath, requestContext)
+  assertWithinUserRoot(virtualPath, requestContext)
   const resolved = await resolvePath(virtualPath, requestContext?.env)
   if (resolved.isVirtual) {
     throw new Error("failed get storage: storage not found")

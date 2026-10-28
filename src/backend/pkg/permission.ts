@@ -143,22 +143,45 @@ export function canRemove(user?: UserPermissionObj | null): boolean {
 }
 
 /**
- * 规范化路径段：合并重复斜杠、丢弃 "."，并用栈折叠 ".."。
+ * 规范化路径段：合并重复斜杠、丢弃 "."，并折叠 `..`。
  *
- * 关键点：栈为空时的 ".." 会被**钳制在根**（`stack.pop()` 作用于空数组是
- * 空操作），因此结果永远以 "/" 开头且不含 ".." 段，无法向上逃逸。
+ * 必须与 `resolvePath()` 的寻址视图**完全同源**（C-1/N-3）：早期实现只折叠
+ * 字面 `..`，而 `decodePathFully()` 会把 `%2e%2e`、`...`（3 个及以上点）都
+ * 归一成 `..` 并折叠。于是 containment 判定看到的是「普通段」，真正落盘时却
+ * 上跳一级——受限租户因此可以越出 base_path。
+ *
+ * 现在统一委托 `canonicalVirtualPath()`：多重百分号解码到稳定 + 段折叠，
+ * 栈为空时的 `..` 被钳制在根，结果永远以 "/" 开头且不含 `..` 段。
  */
 export function normalizeSegments(p: string): string {
-  const stack: string[] = []
-  for (const seg of String(p || "").split("/")) {
-    if (!seg || seg === ".") continue
-    if (seg === "..") {
-      stack.pop()
-      continue
-    }
-    stack.push(seg)
-  }
-  return "/" + stack.join("/")
+  return canonicalVirtualPath(p)
+}
+
+/**
+ * 是否为分享虚拟路径（`/@s/{shareId}/...`）。
+ *
+ * 分享路径是**唯一**允许绕过 `base_path` 拼接的命名空间：它由 `resolveShare()`
+ * 负责解析并把子路径钳制在分享根内。其它任何端点都不得把它当作直通存储根的
+ * 快捷方式（N-1：`/@s/../other` 曾可跨租户读写）。
+ */
+export function isSharePath(value: unknown): boolean {
+  const p = String(value ?? "")
+  return p === "/@s" || p.startsWith("/@s/")
+}
+
+/**
+ * 分享路径的规范形式：与 `canonicalVirtualPath()` 同源，但在 `@s` 段处钳制。
+ *
+ * `..`（含 `%2e%2e`、`...`）最多把子路径折叠回分享根，绝不会把 `@s` 段弹掉。
+ * 否则 `/@s/../local/other` 会变成 `/local/other`，从分享命名空间直接落到
+ * 存储根上的任意路径。
+ */
+export function canonicalSharePath(value: string): string {
+  const stack = collapsePathSegments(
+    decodePathFully(String(value || "/@s")),
+    1, // 保留 "@s" 这一段，任何 .. 都弹不动它
+  )
+  return stack.length === 0 ? "/@s" : "/" + stack.join("/")
 }
 
 /**
@@ -175,6 +198,11 @@ export function normalizeSegments(p: string): string {
  * 段折叠，再要求结果不得越过用户自己的根目录（`..`、`%2e%2e`、`%252e%252e` 等写法
  * 在 base_path 处被钳制）。
  *
+ * `/@s` 前缀（分享命名空间）必须由调用方显式声明 `{ share: true }` 才会直通：
+ * 该分支不套用 base_path，若默认生效，任何写端点都能用 `/@s/../other` 落到存储根
+ * 的任意位置（N-1）。未声明时按普通路径段处理，`/@s` 只是 base_path 下的一个
+ * 普通目录名，`..` 仍被钳制在用户根内。
+ *
  * 历史缺陷：本函数只做字符串拼接，`..` 段留给下游 resolvePath() 折叠。于是
  * `/photos/alice` + `/../bob/x` 会解析成 `/photos/bob/x` —— 用户根目录被越过。
  * 因为拼接后才规范化，下游只保证「不逃出存储物理根」，并不保证「不逃出用户
@@ -188,10 +216,12 @@ export function normalizeSegments(p: string): string {
 export function getActualPath(
   user?: UserPermissionObj | null,
   reqPath: string = "/",
+  opts?: { share?: boolean },
 ): string {
   const p = reqPath || "/"
-  if (p.startsWith("/@s")) {
-    return p
+  if (isSharePath(p)) {
+    if (opts?.share) return canonicalSharePath(p)
+    // 非分享端点：不直通。继续走下面的 base_path 拼接，`/@s` 退化为普通段。
   }
 
   let basePath = (user?.base_path || "/").trim()
@@ -224,16 +254,20 @@ export function getActualPath(
 /**
  * 判断某个实际路径是否位于用户根目录之内（含等于根目录本身）。
  *
- * 供网关类入口（S3 / WebDAV）在把请求路径交给存储层之前做二次确认使用：
- * 这些入口直接操作「全局虚拟路径」，不走 getActualPath 的拼接语义，因此需要
- * 一个显式的范围检查，避免受限用户越出 base_path。
+ * 供网关类入口（S3 / WebDAV）与写端点，在把请求路径交给存储层之前做二次确认
+ * 使用：这些入口直接操作「全局虚拟路径」，不走 getActualPath 的拼接语义，
+ * 因此需要一个显式的范围检查，避免受限用户越出 base_path。
+ *
+ * 两侧都必须用 `canonicalVirtualPath()`：`resolvePath()` 定位存储时会把
+ * `%2e%2e`、`...` 一并折叠，若这里只按字面比较，判定「在根内」的字符串在寻址
+ * 时会变成别的目录（C-1/N-3）。
  */
 export function isWithinUserRoot(
   user: UserPermissionObj | null | undefined,
   actualPath: string,
 ): boolean {
-  const root = getActualPath(user, "/")
-  const target = normalizeSegments(actualPath)
+  const root = canonicalVirtualPath(getActualPath(user, "/"))
+  const target = canonicalVirtualPath(actualPath)
   if (root === "/") return true
   return target === root || target.startsWith(root + "/")
 }

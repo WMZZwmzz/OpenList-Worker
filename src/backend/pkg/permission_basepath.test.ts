@@ -1,6 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { getActualPath } from "./permission"
+import { getActualPath, isWithinUserRoot } from "./permission"
 import { decodePathFully } from "./path"
 
 /**
@@ -83,8 +83,31 @@ test("正常路径不再被保留编码形式，而是与存储落点同源", ()
   assert.equal(getActualPath(tenant, "sub"), "/u1/sub")
 })
 
-test("/@s 分享虚拟路径不被 base_path 前缀污染", () => {
-  assert.equal(getActualPath(tenant, "/@s/abc123"), "/@s/abc123")
+test("/@s 只在显式声明 share 时才直通，且不得被 .. 弹出分享命名空间", () => {
+  // 分享端点：保留 /@s 前缀（不套 base_path），但 `..` 最多折叠回分享根，
+  // 绝不会变成 `/other` 这类存储根路径（N-1）。
+  assert.equal(getActualPath(tenant, "/@s/abc123", { share: true }), "/@s/abc123")
+  assert.equal(getActualPath(tenant, "/@s/../other", { share: true }), "/@s/other")
+  assert.equal(
+    getActualPath(tenant, "/@s/%2e%2e/%2e%2e/other", { share: true }),
+    "/@s/other",
+  )
+  assert.equal(getActualPath(tenant, "/@s/.../other", { share: true }), "/@s/other")
+  // 非分享端点：/@s 退化为 base_path 下的普通段，不能直通存储根。
+  assert.equal(getActualPath(tenant, "/@s/abc123"), "/u1/@s/abc123")
+  assert.equal(getActualPath(tenant, "/@s/../other"), "/u1/other")
+})
+
+test("isWithinUserRoot 与寻址同源：... / 多重编码 / 编码分隔符都不得越界", () => {
+  const u = { role: 0, permission: 0, base_path: "/local/u1" } as any
+  assert.equal(isWithinUserRoot(u, "/local/u1/a.txt"), true)
+  assert.equal(isWithinUserRoot(u, "/local/u1"), true)
+  // C-1 / N-3：这些在旧实现里全部返回 true，resolvePath 却落到 /local/u2
+  assert.equal(isWithinUserRoot(u, "/local/u1/../u2/secret.txt"), false)
+  assert.equal(isWithinUserRoot(u, "/local/u1/%2e%2e/u2/secret.txt"), false)
+  assert.equal(isWithinUserRoot(u, "/local/u1/.../u2/secret.txt"), false)
+  assert.equal(isWithinUserRoot(u, "/local/u1/%252e%252e/u2/x"), false)
+  assert.equal(isWithinUserRoot(u, "/local/u2/../u1/ok.txt"), true)
 })
 
 test("深层 base_path 同样只在自己的根内活动", () => {

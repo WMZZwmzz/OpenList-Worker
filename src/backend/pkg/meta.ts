@@ -93,6 +93,23 @@ function fixAndCleanPath(p: string): string {
 }
 
 /**
+ * 目录密码的恒时比较（A-3）。
+ *
+ * `!==` 会在第一个不同字符处短路，逐字符的时序差理论上可用于还原密码。
+ * 分享口令早已用恒时比较（internal/op/share.ts），这里补齐一致性。
+ */
+function timingSafeStringEqual(a: string, b: string): boolean {
+  const left = String(a ?? "")
+  const right = String(b ?? "")
+  if (left.length !== right.length) return false
+  let diff = 0
+  for (let i = 0; i < left.length; i++) {
+    diff |= left.charCodeAt(i) ^ right.charCodeAt(i)
+  }
+  return diff === 0
+}
+
+/**
  * 判断用户能否访问路径（密码 + read_users）。
  * 对齐 Go common.CanAccess (server/common/check.go:57-65)。
  */
@@ -113,7 +130,7 @@ export function canAccess(
     meta.password.trim() !== "" &&
     metaCoversPath(meta.path, path, meta.p_sub)
   ) {
-    if (password !== meta.password) return false
+    if (!timingSafeStringEqual(password, meta.password)) return false
   }
 
   // read_users 白名单：非空 + 覆盖路径 → 用户必须在列表

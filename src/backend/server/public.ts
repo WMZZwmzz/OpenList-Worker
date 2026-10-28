@@ -4,6 +4,7 @@ import {
   getDb,
   getDbLoadError,
   getStoreStatus,
+  isDbSealedReadUntrusted,
   isDbTrusted,
   isEncryptionReady,
   saveDb,
@@ -713,11 +714,11 @@ publicRouter.post("/init/setup", async (c) => {
       400,
     )
   }
-  if (password.length < 4) {
+  if (password.length < 8) {
     return c.json(
       {
         code: 400,
-        message: "password must be at least 4 characters",
+        message: "password must be at least 8 characters",
         data: null,
       },
       400,
@@ -737,6 +738,32 @@ publicRouter.post("/init/setup", async (c) => {
   //      若也一并拒绝，就会出现「读不到 → 不许初始化 → 永远读不到」的死锁，
   //      让全新空存储永远无法安装（issue #62 现象 3）。
   const loadError = getDbLoadError()
+  // D-2：Blob/KV 驱动早期把「读取异常」吞成 null，上层就把它当成「全新空库」，
+  // 于是任何人 POST /init/setup 都能重建管理员并覆盖真实配置。驱动层已改为
+  // 「只有确证 not-found 才返回 null」，这里再把「密文解不开」的半成品状态也
+  // 一并拒掉 —— 两种情形都不允许写回。
+  if (!loadError && isDbSealedReadUntrusted()) {
+    console.error(
+      "[DB] init/setup rejected: database was read but could not be decrypted " +
+        "(encryption key unavailable); refusing to overwrite config",
+    )
+    return c.json(
+      {
+        code: 500,
+        message:
+          "database is not readable; refusing to initialize to avoid overwriting existing config",
+        data: {
+          code: "DB_SEALED_UNREADABLE",
+          summary:
+            "数据库已存在但无法解密（ENCIPHER 密钥不可用或与封存时不一致），拒绝初始化以免覆盖真实配置。",
+          reason: "sealed values present but encryption key unavailable",
+          suggestion:
+            "请恢复与加密数据匹配的 JWT_SECRET / ENCRYPTION_SECRET 后重试。",
+        },
+      },
+      500,
+    )
+  }
   if (loadError) {
     console.error(
       "[DB] init/setup rejected: database could not be loaded from the persistence backend: " +

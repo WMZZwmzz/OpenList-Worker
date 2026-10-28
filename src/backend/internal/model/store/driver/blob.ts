@@ -54,6 +54,31 @@ async function getEdgeOneStore(namespace: string = "default"): Promise<any | nul
   }
 }
 
+/**
+ * 判断异常是否表示「对象不存在」。
+ *
+ * D-2 的关键：`get` 必须区分「确实没有这个 key」与「读取失败」。早期实现对
+ * 所有异常一律 `return null`，上层（map.load → loadDb）就会把**读取故障**
+ * 当成「全新空库」，`/public/init/setup` 于是可以匿名重建管理员并覆盖整库。
+ * 只有明确的 not-found 才算不存在；其余异常必须抛出去，让 loadDb 置
+ * dbLastLoadError。
+ */
+function isNotFoundError(err: any): boolean {
+  const code = String(err?.code ?? err?.name ?? "")
+  const message = String(err?.message ?? err ?? "")
+  const status = Number(err?.status ?? err?.statusCode ?? 0)
+  if (status === 404) return true
+  return /not\s*found|no\s+such\s+(key|object|blob)|NOSUCHKEY|NotFound|404/i.test(
+    `${code} ${message}`,
+  )
+}
+
+function throwReadFailure(platform: string, key: string, err: any): never {
+  const reason = err?.message || String(err)
+  console.error(`[Blob] ${platform} get key="${key}" failed:`, reason)
+  throw new Error(`blob read failed (${platform}, key="${key}"): ${reason}`)
+}
+
 export const blobDriver: Driver = {
   name: "blob",
 
@@ -79,25 +104,25 @@ export const blobDriver: Driver = {
       try {
         const obj = await esaBlob.get(key)
         if (!obj) return null
-        return await obj.text()  // ESA Blob 返回对象，需要 .text()
+        return await obj.text() // ESA Blob 返回对象，需要 .text()
       } catch (err) {
-        console.warn(`[Blob] ESA get key="${key}" failed:`, err)
-        return null
+        if (isNotFoundError(err)) return null
+        throwReadFailure("ESA", key, err)
       }
     }
-    
+
     // 使用 EdgeOne Blob SDK
     const store = await getEdgeOneStore()
     if (!store) throw new Error("Blob not available")
-    
+
     try {
       // EdgeOne SDK 默认 type="text" 返回字符串
       const v = await store.get(key)
       if (v == null) return null
       return typeof v === "string" ? v : JSON.stringify(v)
     } catch (err) {
-      console.warn(`[Blob] EdgeOne get key="${key}" failed:`, err)
-      return null
+      if (isNotFoundError(err)) return null
+      throwReadFailure("EdgeOne", key, err)
     }
   },
 

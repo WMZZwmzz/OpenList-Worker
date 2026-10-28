@@ -360,6 +360,10 @@ export async function verifyUserStaticHash(
 
 /**
  * 校验明文密码（/login、改密旧密码校验、WebDAV Basic Auth 共用）。
+ *
+ * N-2：空口令一律拒绝。`setUserPassword(user, "")` 存下的是「空字符串的双层
+ * 哈希」——一个合法的 64 位 hex，`if (!stored)` 拦不住，于是这类账号能用
+ * 空密码登录全部通道。密码学上「空字符串」永远不是一个有效口令。
  */
 export async function verifyUserPassword(
   user: any,
@@ -367,6 +371,7 @@ export async function verifyUserPassword(
 ): Promise<boolean> {
   const stored = String(user?.password || "").trim()
   if (!stored) return false
+  if (!plain) return false
   return verifyUserStaticHash(user, await staticHash(plain))
 }
 

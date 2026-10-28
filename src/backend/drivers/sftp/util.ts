@@ -96,6 +96,46 @@ export class SFTPClientWrapper {
       keepaliveCountMax: 3,
     }
 
+    // D-7：ssh2 在未提供 hostVerifier 时**接受任意主机密钥**，SFTP 会话可被
+    // 中间人解密/篡改（凭据与文件内容一起暴露）。这里按配置做严格比对：
+    //   - host_key 形如 `SHA256:<base64>` 或公钥 base64 → 必须完全一致；
+    //   - 未配置 → TOFU：接受首次见到的密钥，但把指纹打进日志，便于事后固化。
+    const expectedHostKey = String((this.addition as any).host_key || "").trim()
+    config.hostVerifier = (
+      key: Buffer,
+      verify: (valid: boolean) => void,
+    ): void => {
+      const keyB64 = key.toString("base64")
+      const finish = (fingerprint: string) => {
+        if (!expectedHostKey) {
+          console.warn(
+            `[SFTP] ${host}:${port} host key is not pinned; saw ${fingerprint}. ` +
+              `Set "host_key" to this value to enable strict verification.`,
+          )
+          verify(true)
+          return
+        }
+        verify(
+          expectedHostKey === fingerprint ||
+            expectedHostKey === keyB64 ||
+            expectedHostKey === `SHA256:${keyB64}`,
+        )
+      }
+      // 优先用 WebCrypto 算 SHA256 指纹（Node 18+ 全局可用）。
+      try {
+        const raw = new Uint8Array(key)
+        crypto.subtle
+          .digest("SHA-256", raw)
+          .then((digest) => {
+            const b64 = Buffer.from(new Uint8Array(digest)).toString("base64")
+            finish(`SHA256:${b64.replace(/=+$/, "")}`)
+          })
+          .catch(() => finish(keyB64))
+      } catch {
+        finish(keyB64)
+      }
+    }
+
     if (this.addition.private_key) {
       config.privateKey = this.addition.private_key
       if (this.addition.passphrase) {

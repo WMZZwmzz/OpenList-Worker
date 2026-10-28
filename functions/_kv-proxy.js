@@ -175,8 +175,24 @@ export async function verifyJwt(token, secret) {
   if (!payload) return null
 
   const now = Math.floor(Date.now() / 1000)
-  if (typeof payload.exp === "number" && now >= payload.exp) return null
-  if (typeof payload.nbf === "number" && now < payload.nbf) return null
+  // H-1：exp 缺失或非数字时**必须拒绝**。
+  // 历史实现是 `typeof exp === "number" && now >= exp`，于是 exp:"abc" /
+  // 完全没有 exp 的 token 永不过期 —— 一旦泄漏就是永久管理员凭据。
+  if (typeof payload.exp !== "number" || !Number.isFinite(payload.exp)) {
+    return null
+  }
+  if (now >= payload.exp) return null
+  if (payload.nbf !== undefined) {
+    if (typeof payload.nbf !== "number" || !Number.isFinite(payload.nbf)) {
+      return null
+    }
+    if (now < payload.nbf) return null
+  }
+  // 2FA 待兑换令牌只能用于 /api/auth/otp/login，不得当会话用（与主站一致）。
+  if (payload.type === "otp_pending" || payload.otp_pending === true) return null
+  // iss / aud 若存在必须匹配（兼容历史无该字段的 token，但拒绝错值）。
+  if (payload.iss !== undefined && payload.iss !== "openlist") return null
+  if (payload.aud !== undefined && payload.aud !== "openlist-api") return null
 
   return payload
 }

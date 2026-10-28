@@ -7,6 +7,8 @@ import {
   requireAuthenticatedUser,
 } from "./middlewares"
 import { passwordStampOf } from "../pkg/password"
+import { JWT_AUDIENCE, JWT_ISSUER } from "../pkg/permission"
+import { issueOtpPendingToken } from "./auth"
 
 /**
  * WebAuthn / Passkey 登录。
@@ -363,6 +365,13 @@ async function generateToken(user: any, c: any): Promise<string> {
     id: user.id,
     username: user.username,
     role: user.role,
+    // N-3：补齐与密码登录 / SSO 同一套 claims。
+    //  - iss/aud：同一 JWT_SECRET 被其它服务复用时，缺这两个字段就会互相认账；
+    //  - epoch：findUserByTokenPayload 按 0 比较，用户改密/关 2FA 后
+    //    （token_epoch > 0）Passkey 新签发的令牌会立刻失效，功能不可用。
+    iss: JWT_ISSUER,
+    aud: JWT_AUDIENCE,
+    epoch: Number(user.token_epoch ?? 0) || 0,
     // 密码指纹（对齐 Go PwdTS）：改密后旧令牌立即失效
     pwd_ts: passwordStampOf(user),
     exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 7,
@@ -392,16 +401,18 @@ webauthnRouter.post("/webauthn_begin_login", async (c) => {
   let allowCredentials: { id: string; type: string }[] | undefined
   if (username) {
     const user = (db.users || []).find((u: any) => u.username === username)
-    if (!user) {
-      return c.json({ code: 400, message: "user not found", data: null }, 400)
+    // N-6：用户不存在时不再回 "user not found"（那是一个用户名枚举预言机），
+    // 而是照样返回一份空的 allowCredentials 挑战 —— 与「用户存在但没有
+    // Passkey」的表现完全一致，只有真正持有凭据的人才能继续。
+    if (user) {
+      sd.userId = String(user.id)
+      sd.username = username
+      allowCredentials = getUserCredentials(user).map((cred: any) => ({
+        id: typeof cred.id === "string" ? cred.id : b64urlEncode(new Uint8Array(cred.id)),
+        type: "public-key",
+      }))
+      sd.allowedCredentials = allowCredentials
     }
-    sd.userId = String(user.id)
-    sd.username = username
-    allowCredentials = getUserCredentials(user).map((cred: any) => ({
-      id: typeof cred.id === "string" ? cred.id : b64urlEncode(new Uint8Array(cred.id)),
-      type: "public-key",
-    }))
-    sd.allowedCredentials = allowCredentials
   }
 
   const options: any = {
@@ -558,6 +569,18 @@ webauthnRouter.post("/webauthn_finish_login", async (c) => {
     credential.sign_count = signCount
     await saveDb(db, c.env)
 
+    // D-4：开了 TOTP 的账号不能靠 Passkey 一步拿到完整会话 —— 否则「一把
+    // Passkey」等于绕过了 6 位验证码。与 SSO 一致：只发 5 分钟的待兑换令牌，
+    // 前端拿 otp_required 去 POST /api/auth/otp/login 兑换。
+    if (user.otp_secret) {
+      const pending = await issueOtpPendingToken(user, c)
+      return c.json({
+        code: 200,
+        message: "success",
+        data: { otp_required: true, token: pending },
+      })
+    }
+
     const token = await generateToken(user, c)
     return c.json({ code: 200, message: "success", data: { token } })
   } catch (e: any) {
@@ -587,7 +610,8 @@ webauthnRouter.post("/webauthn_begin_registration", async (c) => {
     userVerification: "preferred",
   }
 
-  const existing = getUserCredentials(user).map((cred: any) => ({
+  const dbUser = (db.users || []).find((u: any) => String(u.id) === String(user.id))
+  const existing = getUserCredentials(dbUser || user).map((cred: any) => ({
     id: typeof cred.id === "string" ? cred.id : b64urlEncode(new Uint8Array(cred.id)),
     type: "public-key",
   }))
@@ -674,9 +698,17 @@ webauthnRouter.post("/webauthn_finish_registration", async (c) => {
       sign_count: signCount,
       created_at: new Date().toISOString(),
     }
-    const webauthnUser = user as any
-    if (!webauthnUser.webauthn_credentials) webauthnUser.webauthn_credentials = []
-    webauthnUser.webauthn_credentials.push(credRecord)
+    // N-3/M-7：必须写回**数据库实体**。requireAuthenticatedUser() 返回的是
+    // resolveUserFromContext() 新建的快照对象，往快照上 push 再 saveDb 保存的
+    // 却是另一个对象 —— 凭据永远不落库，Passkey 登录永远「credential not found」。
+    const dbUser = (db.users || []).find(
+      (u: any) => String(u.id) === String(user.id),
+    )
+    if (!dbUser) {
+      return c.json({ code: 401, message: "Unauthorized", data: null }, 401)
+    }
+    if (!dbUser.webauthn_credentials) dbUser.webauthn_credentials = []
+    dbUser.webauthn_credentials.push(credRecord)
     await saveDb(db, c.env)
 
     return c.json({ code: 200, message: "Registered Successfully", data: null })
@@ -715,7 +747,11 @@ webauthnRouter.get("/getcredentials", async (c) => {
   if (!user || user.disabled) {
     return c.json({ code: 401, message: "Unauthorized", data: null }, 401)
   }
-  const creds = getUserCredentials(user).map((cred: any) => ({
+  // N-3：快照里没有 webauthn_credentials（resolveUserFromContext 只挑必要字段），
+  // 必须回数据库实体读，否则列表恒为空。
+  const db = await getDb(c.env)
+  const dbUser = (db.users || []).find((u: any) => String(u.id) === String(user.id))
+  const creds = getUserCredentials(dbUser || user).map((cred: any) => ({
     id: cred.id,
     fingerprint: cred.aaguid || "",
   }))

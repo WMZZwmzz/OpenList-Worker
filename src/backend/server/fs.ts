@@ -13,7 +13,7 @@ import {
 } from "../internal/op/storage"
 import { resolveShare } from "../internal/op/share"
 import { resolvePath } from "../internal/model/db"
-import { getUserFromContext } from "./middlewares"
+import { getUserFromContext, requireAuthenticatedUser, AUTHED_USER_KEY } from "./middlewares"
 import {
   can,
   canCopy,
@@ -23,6 +23,7 @@ import {
   canWrite,
   getActualPath,
   isAdmin,
+  isSharePath,
   isWithinUserRoot,
   PermissionBit,
 } from "../pkg/permission"
@@ -44,7 +45,11 @@ import {
   needDownloadSign,
 } from "../pkg/sign"
 import { safeErrorMessage } from "../pkg/errs"
-import { encodeDownloadPath } from "../pkg/path"
+import {
+  encodeDownloadPath,
+  decodePathFully,
+  safeDecodeComponent,
+} from "../pkg/path"
 import { search } from "../internal/op/search"
 import {
   getDisableIndex,
@@ -130,7 +135,7 @@ fsRouter.route("/torrent", torrentLegacyRouter)
  * （见 `scheduleStoragePersistence`），业务语义不变。
  */
 let warnedMissingExecutionCtx = false
-const getStorageRequestContext = (c: any) => {
+const getStorageRequestContext = (c: any, explicitUser?: any) => {
   const env = c?.env
   let waitUntil: ((promise: Promise<unknown>) => void) | undefined
   try {
@@ -150,8 +155,19 @@ const getStorageRequestContext = (c: any) => {
         "in the background.",
     )
   }
+  // N-1：请求身份必须进到 op 层，否则 `assertMetaWritable`（目录 write_users
+  // 白名单）拿到的是 undefined，直接 `if (!user) return` 放行，整道门禁成为死代码。
+  // 身份由 getUserFromContext() 在解析后写入 context；此处做兜底读取。
+  let user: any = explicitUser ?? null
+  if (!user) {
+    try {
+      user = c?.get?.(AUTHED_USER_KEY) ?? null
+    } catch {
+      user = null
+    }
+  }
   if (!env && !waitUntil) return undefined
-  return { ...(waitUntil ? { waitUntil } : {}), env }
+  return { ...(waitUntil ? { waitUntil } : {}), env, user }
 }
 
 // ---- 写操作权限校验 ----
@@ -160,6 +176,15 @@ const getStorageRequestContext = (c: any) => {
 // 的安全漏洞，同时让 /fs/list 的 write 字段如实反映请求者身份。
 const permissionDenied = (c: any) =>
   c.json({ code: 403, message: "Permission denied", data: null }, 403)
+
+/** 读取正整数环境变量（env 绑定优先，其次 process.env），非法值回落到默认。 */
+function parsePositiveIntEnv(c: any, key: string, fallback: number): number {
+  const raw =
+    c?.env?.[key] ??
+    (typeof process !== "undefined" ? process.env?.[key] : undefined)
+  const value = Number(raw)
+  return Number.isSafeInteger(value) && value > 0 ? value : fallback
+}
 
 /**
  * 目录级写权限（meta.write_users）的**执行点**。
@@ -224,16 +249,21 @@ async function deniedByMetaReadAcl(
  * 历史缺陷：条目名只做了反斜杠转换，`../bob/x` 与目标目录拼接后会被
  * resolvePath 归一化，从而把文件写到解压目录（乃至用户根）之外。
  *
- * 返回 null 表示该条目应被跳过（绝对路径 / 盘符 / 含 `..` / 空）。
+ * C-2：判定必须与寻址同源 —— `resolvePath` 会对拼接后的路径做多重百分号解码，
+ * 所以 `%2e%2e%2f` 在字面视图里是普通文件名、落盘时却是 `../`。这里先
+ * `decodePathFully`（含 `...` → `..`、`%2f` → `/`）再逐段拒绝。
+ *
+ * 返回 null 表示该条目应被跳过（绝对路径 / 盘符 / 含父目录段 / 空）。
  */
 function safeArchiveEntryPath(rel: string): string | null {
-  const cleaned = String(rel || "")
+  const cleaned = decodePathFully(String(rel || ""))
     .replace(/\\/g, "/")
     .replace(/^\/+/, "")
   if (!cleaned || cleaned.includes("\0")) return null
   if (/^[A-Za-z]:/.test(cleaned)) return null
   const parts = cleaned.split("/").filter(Boolean)
   if (parts.length === 0) return null
+  // decodePathFully 已把 3 个及以上点归一为 ".."，这里只需拒绝 "." 与 ".."。
   if (parts.some((p) => p === "." || p === "..")) return null
   return parts.join("/")
 }
@@ -267,7 +297,7 @@ fsRouter.post("/dirs", async (c) => {
   const body = await c.req.json().catch(() => ({}))
   const user = await getUserFromContext(c)
   const rawPath = body.path || "/"
-  const isShare = rawPath.startsWith("/@s")
+  const isShare = isSharePath(rawPath)
   if (!isShare && (!user || user.disabled)) {
     return c.json({ code: 401, message: "Unauthorized", data: null }, 401)
   }
@@ -278,7 +308,9 @@ fsRouter.post("/dirs", async (c) => {
   }
   let reqPath = rawPath
   if (!body.force_root) {
-    reqPath = getActualPath(user, reqPath)
+    // 只有分享端点声明 share: true；否则 /@s 会被当成普通段并套用 base_path，
+    // 避免「直通存储根」成为跨租户入口（N-1）。
+    reqPath = getActualPath(user, reqPath, { share: isShare })
   }
   if (body.refresh) {
     try {
@@ -373,12 +405,12 @@ fsRouter.post("/dirs", async (c) => {
 fsRouter.post("/list", async (c) => {
   const body = await c.req.json().catch(() => ({}))
   const user = await getUserFromContext(c)
-  const isShare = (body.path || "/").startsWith("/@s")
+  const isShare = isSharePath(body.path || "/")
   if (!isShare && (!user || user.disabled)) {
     return c.json({ code: 401, message: "Unauthorized", data: null }, 401)
   }
   const requestContext = getStorageRequestContext(c)
-  const reqPath = getActualPath(user, body.path || "/")
+  const reqPath = getActualPath(user, body.path || "/", { share: isShare })
   const page = parseInt(body.page, 10) || 1
   const perPage = parseInt(body.per_page, 10) || 0
 
@@ -693,12 +725,12 @@ fsRouter.post("/list", async (c) => {
 fsRouter.post("/get", async (c) => {
   const body = await c.req.json().catch(() => ({}))
   const user = await getUserFromContext(c)
-  const isShare = (body.path || "/").startsWith("/@s")
+  const isShare = isSharePath(body.path || "/")
   if (!isShare && (!user || user.disabled)) {
     return c.json({ code: 401, message: "Unauthorized", data: null }, 401)
   }
   const requestContext = getStorageRequestContext(c)
-  const reqPath = getActualPath(user, body.path || "/")
+  const reqPath = getActualPath(user, body.path || "/", { share: isShare })
   try {
     // Share path: /@s/{shareId}/...
     if (reqPath.startsWith("/@s")) {
@@ -836,9 +868,15 @@ fsRouter.post("/get", async (c) => {
           ? item.name.slice(0, item.name.lastIndexOf("."))
           : item.name
         const { content: siblings } = await listItems(parentPath, requestContext)
+        // N-5：related 直接列同目录同前缀文件，绕过了 /fs/list 的 hide 过滤，
+        // 会把 meta.hide 命中的文件名泄露给任何能读该目录的人。
+        const parentMeta = await getNearestMeta(parentPath, c.env).catch(
+          () => null,
+        )
         related = siblings
           .filter((s: any) => {
             if (s.name === item.name || s.is_dir) return false
+            if (isHidden(parentMeta, parentPath, s.name)) return false
             const sStem = s.name.includes(".")
               ? s.name.slice(0, s.name.lastIndexOf("."))
               : s.name
@@ -886,17 +924,30 @@ fsRouter.post("/get", async (c) => {
   }
 })
 
+/**
+ * 文件名校验（单段约束）。
+ *
+ * 安全不变量：name 会被 op 层直接拼成 `dir + "/" + name`，再交给 `resolvePath()`
+ * ——而 resolvePath 会做**多重百分号解码**后才折叠路径段。只检查字面分隔符等于
+ * 放行 `%2e%2e%2f`（D-1）：判定时是一个普通文件名，落盘时却成了 `../`。
+ * 因此必须先按同一套解码规则（`decodePathFully`）把输入还原，再在还原结果上
+ * 检查分隔符与父目录段。
+ *
+ * 合法文件名不可能包含 `/`、`\`、NUL，也不可能整体是 `.`/`..`（含 `...`），
+ * 所以在解码视图上做这几条拒绝不会误伤正常文件。
+ */
 function validateFileName(name: any): string {
   if (typeof name !== "string" || !name.trim()) {
     throw new Error("Invalid or empty file name")
   }
   const clean = name.trim()
+  const decoded = decodePathFully(clean)
   if (
-    clean === "." ||
-    clean === ".." ||
-    clean.includes("/") ||
-    clean.includes("\\") ||
-    clean.includes("\0")
+    decoded === "." ||
+    /^\.+$/.test(decoded) ||
+    decoded.includes("/") ||
+    decoded.includes("\\") ||
+    decoded.includes("\0")
   ) {
     throw new Error(`Illegal file name '${clean}'`)
   }
@@ -1083,7 +1134,20 @@ fsRouter.post("/copy", async (c) => {
 fsRouter.put("/put", async (c) => {
   const user = await getUserFromContext(c)
   if (!canWrite(user)) return permissionDenied(c)
-  const rawPath = decodeURIComponent(c.req.header("File-Path") || "")
+  // L-5：畸形百分号编码（如 "100%.txt"）会让 decodeURIComponent 抛 URIError，
+  // 冒泡到路由层就是 500 + 堆栈。统一走安全解码并回 400。
+  const decodedPath = safeDecodeComponent(c.req.header("File-Path") || "")
+  if (decodedPath === null) {
+    return c.json(
+      {
+        code: 400,
+        message: "File-Path contains malformed percent-encoding",
+        data: null,
+      },
+      400,
+    )
+  }
+  const rawPath = decodedPath
   if (!rawPath.trim()) {
     return c.json(
       { code: 400, message: "Missing File-Path header", data: null },
@@ -1111,7 +1175,20 @@ fsRouter.put("/put", async (c) => {
 fsRouter.put("/form", async (c) => {
   const user = await getUserFromContext(c)
   if (!canWrite(user)) return permissionDenied(c)
-  const rawPath = decodeURIComponent(c.req.header("File-Path") || "")
+  // L-5：畸形百分号编码（如 "100%.txt"）会让 decodeURIComponent 抛 URIError，
+  // 冒泡到路由层就是 500 + 堆栈。统一走安全解码并回 400。
+  const decodedPath = safeDecodeComponent(c.req.header("File-Path") || "")
+  if (decodedPath === null) {
+    return c.json(
+      {
+        code: 400,
+        message: "File-Path contains malformed percent-encoding",
+        data: null,
+      },
+      400,
+    )
+  }
+  const rawPath = decodedPath
   if (!rawPath.trim()) {
     return c.json(
       { code: 400, message: "Missing File-Path header", data: null },
@@ -1173,12 +1250,25 @@ fsRouter.post("/add_offline_download", async (c) => {
 })
 
 fsRouter.post("/search", async (c) => {
-  const user = await getUserFromContext(c)
+  // N-4：递归搜索会按 depth×目录数打满上游网盘配额，不能吃 allow_guest 的
+  // guest 兜底（匿名即可触发全树遍历）。只接受真实凭据。
+  const user = await requireAuthenticatedUser(c)
   if (!user || user.disabled) {
     return c.json({ code: 401, message: "Unauthorized", data: null }, 401)
   }
   const body = await c.req.json().catch(() => ({}))
   const parentPath = getActualPath(user, body.parent || "/")
+  // N-5/M-4：search 不经过 /fs/list 的 hide 过滤，必须由调用方补齐，
+  // 否则被 meta.hide 隐藏的文件名会原样出现在结果里。
+  const metaCache = new Map<string, Meta | null>()
+  const isVisible = async (parent: string, item: any) => {
+    let meta = metaCache.get(parent)
+    if (meta === undefined) {
+      meta = await getNearestMeta(parent, c.env).catch(() => null)
+      metaCache.set(parent, meta)
+    }
+    return !isHidden(meta, parent, item.name)
+  }
   try {
     const result = await search(
       {
@@ -1191,6 +1281,7 @@ fsRouter.post("/search", async (c) => {
         // 对齐 Go handles.Search 里 SearchFiltered 的 filter 闭包
         user,
         password: body.password || "",
+        isVisible,
       },
       c.env,
     )
@@ -1199,6 +1290,18 @@ fsRouter.post("/search", async (c) => {
     return c.json({ code: 500, message: safeErrorMessage(e), data: null }, 500)
   }
 })
+
+/**
+ * `/fs/other` 允许透传给驱动的方法名白名单（S-5）。
+ *
+ * `method` 是用户可控字符串，驱动内部按方法名分发特权操作（S3/R2 用它签发
+ * 直传 URL）。只在 API 层放行已知方法，避免未来某个驱动新增分支后，`/fs/other`
+ * 立刻变成一条未经审计的越权入口。
+ */
+const OTHER_METHOD_ALLOWLIST = new Set([
+  "direct_upload",
+  "get_direct_upload_info",
+])
 
 fsRouter.post("/other", async (c) => {
   const user = await getUserFromContext(c)
@@ -1211,6 +1314,12 @@ fsRouter.post("/other", async (c) => {
   if (!method) {
     return c.json(
       { code: 400, message: "Missing required parameter 'method'", data: null },
+      400,
+    )
+  }
+  if (!OTHER_METHOD_ALLOWLIST.has(String(method))) {
+    return c.json(
+      { code: 400, message: `Unsupported method '${method}'`, data: null },
       400,
     )
   }
@@ -1280,19 +1389,33 @@ fsRouter.post("/batch_rename", async (c) => {
   }
   const dirPath = getActualPath(user, src_dir || "/")
   const requestContext = getStorageRequestContext(c)
+  // N-2：src_name 与 new_name 都必须是**单段文件名**。
+  // 历史缺陷：只校验 new_name，src_name 原样拼成 `${dir}/${src_name}`，
+  // 于是 `"../u2/secret.txt"` 会把改名操作落到别的租户目录里。
+  const pairs: { srcName: string; newName: string }[] = []
   try {
-    const aclPaths = rename_objects
-      .map((obj: any) => obj?.src_name)
-      .filter((n: any) => typeof n === "string" && n)
-      .map((n: string) => `${dirPath}/${n}`.replace(/\/{2,}/g, "/"))
+    for (const obj of rename_objects) {
+      const rawSrc = obj?.src_name
+      const rawNew = obj?.new_name
+      if (!rawSrc || !rawNew) continue
+      pairs.push({
+        srcName: validateFileName(rawSrc),
+        newName: validateFileName(rawNew),
+      })
+    }
+  } catch (e: any) {
+    return c.json({ code: 400, message: safeErrorMessage(e), data: null }, 400)
+  }
+  try {
+    const aclPaths = pairs.map(({ srcName }) =>
+      `${dirPath}/${srcName}`.replace(/\/{2,}/g, "/"),
+    )
     if (await deniedByMetaWriteAcl(c, user, aclPaths))
       return permissionDenied(c)
-    for (const obj of rename_objects) {
-      const srcName = obj?.src_name
-      const newName = obj?.new_name
-      if (!srcName || !newName) continue
-      validateFileName(newName)
+    for (const { srcName, newName } of pairs) {
       const fullPath = `${dirPath}/${srcName}`.replace(/\/{2,}/g, "/")
+      // 第二道防线：srcName 已限定为单段，拼出来的路径必然是 dirPath 的直接子项。
+      if (!isWithinUserRoot(user, fullPath)) return permissionDenied(c)
       await renameItem(fullPath, newName, requestContext)
     }
     return c.json({ code: 200, message: "success", data: null })
@@ -1606,7 +1729,20 @@ fsRouter.post("/multipart/init", async (c) => {
   const user = await getUserFromContext(c)
   if (!user || !canWrite(user)) return permissionDenied(c)
 
-  const rawPath = decodeURIComponent(c.req.header("File-Path") || "")
+  // L-5：畸形百分号编码（如 "100%.txt"）会让 decodeURIComponent 抛 URIError，
+  // 冒泡到路由层就是 500 + 堆栈。统一走安全解码并回 400。
+  const decodedPath = safeDecodeComponent(c.req.header("File-Path") || "")
+  if (decodedPath === null) {
+    return c.json(
+      {
+        code: 400,
+        message: "File-Path contains malformed percent-encoding",
+        data: null,
+      },
+      400,
+    )
+  }
+  const rawPath = decodedPath
   const size = parseInt(c.req.header("X-File-Size") || "0", 10)
   const rawChunk = parseInt(c.req.header("X-Chunk-Size") || "0", 10)
   const md5 = c.req.header("X-File-Md5") || ""
@@ -1616,6 +1752,12 @@ fsRouter.post("/multipart/init", async (c) => {
       { code: 400, message: "Missing File-Path / X-File-Size header", data: null },
       400,
     )
+  }
+  // D-15：先前只在 chunk/complete 阶段校验上限，init 先建会话再失败也会占住
+  // 会话与配额；这里按同一个 MAX_UPLOAD 提前拒绝。
+  const maxUpload = getUploadSizeLimit(c, false)
+  if (size > maxUpload) {
+    return tooLargeResponse(c, maxUpload)
   }
 
   const { dir, name } = splitUploadPath(rawPath)
@@ -1899,7 +2041,46 @@ async function fetchArchiveBytes(
     trustedHosts,
   )
   if (!resp.ok) throw new Error(`archive download failed: HTTP ${resp.status}`)
-  return await resp.arrayBuffer()
+  // R-1：这是服务端主动拉取的远端文件，不是请求体，`jsonBodyGuard` 那几处上限
+  // 覆盖不到。整包 arrayBuffer() 会让单个归档把 Worker 内存打爆，必须流式读并
+  // 在累计超限时中止。
+  const maxBytes = parsePositiveIntEnv(
+    c,
+    "ARCHIVE_MAX_BYTES",
+    256 * 1024 * 1024,
+  )
+  const declared = Number(resp.headers.get("content-length") || 0)
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    throw new Error(`archive exceeds the ${maxBytes} byte limit`)
+  }
+  if (!resp.body) {
+    const buf = await resp.arrayBuffer()
+    if (buf.byteLength > maxBytes) {
+      throw new Error(`archive exceeds the ${maxBytes} byte limit`)
+    }
+    return buf
+  }
+  const reader = resp.body.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    if (!value) continue
+    total += value.byteLength
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => {})
+      throw new Error(`archive exceeds the ${maxBytes} byte limit`)
+    }
+    chunks.push(value)
+  }
+  const out = new Uint8Array(total)
+  let offset = 0
+  for (const chunk of chunks) {
+    out.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return out.buffer as ArrayBuffer
 }
 
 /** 将扁平条目构建为树形结构（对齐 Go ArchiveContentResp） */
@@ -2094,6 +2275,14 @@ fsRouter.post("/archive/decompress", async (c) => {
   }
   try {
     let count = 0
+    // D-15：解压必须有总量预算，否则单个 zip bomb 就能打满 CPU/内存/配额。
+    const maxEntries = parsePositiveIntEnv(c, "ARCHIVE_MAX_ENTRIES", 10000)
+    const maxTotalBytes = parsePositiveIntEnv(
+      c,
+      "ARCHIVE_MAX_TOTAL_BYTES",
+      512 * 1024 * 1024,
+    )
+    let totalBytes = 0
     // 目标目录必须落在**调用者自己的根目录**之内。
     // 历史缺陷：dst_dir 被当作全局虚拟路径直接拼接，既未套用 base_path，
     // 也未做角色范围校验，受限用户可写到任意目录。
@@ -2107,6 +2296,15 @@ fsRouter.post("/archive/decompress", async (c) => {
       if (!fmtDecomp || !isNativelySupported(fmtDecomp)) {
         return c.json({ code: 400, message: `unsupported archive format: ${name} (only ZIP is supported)`, data: null }, 400)
       }
+      // M-2：源归档同样要过租户根 + 读权限（密码 / read_users），
+      // 否则「读不到的文件」可以通过解压接口读出内容。
+      const actualSrc = getActualPath(user, srcPath)
+      if (!isWithinUserRoot(user, actualSrc)) return permissionDenied(c)
+      if (
+        await deniedByMetaReadAcl(c, user, actualSrc, String(body.password || ""))
+      ) {
+        return permissionDenied(c)
+      }
       const bytes = await fetchArchiveBytes(c, user, srcPath)
       const archive = parseZip(bytes)
       const prefix = innerPath ? innerPath.replace(/^\/+|\/+$/g, "") + "/" : ""
@@ -2114,6 +2312,19 @@ fsRouter.post("/archive/decompress", async (c) => {
         if (prefix && !entry.name.startsWith(prefix)) continue
         const rel = prefix ? entry.name.slice(prefix.length) : entry.name
         if (!rel || rel.endsWith("/")) continue
+        if (count >= maxEntries) {
+          return c.json(
+            { code: 400, message: `archive has too many entries (limit ${maxEntries})`, data: null },
+            400,
+          )
+        }
+        totalBytes += Number(entry.size) || 0
+        if (totalBytes > maxTotalBytes) {
+          return c.json(
+            { code: 400, message: `archive expands beyond the ${maxTotalBytes} byte limit`, data: null },
+            400,
+          )
+        }
         // zip-slip 防护：条目名视为「只能向下展开的相对路径」
         const safeRel = safeArchiveEntryPath(rel)
         if (!safeRel) {
