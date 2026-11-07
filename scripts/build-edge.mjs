@@ -60,11 +60,13 @@ const NODE_BUILTINS = [
  *
  * 原因：sftp 驱动依赖 ssh2（需 crypto/net/http/https/tls 等 Node 内置模块以及 cpufeatures.node / sshcrypto.node 原生二进制），
  * ftp 驱动依赖 node:net / iconv-lite。
- * EdgeOne / ESA / Cloudflare Workers 等平台部署时会对其云函数进行二次打包（例如 EdgeOne CLI 的 buildProdMode），
+ * ESA（以及需要二次打包的边缘产物）部署时会对其云函数进行二次打包（例如 EdgeOne CLI 的 buildProdMode），
  * 由于平台打包器未配置针对原生 ".node" 二进制文件的 loader，一旦引用了 ssh2 / cpu-features 就会直接抛出：
  * "No loader is configured for '.node' files: .../cpufeatures.node" 并导致部署失败。
  *
- * 此插件在打包阶段把 sftp/ftp 驱动及 ssh2 模块替换为空壳桩模块，确保产物完全不包含对原生 .node 文件的间接依赖。
+ * 因此该插件【只能用于边缘运行时（ESA 浏览器构建）】。dist-server（npm start 自托管）
+ * 与 EdgeOne Node 云函数（node22）都是完整 Node 运行时，必须保留真实驱动，
+ * 否则 SFTP/FTP 会抛出与事实相反的「requires full Node.js runtime」错误（audit F-124）。
  */
 const emptyNodeDriverPlugin = {
   name: "empty-node-driver",
@@ -149,7 +151,34 @@ const nodeShimPlugin = {
   },
 }
 
+/**
+ * EdgeOne 定时调度只能用 payload 携带 cron_secret，而真实密钥绝不能入库。
+ * edgeone.json 里保留的是占位符 __REPLACE_WITH_CRON_SECRET__：未替换时后端
+ * matchCronSecret 一定拒绝（fail-closed，调度请求 401）。部署者要启用定时
+ * token 刷新，需把该 payload 改成与 CRON_SECRET 环境变量相同的值。
+ * 这里在构建期显式提示，避免配置看起来「已经能用」的假象。
+ */
+function warnEdgeOneCronPlaceholder() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync("edgeone.json", "utf-8"))
+    const pending = (cfg.schedules || []).some((s) => {
+      const v = s?.payload?.cron_secret
+      return v === "" || v === "__REPLACE_WITH_CRON_SECRET__"
+    })
+    if (pending) {
+      console.warn(
+        "[EdgeOne] schedules[].payload.cron_secret 仍是占位符：定时 token 刷新会被 " +
+          "后端拒绝（fail-closed，401）。如需启用，请填入与 CRON_SECRET 环境变量相同的值" +
+          "（不要提交真实密钥）。",
+      )
+    }
+  } catch {
+    /* edgeone.json 不存在或无效（其他平台构建）时忽略 */
+  }
+}
+
 async function build() {
+  warnEdgeOneCronPlaceholder()
   await esbuild.build({
     entryPoints: ["api/[...route].ts"],
     bundle: true,
@@ -174,7 +203,8 @@ async function build() {
       ...NODE_BUILTINS,
     ],
     loader: { ".node": "empty" },
-    plugins: [emptyNodeDriverPlugin],
+    // 不要在这里加 emptyNodeDriverPlugin：dist-server 由 Node 直接运行，
+    // 真实 sftp/ftp 驱动必须保留（ssh2 已 external，运行时由 node_modules 提供）。
   })
 
   // EdgeOne Makers 的 Node 云函数入口。产物按平台约定落在项目根
@@ -191,7 +221,9 @@ async function build() {
     external: ["ssh2", "cpu-features", "iconv-lite", "mysql2"],
     // 内联 dist/index.html 作为 SPA 兜底壳（需在 vite build 之后运行）
     loader: { ".html": "text", ".node": "empty" },
-    plugins: [emptyNodeDriverPlugin, normalizeHtmlEolPlugin],
+    // EdgeOne Node 云函数是完整 Node 运行时（node22），同样不应用 empty-node-driver
+    // 桩：否则 SFTP/FTP 在本可用的环境里被替换成抛错桩（audit F-124）。
+    plugins: [normalizeHtmlEolPlugin],
   })
 
   // EdgeOne Pages 官方约定的 Node Functions 目录是 node-functions/（平台

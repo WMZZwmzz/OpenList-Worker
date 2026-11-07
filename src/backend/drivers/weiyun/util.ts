@@ -286,6 +286,19 @@ export class WeiyunClient {
     const tokenInfo = this.parseTokenInfo()
     const wyctoken = this.cookies.get("wyctoken") || ""
 
+    // g_tk 是 URL 查询参数（不是请求头）：403 重试时必须用刷新后的
+    // wyctoken 重建 URL，否则重试仍带旧 g_tk，刷新 cookie 的工作白费。
+    const buildUrl = (tk: string): string => {
+      const qs = `g_tk=${encodeURIComponent(tk)}&cmd=${cmd}`
+      if (protocol === "preUpload") {
+        return `https://www.weiyun.com/api/v3/ftn_pre_upload?${qs}`
+      }
+      if (protocol === "upload") {
+        return `https://upload.weiyun.com/ftnup_v2/weiyun?${qs}`
+      }
+      return `https://www.weiyun.com/webapp/json/${protocol}/${cmdName}?${qs}`
+    }
+
     let url = ""
     let body: any
     const headers: Record<string, string> = {
@@ -296,11 +309,11 @@ export class WeiyunClient {
     }
 
     if (protocol === "preUpload") {
-      url = `https://www.weiyun.com/api/v3/ftn_pre_upload?g_tk=${encodeURIComponent(wyctoken)}&cmd=${cmd}`
+      url = buildUrl(wyctoken)
       body = JSON.stringify(this.newUploadJson(cmdName, cmd, data))
       headers["Content-Type"] = "application/json; charset=UTF-8"
     } else if (protocol === "upload") {
-      url = `https://upload.weiyun.com/ftnup_v2/weiyun?g_tk=${encodeURIComponent(wyctoken)}&cmd=${cmd}`
+      url = buildUrl(wyctoken)
       // Manually build multipart/form-data with exact field order
       const boundary = "----WebKitFormBoundaryIifrOqiswelC8nfe"
       headers["Content-Type"] = `multipart/form-data; boundary=${boundary}`
@@ -337,7 +350,7 @@ export class WeiyunClient {
 
       body = fullBuffer
     } else {
-      url = `https://www.weiyun.com/webapp/json/${protocol}/${cmdName}?g_tk=${encodeURIComponent(wyctoken)}&cmd=${cmd}`
+      url = buildUrl(wyctoken)
       body = JSON.stringify({
         req_header: JSON.stringify(this.newHeader(cmd, tokenInfo)),
         req_body: JSON.stringify(this.newBody(cmdName, data, tokenInfo)),
@@ -364,7 +377,8 @@ export class WeiyunClient {
           await this.refreshCtoken()
         }
         headers.Cookie = this.getCookieStr()
-        headers["g_tk"] = this.cookies.get("wyctoken") || ""
+        // 用刷新后的 wyctoken 重建 URL（g_tk 只从查询参数生效）
+        url = buildUrl(this.cookies.get("wyctoken") || "")
         resp = await fetch(url, { method: "POST", headers, body })
         this.updateCookiesFromHeaders(resp.headers)
       } catch (err: any) {
@@ -552,10 +566,44 @@ export class WeiyunClient {
     dirKey: string,
     fileName: string,
     fileSize: number,
-    content: Uint8Array | Buffer,
+    content: Uint8Array | Buffer | undefined,
     channelCount = 4,
     fileExistOption = 1,
+    options: { omitHash?: boolean } = {},
   ): Promise<PreUploadData> {
+    // F-166：分片会话（createUploadSession）在 init 阶段拿不到文件真实字节，
+    // 绝不能再用「空内容 + 真实 file_size」伪造块哈希（那会让 check_sha /
+    // check_data / file_sha 全部按 0 字节计算并与声明大小自相矛盾）。
+    // 这里走「无哈希上传」格式：只声明真实大小，不携带任何块哈希。
+    if (options.omitHash) {
+      const reqData = {
+        common_upload_req: {
+          ppdir_key: pdirKey,
+          pdir_key: dirKey,
+          file_size: fileSize,
+          filename: fileName,
+          file_exist_option: fileExistOption,
+          use_mutil_channel: true,
+        },
+        upload_scr: 0,
+        channel_count: channelCount,
+        block_size: 1024 * 1024,
+        check_sha: "",
+        check_data: "",
+        block_info_list: [] as { sha: string; offset: number; size: number }[],
+      }
+      const res: PreUploadData = await this.request(
+        "preUpload",
+        "PreUpload",
+        247120,
+        reqData,
+      )
+      return res
+    }
+
+    if (!content) {
+      throw new Error("[WeiYun] preUpload 需要文件内容以计算块哈希")
+    }
     const blockSize = 1024 * 1024
     let beforeBlockSize = 0
     let lastBlockSize = fileSize

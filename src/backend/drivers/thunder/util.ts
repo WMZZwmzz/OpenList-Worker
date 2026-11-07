@@ -52,28 +52,33 @@ export function generateDeviceSign(
   return `div101.${deviceID}${md5Result}`
 }
 
-export function calcGcid(data: Buffer | Uint8Array): string {
+export async function calcGcid(data: Buffer | Uint8Array): Promise<string> {
   const size = data.length
   let psize = 0x40000 // 256KB
   while (size / psize > 0x200 && psize < 0x200000) {
     psize = psize << 1
   }
 
-  const chunkDigests: CryptoJS.lib.WordArray[] = []
+  // F-287：改用 WebCrypto 的原生 SHA-1（Workers/Node18+/ESA 均可用）。
+  // 旧的 CryptoJS.SHA1 是纯 JS 实现，吞吐仅几 MB/s，大文件上传会直接
+  // 打爆 Workers 的 CPU 限额。
+  const chunkDigests: Uint8Array[] = []
   for (let offset = 0; offset < size; offset += psize) {
     const chunk = data.subarray(offset, Math.min(offset + psize, size))
-    const chunkWordArray = CryptoJS.lib.WordArray.create(chunk as any)
-    const chunkSha1 = CryptoJS.SHA1(chunkWordArray)
-    chunkDigests.push(chunkSha1)
+    // 传副本：subtle.digest 需要独立的 ArrayBuffer/TypedArray
+    const digest = await crypto.subtle.digest("SHA-1", chunk.slice() as any)
+    chunkDigests.push(new Uint8Array(digest))
   }
 
-  // Concatenate all SHA1 digests
-  const combined = CryptoJS.lib.WordArray.create()
-  for (const d of chunkDigests) {
-    combined.concat(d)
-  }
+  const combined = new Uint8Array(chunkDigests.length * 20)
+  chunkDigests.forEach((digest, i) => combined.set(digest, i * 20))
 
-  return CryptoJS.SHA1(combined).toString(CryptoJS.enc.Hex)
+  const finalDigest = new Uint8Array(
+    await crypto.subtle.digest("SHA-1", combined as any),
+  )
+  return Array.from(finalDigest)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("")
 }
 
 export interface ThunderClientOptions {
@@ -101,6 +106,8 @@ export class ThunderClient {
   public coreLoginResp: ThunderCoreLoginResp | null = null
   public captchaToken: string = ""
   public creditKey: string = ""
+  /** F-281：进行中的刷新 Promise（singleflight） */
+  private refreshInFlight: Promise<ThunderTokenResp> | null = null
 
   constructor(options: ThunderClientOptions) {
     this.options = options
@@ -275,6 +282,25 @@ export class ThunderClient {
       throw this.formatReviewData(data as ThunderLoginReviewResp)
     }
 
+    // F-283：JSON 分支同样要检查 HTTP 状态码。网关/限流组件常返回
+    // 502/429 + JSON 错误体（如 {"message":"rate limited"}），这类响应没有
+    // error_code 字段，若当作成功数据返回会被静默处理（list 变空目录）。
+    // 例外：带非 0 error_code 的响应交给 authRequest 处理（4122/10/16 需刷新令牌）。
+    if (!res.ok) {
+      const errCode = data?.error_code
+      const handledByAuth = typeof errCode === "number" && errCode !== 0
+      if (!handledByAuth) {
+        const reason =
+          data?.error_description ||
+          data?.error ||
+          data?.message ||
+          text
+        throw new Error(
+          `${res.status} ${res.statusText}: ${String(reason).slice(0, 300)}`,
+        )
+      }
+    }
+
     return data as T
   }
 
@@ -285,6 +311,7 @@ export class ThunderClient {
       body?: any
       headers?: Record<string, string>
     } = {},
+    retry: number = 0,
   ): Promise<T> {
     if (!this.tokenResp?.access_token) {
       throw new Error("empty token")
@@ -308,24 +335,31 @@ export class ThunderClient {
       errCode === 10 ||
       errCode === 16
     ) {
-      // Access token expired, try to refresh
+      // Access token expired, try to refresh.
+      // F-282：只自动刷新/重试一次，避免上游持续返回同一错误码时无界递归。
+      if (retry >= 1) {
+        throw new Error(
+          `Token expired error ${errCode} (still failing after token refresh)`,
+        )
+      }
       if (this.tokenResp?.refresh_token) {
-        const refreshed = await this.refreshToken(this.tokenResp.refresh_token)
-        this.tokenResp = refreshed
-        if (this.options.onPersistToken) {
-          await this.options.onPersistToken(refreshed)
-        }
-        return this.authRequest<T>(url, options)
+        // F-281：refreshToken 内部已完成校验 + 持久化（且已 singleflight）
+        this.tokenResp = await this.refreshToken(this.tokenResp.refresh_token)
+        return this.authRequest<T>(url, options, retry + 1)
       }
       throw new Error(`Token expired error ${errCode}`)
     } else if (errCode === 9) {
       // Captcha token expired
+      // F-282：captcha 刷新同样只重试一次
+      if (retry >= 1) {
+        throw new Error("Captcha error 9 (still failing after captcha refresh)")
+      }
       const action = getAction(options.method || "GET", url)
       await this.refreshCaptchaTokenAtLogin(
         action,
         this.tokenResp.user_id || "",
       )
-      return this.authRequest<T>(url, options)
+      return this.authRequest<T>(url, options, retry + 1)
     } else if (errCode !== 0 || (data.error && data.error !== "success")) {
       throw new Error(
         `ErrorCode: ${data.error_code || 0}, Error: ${data.error || ""}, ErrorDescription: ${data.error_description || ""}`,
@@ -375,6 +409,14 @@ export class ThunderClient {
         "user-agent": "android-ok-http-client/xl-acc-sdk/version-5.0.12.512000",
       },
     })
+    // F-284：登录响应必须校验，否则密码错误/需要验证时 sessionID 为
+    // undefined，会把 undefined 的 signin_token 发出去并被 JSON.stringify 丢弃。
+    const anyRes = res as any
+    if (!res?.sessionID) {
+      throw new Error(
+        `Login failed: error_code=${anyRes?.error_code ?? ""}, error=${anyRes?.error ?? ""}, error_description=${anyRes?.error_description ?? ""}`,
+      )
+    }
     this.coreLoginResp = res
     return res
   }
@@ -389,15 +431,26 @@ export class ThunderClient {
       username,
     )
 
-    const resp = await this.rawRequest<ThunderTokenResp>(signinUrl, {
-      method: "POST",
-      body: {
-        client_id: this.options.clientId,
-        client_secret: this.options.clientSecret,
-        provider: SignProvider,
-        signin_token: sessionId,
+    const resp = await this.rawRequest<ThunderTokenResp & ThunderErrResp>(
+      signinUrl,
+      {
+        method: "POST",
+        body: {
+          client_id: this.options.clientId,
+          client_secret: this.options.clientSecret,
+          provider: SignProvider,
+          signin_token: sessionId,
+        },
       },
-    })
+    )
+
+    // F-284：signin 失败时校验并抛出上游真实原因，而不是把垃圾对象
+    // 赋给 tokenResp 后在首次 authRequest 才报误导性的 "empty token"。
+    if (!resp?.access_token) {
+      throw new Error(
+        `Signin failed: error_code=${resp?.error_code ?? ""}, error=${resp?.error ?? ""}, error_description=${resp?.error_description ?? ""}`,
+      )
+    }
 
     this.tokenResp = resp
     this.creditKey = "" // reset credit key upon successful login
@@ -407,9 +460,30 @@ export class ThunderClient {
     return resp
   }
 
+  /**
+   * 刷新 access token。
+   *
+   * F-281：
+   *  - OAuth 错误响应（如 {"error":"invalid_grant"}）不得覆盖 tokenResp，
+   *    必须校验 access_token 存在，否则共享驱动实例会被整体毒化；
+   *  - 并发刷新复用同一个 in-flight Promise（singleflight），避免旧
+   *    refresh_token 被并发消费导致互相失效；
+   *  - 持久化只在真正刷新成功后执行一次。
+   */
   async refreshToken(refreshToken: string): Promise<ThunderTokenResp> {
+    if (!this.refreshInFlight) {
+      this.refreshInFlight = this.doRefreshToken(refreshToken).finally(() => {
+        this.refreshInFlight = null
+      })
+    }
+    return this.refreshInFlight
+  }
+
+  private async doRefreshToken(
+    refreshToken: string,
+  ): Promise<ThunderTokenResp> {
     const url = `${XLUSER_API_URL}/auth/token`
-    const resp = await this.rawRequest<ThunderTokenResp>(url, {
+    const resp = await this.rawRequest<ThunderTokenResp & ThunderErrResp>(url, {
       method: "POST",
       body: {
         grant_type: "refresh_token",
@@ -418,6 +492,13 @@ export class ThunderClient {
         client_secret: this.options.clientSecret,
       },
     })
+    if (!resp?.access_token) {
+      throw new Error(
+        `Refresh token failed: error_code=${resp?.error_code ?? ""}, error=${resp?.error ?? ""}, error_description=${resp?.error_description ?? ""}`,
+      )
+    }
+    // 服务端未轮换 refresh_token 时沿用旧值，避免下一次刷新丢凭据
+    if (!resp.refresh_token) resp.refresh_token = refreshToken
     this.tokenResp = resp
     if (this.options.onPersistToken) {
       await this.options.onPersistToken(resp)

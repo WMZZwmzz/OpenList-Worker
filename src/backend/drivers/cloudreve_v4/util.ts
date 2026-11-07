@@ -1,6 +1,34 @@
 // Cloudreve V4 API 客户端
 import { DriverCloudreveAddition, CloudreveFile, CloudreveListResp, CloudreveUrlResp } from "./types"
 
+/**
+ * 解包 Cloudreve V4 的统一响应信封 {"code":0,"data":...,"msg":""}（F-456）。
+ * - 带信封：code !== 0 抛错，否则返回 data 字段；
+ * - 无信封（极少数端点/代理返回裸 JSON）：HTTP 状态 >= 400 抛错，否则原样返回。
+ */
+export function unwrapEnvelope(
+  payload: any,
+  status: number,
+): any {
+  const isEnvelope =
+    !!payload &&
+    typeof payload === "object" &&
+    !Array.isArray(payload) &&
+    typeof payload.code === "number"
+  if (isEnvelope) {
+    if (payload.code !== 0) {
+      const msg = payload.msg || payload.message || `code ${payload.code}`
+      throw new Error(`[Cloudreve] ${msg}`)
+    }
+    return payload.data
+  }
+  if (status >= 400) {
+    const msg = payload?.msg || payload?.message || `HTTP ${status}`
+    throw new Error(`[Cloudreve] ${msg}`)
+  }
+  return payload
+}
+
 export class ClientCloudreve {
   private address: string
   private addition: DriverCloudreveAddition
@@ -30,7 +58,8 @@ export class ClientCloudreve {
         password: this.addition.password,
       }),
     })
-    const data: any = await resp.json().catch(() => ({}))
+    const payload: any = await resp.json().catch(() => null)
+    const data: any = unwrapEnvelope(payload, resp.status)
     if (data?.token) {
       this.accessToken = data.token
       if (data.refresh_token) this.addition.refresh_token = data.refresh_token
@@ -47,7 +76,8 @@ export class ClientCloudreve {
         Authorization: `Bearer ${this.addition.refresh_token}`,
       },
     })
-    const data: any = await resp.json().catch(() => ({}))
+    const payload: any = await resp.json().catch(() => null)
+    const data: any = unwrapEnvelope(payload, resp.status)
     if (data?.token) this.accessToken = data.token
   }
 
@@ -65,16 +95,17 @@ export class ClientCloudreve {
     const options: RequestInit = { method, headers }
     if (body) options.body = JSON.stringify(body)
     const resp = await fetch(`${this.address}/api/v4${endpoint}`, options)
-    if (resp.status === 401 && !retry) {
+    const payload: any = await resp.json().catch(() => null)
+    const code = payload && typeof payload.code === "number" ? payload.code : undefined
+    if ((resp.status === 401 || code === 401) && !retry) {
       if (this.addition.refresh_token) await this.refreshToken()
       else if (this.addition.username) await this.login()
+      else throw new Error("[Cloudreve] unauthorized")
       return this.request<T>(method, endpoint, body, true)
     }
-    if (method === "DELETE" && resp.ok) return {} as T
-    const data: any = await resp.json().catch(() => ({}))
-    if (resp.status >= 400) {
-      throw new Error(`[Cloudreve] ${data?.msg || data?.message || `HTTP ${resp.status}`}`)
-    }
+    // 无论 HTTP 状态码如何都检查信封 code（上游行为一致），失败不再静默。
+    const data = unwrapEnvelope(payload, resp.status)
+    if (data === null || data === undefined) return {} as T
     return data as T
   }
 

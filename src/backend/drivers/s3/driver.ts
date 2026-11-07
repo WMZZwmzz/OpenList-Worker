@@ -110,11 +110,12 @@ export class S3Driver implements StorageDriver {
   private async fileItemFromS3(
     file: S3File,
     remotePath: string,
+    withLink = true,
   ): Promise<FileItem> {
     let rawUrl: string | undefined
     let rawUrlHeaders: Record<string, string> | undefined
 
-    if (!file.isFolder) {
+    if (!file.isFolder && withLink) {
       const linkRes = await this.client.getLink(
         remotePath,
         file.name,
@@ -150,7 +151,12 @@ export class S3Driver implements StorageDriver {
     const items: FileItem[] = []
     for (const file of rawFiles) {
       const itemRemotePath = joinPath(remotePath, file.name)
-      const item = await this.fileItemFromS3(file, itemRemotePath)
+      // F-154：list 不预生成 raw_url。每次预签名约 11 次 crypto.subtle，
+      // 1000 项目录即上万次串行加密（Workers 免费档 10ms CPU 直接超限），
+      // 且这些链接没有任何消费者（/fs/list 会剥离 raw_url，真实下载走
+      // driver.get + 链接缓存），签名过期后还会随文件树缓存一起失效。
+      // 与 Go 上游一致：链接在 get/Link 时按需签发。
+      const item = await this.fileItemFromS3(file, itemRemotePath, false)
       items.push(item)
     }
 
@@ -274,7 +280,19 @@ export class S3Driver implements StorageDriver {
 
   private async copyDirRecursive(src: string, dst: string): Promise<void> {
     const version = this.addition.list_object_version === "v2" ? "v2" : "v1"
-    const rawFiles = await this.client.listObjects(src, version, true)
+    const markers: string[] = []
+    const rawFiles = await this.client.listObjects(src, version, true, markers)
+    const srcPrefix = getKey(src, true)
+    const dstPrefix = getKey(dst, true)
+    // F-149：目录 marker（零字节的 "dir/" 对象）不在 files 里，必须在目标端
+    // 原样重建，否则 rename/move/copy 后空子目录消失，纯 marker 目录的
+    // rename/move 更是彻底 no-op。
+    for (const markerKey of markers) {
+      const rel = markerKey.startsWith(srcPrefix)
+        ? markerKey.substring(srcPrefix.length)
+        : getBaseName(markerKey) + "/"
+      await this.client.putObject(dstPrefix + rel, new Uint8Array(0))
+    }
     for (const file of rawFiles) {
       const childSrc = joinPath(src, file.name)
       const childDst = joinPath(dst, file.name)
@@ -307,13 +325,32 @@ export class S3Driver implements StorageDriver {
 
   private async removeDirRecursive(dirPath: string): Promise<void> {
     const version = this.addition.list_object_version === "v2" ? "v2" : "v1"
-    const rawFiles = await this.client.listObjects(dirPath, version, true)
+    const markers: string[] = []
+    const rawFiles = await this.client.listObjects(
+      dirPath,
+      version,
+      true,
+      markers,
+    )
     for (const file of rawFiles) {
       const childPath = joinPath(dirPath, file.name)
       if (file.isFolder) {
         await this.removeDirRecursive(childPath)
       } else {
         await this.client.deleteObject(childPath)
+      }
+    }
+    // F-149：目录 marker（"dir/"）不在 files 里，必须显式删除；再补删本目录
+    // 自身可能的 marker（前缀与 marker key 相同的边界情况），否则 remove()
+    // 会报成功但目录仍在（下次 list 依旧出现）。
+    for (const markerKey of markers) {
+      await this.client.deleteObject(markerKey).catch(() => {})
+    }
+    if (dirPath) {
+      const selfMarker = getKey(dirPath, true)
+      // 已在本页 marker 列表里时不必再发一次 DELETE
+      if (!markers.includes(selfMarker)) {
+        await this.client.deleteObject(selfMarker).catch(() => {})
       }
     }
     const placeholderName = getPlaceholderName(this.addition.placeholder)

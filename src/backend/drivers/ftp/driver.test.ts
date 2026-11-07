@@ -1,7 +1,11 @@
 import { describe, it } from "node:test"
 import assert from "node:assert"
 import { parseFtpAddress, parseListLine } from "./ftp-client"
-import { encodeFtpString, decodeFtpBuffer } from "./encoding"
+import {
+  encodeFtpString,
+  decodeFtpBuffer,
+  ensureEncodingReady,
+} from "./encoding"
 import { FTPDriver, normalizeFTPAddition } from "./driver"
 
 describe("FTP Encoding & Address", () => {
@@ -24,12 +28,31 @@ describe("FTP Encoding & Address", () => {
     })
   })
 
-  it("encodes and decodes UTF-8 and GBK correctly", () => {
+  it("F-270：bare IPv6 is treated as host, not host+port", () => {
+    assert.deepStrictEqual(parseFtpAddress("::1"), { host: "::1", port: 21 })
+    assert.deepStrictEqual(parseFtpAddress("2001:db8::1"), {
+      host: "2001:db8::1",
+      port: 21,
+    })
+    assert.deepStrictEqual(parseFtpAddress("[2001:db8::1]:2121"), {
+      host: "2001:db8::1",
+      port: 2121,
+    })
+  })
+
+  it("encodes and decodes UTF-8 and GBK correctly", async () => {
     const text = "测试目录"
     const utf8Buf = encodeFtpString(text, "utf-8")
     assert.strictEqual(decodeFtpBuffer(utf8Buf, "utf-8"), text)
 
+    // F-264：非 UTF-8 编码必须真正经 iconv-lite 编解码（不再静默回退 UTF-8）
+    await ensureEncodingReady("gbk")
     const gbkBuf = encodeFtpString(text, "gbk")
+    assert.notDeepStrictEqual(
+      [...gbkBuf],
+      [...Buffer.from(text, "utf-8")],
+      "GBK 字节序列不得退化成 UTF-8",
+    )
     assert.strictEqual(decodeFtpBuffer(gbkBuf, "gbk"), text)
   })
 })
@@ -63,6 +86,42 @@ describe("FTP Listing Parser", () => {
     assert.strictEqual(entryFile?.name, "file.pdf")
     assert.strictEqual(entryFile?.is_dir, false)
     assert.strictEqual(entryFile?.size, 54321)
+
+    // F-268：MM-DD-YY + AM/PM 必须真正解析（旧实现恒 NaN → 回退当前时间）
+    const now = Date.now()
+    assert.ok(
+      Math.abs(now - entryFile!.modified.getTime()) > 60 * 1000,
+      "DOS 日期不得静默回退为当前时间",
+    )
+    assert.strictEqual(
+      entryFile?.modified.toISOString(),
+      "2026-08-24T10:00:00.000Z",
+    )
+    const pm = parseListLine("08-24-26 1:05PM 7 evening.txt", "utf-8")
+    assert.strictEqual(pm?.modified.toISOString(), "2026-08-24T13:05:00.000Z")
+  })
+
+  it("F-265：Unix 无年份日期按 ls 语义补年份（不得落到 2001 年）", () => {
+    const entry = parseListLine(
+      "-rw-r--r-- 1 user group 12345 Aug 24 10:00 recent.txt",
+      "utf-8",
+    )
+    assert.ok(entry)
+    const year = entry!.modified.getUTCFullYear()
+    const nowYear = new Date().getUTCFullYear()
+    assert.ok(
+      year === nowYear || year === nowYear - 1,
+      `mtime 年份应为当年或去年，实际 ${entry!.modified.toISOString()}`,
+    )
+    // 带年份的形式不受影响
+    const withYear = parseListLine(
+      "-rw-r--r-- 1 user group 1 Aug 24 2024 old.txt",
+      "utf-8",
+    )
+    assert.strictEqual(
+      withYear?.modified.toISOString(),
+      "2024-08-24T00:00:00.000Z",
+    )
   })
 
   it("parses MLSD line", () => {

@@ -209,14 +209,15 @@ export class GoogleDriveClient {
       const resp = await this.request<any>(url)
       const items: GoogleFile[] = resp.files || []
 
-      // Resolve shortcuts
+      // 快捷方式：保留自身的 id/mimeType（delete/rename/move/copy 必须作用在
+      // 快捷方式本身），只把目标信息另存，供列表展示与下载解析使用。
       for (const f of items) {
         if (
           f.mimeType === GOOGLE_DRIVE_SHORTCUT_MIME &&
           f.shortcutDetails?.targetId
         ) {
-          f.id = f.shortcutDetails.targetId
-          f.mimeType = f.shortcutDetails.targetMimeType || f.mimeType
+          f.targetId = f.shortcutDetails.targetId
+          f.targetMimeType = f.shortcutDetails.targetMimeType
         }
       }
       files.push(...items)
@@ -228,7 +229,8 @@ export class GoogleDriveClient {
 
   public async getFile(fileId: string): Promise<GoogleFile> {
     const params = new URLSearchParams({
-      fields: "id,name,mimeType,size,modifiedTime,md5Checksum",
+      fields:
+        "id,name,mimeType,size,modifiedTime,md5Checksum,shortcutDetails",
       includeItemsFromAllDrives: "true",
       supportsAllDrives: "true",
     })
@@ -313,8 +315,12 @@ export class GoogleDriveClient {
     mimeType = "application/octet-stream",
   ): Promise<void> {
     const chunkSize = (this.addition.chunk_size || 5) * 1024 * 1024
+    // F-360：Drive 的 multipart/simple upload 上限固定 5MB，与用户配置无关。
+    // chunk_size 调大到 8/10 时，(5MB, chunk_size] 区间的文件以前会走
+    // multipart 并被 Drive 拒绝；超过 5MB 一律走 resumable。
+    const simpleUploadLimit = Math.min(chunkSize, 5 * 1024 * 1024)
 
-    if (content.length <= chunkSize) {
+    if (content.length <= simpleUploadLimit) {
       // Simple upload (small files)
       const params = new URLSearchParams({
         uploadType: "multipart",
@@ -387,6 +393,31 @@ export class GoogleDriveClient {
   // Path resolution (virtualPath -> file_id)
   // ===================================================
   private pathCache = new Map<string, string>()
+  /** 路径 → 快捷方式指向的真实 id（仅读路径使用，写操作仍用 pathCache 中的 id） */
+  private shortcutTargets = new Map<string, string>()
+
+  /** 写操作后按前缀失效路径缓存，避免跨请求复用的驱动实例命中过期 file id */
+  public invalidatePathCache(prefixPath: string): void {
+    const clean = String(prefixPath || "")
+      .split("/")
+      .filter(Boolean)
+      .join("/")
+    if (!clean) {
+      this.pathCache.clear()
+      this.shortcutTargets.clear()
+      return
+    }
+    for (const key of Array.from(this.pathCache.keys())) {
+      if (key === clean || key.startsWith(clean + "/")) {
+        this.pathCache.delete(key)
+      }
+    }
+    for (const key of Array.from(this.shortcutTargets.keys())) {
+      if (key === clean || key.startsWith(clean + "/")) {
+        this.shortcutTargets.delete(key)
+      }
+    }
+  }
 
   public async resolveFileId(physicalPath: string): Promise<string> {
     const clean = physicalPath.split("/").filter(Boolean).join("/")
@@ -410,16 +441,34 @@ export class GoogleDriveClient {
         currentId = this.pathCache.get(subPath)!
         continue
       }
-      const items = await this.listFiles(currentId)
+      // 父路径是快捷方式目录时，必须列其目标的子项
+      const parentPath = parts.slice(0, i).join("/")
+      const listId = this.shortcutTargets.get(parentPath) || currentId
+      const items = await this.listFiles(listId)
       const target = items.find(
         (f) => f.name === rawPart || f.name === decodedPart || f.id === rawPart,
       )
       if (!target) throw new Error(`[GoogleDrive] Path '${rawPart}' not found`)
       currentId = target.id
       this.pathCache.set(subPath, currentId)
+      if (target.targetId) {
+        this.shortcutTargets.set(subPath, target.targetId)
+      } else {
+        this.shortcutTargets.delete(subPath)
+      }
     }
 
     return currentId
+  }
+
+  /**
+   * 读路径（列目录 / 下载）解析：快捷方式跟到 targetId，
+   * 否则 `'<shortcut-id>' in parents` 查不到子项、alt=media 也取不到内容。
+   */
+  public async resolveReadId(physicalPath: string): Promise<string> {
+    const id = await this.resolveFileId(physicalPath)
+    const clean = physicalPath.split("/").filter(Boolean).join("/")
+    return this.shortcutTargets.get(clean) || id
   }
 
   public async resolveParentAndName(

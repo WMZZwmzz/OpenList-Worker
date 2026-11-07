@@ -57,7 +57,22 @@ export class ClientFebBox {
     }
   }
 
-  private async request(params: Record<string, string>): Promise<any> {
+  private refreshPromise: Promise<void> | null = null
+
+  /** 并发 -10001 共享同一次刷新，避免 refresh_token 轮换竞态 */
+  private async refreshTokenOnce(): Promise<void> {
+    if (!this.refreshPromise) {
+      this.refreshPromise = this.refreshToken().finally(() => {
+        this.refreshPromise = null
+      })
+    }
+    return this.refreshPromise
+  }
+
+  private async request(
+    params: Record<string, string>,
+    retried = false,
+  ): Promise<any> {
     const fd = new FormData()
     for (const [k, v] of Object.entries(params)) {
       fd.append(k, v)
@@ -68,10 +83,13 @@ export class ClientFebBox {
       body: fd,
     })
     const data = (await resp.json().catch(() => ({}))) as FebBoxErrResp & any
-    // access_token 过期：-10001 且带 server_name 时刷新后重试
+    // access_token 过期：-10001 且带 server_name 时刷新后重试，最多一次
     if (data.code === -10001 && data.server_name) {
-      await this.refreshToken()
-      return this.request(params)
+      if (retried) {
+        throw new Error("[FebBox] access token rejected after refresh")
+      }
+      await this.refreshTokenOnce()
+      return this.request(params, true)
     }
     if (data.code !== 0 && data.code !== 1) {
       throw new Error(`[FebBox] ${data.msg || data.code}`)

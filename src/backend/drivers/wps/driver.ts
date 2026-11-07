@@ -160,7 +160,7 @@ export class WpsDriver implements StorageDriver {
       }
     }
 
-    return {
+    const item: FileItem = {
       name: node.name,
       size: node.size,
       is_dir: node.isDir,
@@ -169,6 +169,15 @@ export class WpsDriver implements StorageDriver {
       type: calcFileType(node.name, node.isDir),
       raw_url: rawUrl,
     }
+    // F-332：WPS 直链需要与 link() 相同的 User-Agent/Referer。框架没有 link
+    // 通路，下载链路只走 get() → raw_url_headers（代理抓取时使用）。
+    if (rawUrl) {
+      item.raw_url_headers = {
+        "User-Agent": this.client.getUA(),
+        Referer: this.client.driveHost(),
+      }
+    }
+    return item
   }
 
   async link(
@@ -228,14 +237,16 @@ export class WpsDriver implements StorageDriver {
       throw new Error("Target destination directory not found")
     }
     const srcNode = await this.resolvePath(srcPath)
-    if (srcNode) {
-      await this.client.move(
-        srcNode.groupId,
-        srcNode.fileId,
-        dstNode.groupId,
-        dstNode.fileId,
-      )
+    // F-333：源解析失败必须报错，否则调用方收到成功但什么都没发生。
+    if (!srcNode || srcNode.kind === "root" || srcNode.kind === "group") {
+      throw new Error(`[WPS] Source not found: ${srcPath}`)
     }
+    await this.client.move(
+      srcNode.groupId,
+      srcNode.fileId,
+      dstNode.groupId,
+      dstNode.fileId,
+    )
   }
 
   async rename(
@@ -269,14 +280,16 @@ export class WpsDriver implements StorageDriver {
       throw new Error("Target destination directory not found")
     }
     const srcNode = await this.resolvePath(srcPath)
-    if (srcNode) {
-      await this.client.copy(
-        srcNode.groupId,
-        srcNode.fileId,
-        dstNode.groupId,
-        dstNode.fileId,
-      )
+    // F-333：同 move，源不存在时不能静默跳过。
+    if (!srcNode || srcNode.kind === "root" || srcNode.kind === "group") {
+      throw new Error(`[WPS] Source not found: ${srcPath}`)
     }
+    await this.client.copy(
+      srcNode.groupId,
+      srcNode.fileId,
+      dstNode.groupId,
+      dstNode.fileId,
+    )
   }
 
   async remove(
@@ -288,27 +301,27 @@ export class WpsDriver implements StorageDriver {
     // 参数即项路径，直接解析它即可；再拼 name 会指向 <item>/<name>，resolvePath 返回 null
     // 后被静默跳过，接口成功但文件仍在。
     const node = await this.resolvePath(this.cleanPath(physicalPath))
-    if (node && node.kind !== "root" && node.kind !== "group") {
-      await this.client.delete(node.groupId, node.fileId)
+    // F-333：源不存在时抛错（不能假成功）；root/group 属不可删除节点，同样报错。
+    if (!node) {
+      throw new Error(`[WPS] Source not found: ${physicalPath}`)
     }
+    if (node.kind === "root" || node.kind === "group") {
+      throw new Error(`[WPS] Cannot remove ${node.kind}: ${physicalPath}`)
+    }
+    await this.client.delete(node.groupId, node.fileId)
   }
 
   async put(
-    virtualPath: string,
-    physicalPath: string,
-    content: Buffer | Uint8Array,
+    _virtualPath: string,
+    _physicalPath: string,
+    _content: Buffer | Uint8Array,
   ): Promise<void> {
-    // WPS direct upload requires chunked upload protocol
-    const clean = this.cleanPath(physicalPath)
-    const parentPath = clean.substring(0, clean.lastIndexOf("/")) || "/"
-    const fileName = clean.substring(clean.lastIndexOf("/") + 1)
-    const parentNode = await this.resolvePath(parentPath)
-    if (!parentNode || !parentNode.isDir) {
-      throw new Error(`Parent directory not found: ${parentPath}`)
-    }
-
-    // Direct upload stub
-    console.warn(`[WPS] direct small upload for ${fileName}`)
+    // WPS 上传依赖分块协议（create/upload/commit），当前 util 层未实现任何上传接口。
+    // 绝不能静默返回成功：op 层 putItem 会据此刻返回 200 并向客户端报告成功，
+    // 而文件从未落盘（静默数据丢失）。显式失败以暴露「不支持」。
+    throw new Error(
+      "[WPS] upload is not supported: chunked upload protocol is not implemented",
+    )
   }
 
   async getDetails(): Promise<{ total_space?: number; used_space?: number }> {

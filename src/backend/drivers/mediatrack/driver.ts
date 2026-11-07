@@ -4,6 +4,7 @@ import {
   StorageDriver,
 } from "../../internal/driver/base"
 import { sortFileItems } from "../../internal/driver/sort"
+import { randomHex } from "../rand"
 import {
   MediatrackAddition,
   MediatrackFile,
@@ -175,6 +176,7 @@ export class MediatrackDriver implements StorageDriver {
         },
       },
     )
+    this.idCache.clear()
   }
 
   async rename(
@@ -193,8 +195,7 @@ export class MediatrackDriver implements StorageDriver {
       },
     )
 
-    const clean = this.cleanPath(physicalPath)
-    this.idCache.delete(clean)
+    this.idCache.clear()
   }
 
   async remove(
@@ -212,7 +213,7 @@ export class MediatrackDriver implements StorageDriver {
     const parentId = await this.resolveParentId(parentPath)
     const files = await this.client.getFiles(parentId)
     const match = files.find((f) => f.title === name)
-    if (!match) return
+    if (!match) throw new Error(`[MediaTrack] Source not found: ${name}`)
 
     await this.client.request(
       "https://jayce.api.mediatrack.cn/v4/assets/batch/delete",
@@ -225,7 +226,7 @@ export class MediatrackDriver implements StorageDriver {
       },
     )
 
-    this.idCache.delete(clean)
+    this.idCache.clear()
   }
 
   async move(
@@ -249,7 +250,7 @@ export class MediatrackDriver implements StorageDriver {
     const dstParentId = await this.resolveParentId(dstParentPath)
     const srcFiles = await this.client.getFiles(srcParentId)
     const match = srcFiles.find((f) => f.title === srcName)
-    if (!match) return
+    if (!match) throw new Error(`[MediaTrack] Source not found: ${srcName}`)
 
     await this.client.request(
       "https://jayce.api.mediatrack.cn/v4/assets/batch/move",
@@ -261,6 +262,7 @@ export class MediatrackDriver implements StorageDriver {
         },
       },
     )
+    this.idCache.clear()
   }
 
   async copy(
@@ -281,7 +283,7 @@ export class MediatrackDriver implements StorageDriver {
     const dstParentId = await this.resolveParentId(dstParentPath)
     const srcFiles = await this.client.getFiles(srcParentId)
     const match = srcFiles.find((f) => f.title === srcName)
-    if (!match) return
+    if (!match) throw new Error(`[MediaTrack] Source not found: ${srcName}`)
 
     await this.client.request(
       "https://jayce.api.mediatrack.cn/v4/assets/batch/clone",
@@ -293,6 +295,7 @@ export class MediatrackDriver implements StorageDriver {
         },
       },
     )
+    this.idCache.clear()
   }
 
   async put(
@@ -305,7 +308,8 @@ export class MediatrackDriver implements StorageDriver {
     const fileName = clean.split("/").pop() || "upload"
     const parentId = await this.resolveParentId(parentPath)
 
-    const randomId = Math.random().toString(36).slice(2)
+    // S-04 同类清单：上传随机键改用 CSPRNG（原 Math.random）。
+    const randomId = randomHex(16)
     const srcKey = `assets/${randomId}`
 
     const tokenResp: MediatrackUploadResp = await this.client.request(
@@ -317,14 +321,22 @@ export class MediatrackDriver implements StorageDriver {
     )
 
     const cosUrl = tokenResp.data?.url
-    if (cosUrl) {
-      await fetch(cosUrl, {
-        method: "PUT",
-        headers: {
-          "Content-Length": String(content.length),
-        },
-        body: new Uint8Array(content),
-      })
+    if (!cosUrl) {
+      // 缺上传地址时继续登记资产会造出指向不存在对象的条目（用户看到成功、下载 404）。
+      throw new Error("[MediaTrack] upload url missing in storage token response")
+    }
+    const putRes = await fetch(cosUrl, {
+      method: "PUT",
+      headers: {
+        "Content-Length": String(content.length),
+      },
+      body: new Uint8Array(content),
+    })
+    if (!putRes.ok) {
+      const detail = await putRes.text().catch(() => "")
+      throw new Error(
+        `[MediaTrack] object storage upload failed: HTTP ${putRes.status}${detail ? ` ${detail}` : ""}`,
+      )
     }
 
     await this.client.request(
@@ -342,5 +354,6 @@ export class MediatrackDriver implements StorageDriver {
         },
       },
     )
+    this.idCache.clear()
   }
 }

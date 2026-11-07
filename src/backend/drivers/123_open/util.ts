@@ -95,6 +95,7 @@ export class Client123Open {
     url: string,
     method: string,
     body?: any,
+    retried = false,
   ): Promise<Resp123 & { data?: T }> {
     const headers: Record<string, string> = {
       Authorization: `Bearer ${this.accessToken}`,
@@ -106,8 +107,14 @@ export class Client123Open {
     const resp = await fetch(url, options)
     const data: Resp123 = await resp.json().catch(() => ({ code: -1 } as any))
     if (data.code === 401) {
+      // F-429：刷新后只重试一次；新令牌仍被拒时直接抛错，避免无界递归。
+      if (retried) {
+        throw new Error(
+          `[123Open] ${data.message || "token refresh did not help (401)"}`,
+        )
+      }
       await this.getAccessToken()
-      return this.request<T>(url, method, body)
+      return this.request<T>(url, method, body, true)
     }
     return data as Resp123 & { data?: T }
   }

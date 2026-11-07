@@ -160,16 +160,47 @@ export const blobDriver: Driver = {
     // 优先使用 ESA Blob binding
     const esaBlob = getEsaBlobBinding(env)
     if (esaBlob) {
-      const keys: string[] = []
+      // F-089：移植 kv.ts 针对 issue #125 的三层防护 ——
+      //   - 空页即终止（不能假设平台一定会给「末页」标记）；
+      //   - 重复页检测（首键与上一页相同 = 游标没推进）；
+      //   - guard 迭代上限（游标恒非空时无界重发真实子请求会打满配额）。
+      // 历史实现是裸 `do { ... } while (cursor)`：一旦平台返回不推进的游标
+      // （或忽略 cursor），就会无限重发同一页并无限累积重复键。
+      const seen = new Set<string>()
       let cursor: string | undefined
+      let guard = 0
+      let prevFirstKey: string | null = null
 
-      do {
+      while (guard < 1000) {
+        guard += 1
         const result = await esaBlob.list({ prefix, cursor })
-        keys.push(...(result?.keys || []).map((k: any) => k.name))
-        cursor = result?.cursor
-      } while (cursor)
+        const pageKeys = Array.isArray(result?.keys) ? result.keys : []
 
-      return keys
+        // 空页视为末页
+        if (pageKeys.length === 0) break
+
+        // 只接受字符串 name（与 kv.ts 的类型过滤一致）
+        const names: string[] = []
+        for (const item of pageKeys) {
+          const name = typeof (item as any)?.name === "string" ? (item as any).name : null
+          if (name) names.push(name)
+        }
+        if (names.length === 0) break
+
+        if (prevFirstKey !== null && names[0] === prevFirstKey) {
+          console.warn("[Blob] repeated page detected; stopping list pagination")
+          break
+        }
+        prevFirstKey = names[0]
+
+        for (const name of names) seen.add(name)
+
+        const nextCursor = result?.cursor
+        if (!nextCursor || nextCursor === cursor) break
+        cursor = nextCursor
+      }
+
+      return [...seen]
     }
     
     // 使用 EdgeOne Blob SDK
@@ -187,13 +218,29 @@ export const blobDriver: Driver = {
     
     if (esaBlob) {
       try {
-        await esaBlob.head("__health_check__")
+        // F-085：探测用 `get`（空安全），而不是 `head("__health_check__")`。
+        //
+        // 全仓库从来没有写入过 __health_check__，而 ESA 读取不存在的键会抛
+        // not-found（本文件 get() 自己就专门处理了这一点）。历史实现直接 head
+        // 且不区分异常类型：not-found 落入 catch → available:false → 全局 503
+        // （ESA 默认主存储）；若平台改为静默返回 null，这条探测又什么都没验证。
+        // 现在与 get 的语义对齐：not-found 视为「健康（能读）」，其余异常才算故障
+        // —— 注意 get 的回退分支同样可用：读取调用本身成功即证明绑定可用。
+        const obj = await esaBlob.get("__health_check__")
+        void obj
         return {
           driver: "blob",
           platform: "ESA Blob (binding)",
           available: true,
         }
       } catch (err: any) {
+        if (isNotFoundError(err)) {
+          return {
+            driver: "blob",
+            platform: "ESA Blob (binding)",
+            available: true,
+          }
+        }
         return {
           driver: "blob",
           platform: "ESA Blob (binding)",

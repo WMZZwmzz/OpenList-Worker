@@ -1,5 +1,4 @@
 import {
-  calcFileType,
   FileItem,
   StorageDriver,
 } from "../../internal/driver/base"
@@ -96,35 +95,51 @@ export class AliasDriver implements StorageDriver {
     return results
   }
 
+  /**
+   * F-462：aliasSub 可能是多段路径（/a/b），中间的 /a 既不是完整映射也不是
+   * 映射下的子路径，需要由前缀树合成为可导航目录。返回 clean 下需要补齐的
+   * 目录名（不含已完整映射的 aliasSub 本身）。
+   */
+  private syntheticChildren(clean: string): string[] {
+    const prefix = clean === "/" ? "/" : `${clean}/`
+    const names: string[] = []
+    for (const aliasSub of this.rootOrder) {
+      if (aliasSub === clean || !aliasSub.startsWith(prefix)) continue
+      const seg = aliasSub.slice(prefix.length).split("/")[0]
+      if (seg && !names.includes(seg)) names.push(seg)
+    }
+    return names
+  }
+
+  /** F-462：clean 是否为某些多段 aliasSub 的中间目录 */
+  private isSyntheticDir(clean: string): boolean {
+    const prefix = clean === "/" ? "/" : `${clean}/`
+    return this.rootOrder.some(
+      (aliasSub) => aliasSub !== clean && aliasSub.startsWith(prefix),
+    )
+  }
+
+  private syntheticItem(dirName: string, parent: string): FileItem {
+    const childPath =
+      parent === "/" ? `/${dirName}` : `${parent}/${dirName}`
+    return {
+      name: dirName,
+      size: 0,
+      is_dir: true,
+      modified: new Date().toISOString(),
+      sign: childPath,
+      type: 1,
+      raw_url: "",
+    }
+  }
+
   async list(virtualPath: string, physicalPath: string): Promise<FileItem[]> {
     const clean = this.cleanPath(physicalPath)
     const { listItems } = await import("../../internal/op/storage")
 
-    if (clean === "/" && this.rootOrder.length > 1) {
-      const items: FileItem[] = []
-      for (const aliasSub of this.rootOrder) {
-        const dirName = aliasSub.replace(/^\//, "").split("/")[0] || aliasSub
-        if (!items.some((i) => i.name === dirName)) {
-          items.push({
-            name: dirName,
-            size: 0,
-            is_dir: true,
-            modified: new Date().toISOString(),
-            sign: aliasSub,
-            type: 1,
-            raw_url: "",
-          })
-        }
-      }
-      return sortFileItems(
-        items,
-        this.addition.order_by,
-        this.addition.order_direction,
-      )
-    }
-
     const targets = this.getTargetsForPath(physicalPath)
-    if (targets.length === 0) {
+    const synthetic = this.syntheticChildren(clean)
+    if (targets.length === 0 && synthetic.length === 0) {
       return []
     }
 
@@ -146,6 +161,13 @@ export class AliasDriver implements StorageDriver {
       }
     }
 
+    // F-462：补齐多段 aliasSub 的中间目录，使整棵别名树可导航。
+    for (const dirName of synthetic) {
+      if (!mergedMap.has(dirName)) {
+        mergedMap.set(dirName, this.syntheticItem(dirName, clean))
+      }
+    }
+
     const items = Array.from(mergedMap.values())
     return sortFileItems(
       items,
@@ -158,7 +180,8 @@ export class AliasDriver implements StorageDriver {
     const clean = this.cleanPath(physicalPath)
     const name = clean.split("/").filter(Boolean).pop() || "root"
 
-    if (clean === "/" && this.rootOrder.length > 1) {
+    // 存储根永远是目录。
+    if (clean === "/") {
       return {
         name: "root",
         size: 0,
@@ -171,43 +194,34 @@ export class AliasDriver implements StorageDriver {
     }
 
     const targets = this.getTargetsForPath(physicalPath)
-    if (targets.length === 0) {
-      return {
-        name,
-        size: 0,
-        is_dir: false,
-        modified: new Date().toISOString(),
-        sign: "",
-        type: calcFileType(name, false),
-        raw_url: "",
-      }
-    }
+    if (targets.length > 0) {
+      const { getItem } = await import("../../internal/op/storage")
 
-    const { getItem } = await import("../../internal/op/storage")
-
-    for (const target of targets) {
-      try {
-        const res = await getItem(target.targetFullPath)
-        if (res?.item) {
-          return {
-            ...res.item,
-            raw_url: res.item.raw_url || res.rawUrl,
+      let lastError: unknown
+      for (const target of targets) {
+        try {
+          const res = await getItem(target.targetFullPath)
+          if (res?.item) {
+            return {
+              ...res.item,
+              raw_url: res.item.raw_url || res.rawUrl,
+            }
           }
+        } catch (e) {
+          lastError = e
         }
-      } catch {
-        // Try next candidate
       }
+      // F-463：映射存在但所有候选都失败时必须上报，不能伪装成 0 字节文件。
+      if (lastError) throw lastError
     }
 
-    return {
-      name,
-      size: 0,
-      is_dir: false,
-      modified: new Date().toISOString(),
-      sign: "",
-      type: calcFileType(name, false),
-      raw_url: "",
+    // F-462：中间目录按目录语义返回，不再报成文件。
+    if (this.isSyntheticDir(clean)) {
+      return this.syntheticItem(name, this.parentPath(clean))
     }
+
+    // F-463：无法映射的路径抛 not found，让上层返回 404。
+    throw new Error(`[Alias] '${clean}' not found`)
   }
 
   async mkdir(virtualPath: string, physicalPath: string): Promise<void> {

@@ -19,6 +19,7 @@ import {
   randomNoCache,
   md5Base64,
 } from "./crypto"
+import { randomHex, randomInt } from "../rand"
 
 /** Cookie 辅助函数 */
 function getCookieValue(cookieStr: string, key: string): string | null {
@@ -74,10 +75,15 @@ function getSetCookieHeaders(headers: Headers): string[] {
  * 189Cloud returns file/folder IDs as JSON numbers. IDs exceed JavaScript's
  * safe integer range, so protect the numeric token before parsing to retain
  * the exact value used by subsequent API requests.
+ *
+ * F-135：旧正则只保护字面键 "id"，`uploadFileId` 等其它 ID 键（types.ts
+ * 声明为 `string | number`，服务端确有数字形态）超过 2^53 时会被 JSON.parse
+ * 按双精度舍入，后续分片/提交请求携带错误的上传会话 ID。这里扩展到所有
+ * 以 Id/ID/id 结尾的键。
  */
 function parseJsonPreservingIds(text: string): any {
   const protectedText = text.replace(
-    /("id"\s*:\s*)(-?\d{16,})(?=\s*[,}])/g,
+    /("(?:id|[a-zA-Z_][a-zA-Z0-9_]*[Ii][Dd])"\s*:\s*)(-?\d{16,})(?=\s*[,}])/g,
     '$1"$2"',
   )
   return JSON.parse(protectedText)
@@ -732,10 +738,10 @@ export class Pan189Client {
     if (!this.sessionKey) this.sessionKey = await this.getSessionKey()
     const requestDate = String(Date.now())
     const requestId = randomUUID189()
-    const randomKey = randomUUID189("xxxxxxxxxxxx4xxxyxxxxxxxxxxxxxxx").slice(
-      0,
-      16 + Math.floor(Math.random() * 17),
-    )
+    // 加密上传的会话密钥（AES-128 密钥 + HMAC-SHA1 签名密钥）必须用 CSPRNG：
+    // Math.random 是 xorshift128+，不是密码学安全的随机源（2026-10-31 深度安全
+    // 审查报告 S-04）。长度仍按协议保持 16~32 字节的十六进制串。
+    const randomKey = randomHex(16 + randomInt(17))
     const params = Object.keys(form)
       .sort()
       .map((key) => `${key}=${form[key]}`)
@@ -787,6 +793,7 @@ export class Pan189Client {
     fileName: string,
     fileSize: number,
     fileMd5: string,
+    sliceMd5?: string,
   ): Promise<{
     uploadFileId: string
     fileDataExists: boolean
@@ -804,7 +811,8 @@ export class Pan189Client {
     try {
       response = await this.uploadRequest<InitMultiUploadResp189>(
         "/person/initMultiUpload",
-        { ...baseParams, fileMd5, sliceMd5: fileMd5 },
+        // 上游发送真实计算的 sliceMd5Hex；调用方未提供时才退回 fileMd5
+        { ...baseParams, fileMd5, sliceMd5: sliceMd5 || fileMd5 },
       )
     } catch (error: any) {
       const message = String(error?.message || error)

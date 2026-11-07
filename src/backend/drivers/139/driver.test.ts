@@ -700,3 +700,53 @@ test("Yun139 keeps using only the first candidate URL when the listing is plausi
     globalThis.fetch = originalFetch
   }
 })
+
+test("Yun139 legacy getDisk reads files from contentList", async () => {
+  const addition: Yun139Addition = {
+    authorization: Buffer.from(
+      "Basic:13800138000:token123|1|1|1790000000000",
+    ).toString("base64"),
+    // 非 personal_new 的类型走 legacy getDisk 分支
+    type: "personal",
+  }
+  const driver = new Yun139Driver(addition)
+  const requests: Array<{ uri: string; body: any }> = []
+  ;(driver as any).client.request = async (uri: string, body: any) => {
+    requests.push({ uri, body })
+    return {
+      code: "0000",
+      message: "success",
+      success: true,
+      data: {
+        getDiskResult: {
+          nodeCount: 2,
+          // 真实 API 字段名：contentList（此前误读 fileList 导致永远为空）
+          contentList: [
+            {
+              contentID: "cnt_1",
+              contentName: "movie.mp4",
+              contentSize: 2048,
+              updateTime: "2026-08-24T12:00:00Z",
+            },
+          ],
+          catalogList: [
+            { catalogID: "cat_1", catalogName: "videos" },
+          ],
+        },
+      },
+    }
+  }
+
+  const items = await driver.list("/", "/")
+  assert.deepEqual(
+    items.map((i) => [i.name, i.is_dir, i.size]),
+    [
+      ["videos", true, 0],
+      ["movie.mp4", false, 2048],
+    ],
+  )
+  assert.equal(
+    requests[0].uri,
+    "/orchestration/personalCloud/catalog/v1.0/getDisk",
+  )
+})

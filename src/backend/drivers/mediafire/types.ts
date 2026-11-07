@@ -30,13 +30,27 @@ export interface MediafireApiResp<T = any> {
 
 export interface MediafireContent {
   folder_content?: {
-    folders?: { folderkey: string; name: string; created: string }[]
-    files?: { quickkey: string; filename: string; size: string; created: string }[]
+    folders?: {
+      folderkey: string
+      name: string
+      created?: string
+      /** get_content(details=yes) 同时返回的 UTC 版本，带时区标记 */
+      created_utc?: string
+    }[]
+    files?: {
+      quickkey: string
+      filename: string
+      size: string
+      created?: string
+      created_utc?: string
+    }[]
     more_chunks?: string
     chunk_size?: number
     chunk?: number
   }
   result?: string
+  message?: string
+  error?: string | number
 }
 
 export interface MediafireLinks {

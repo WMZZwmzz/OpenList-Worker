@@ -4,14 +4,14 @@ import {
   StorageDriver,
 } from "../../internal/driver/base"
 import { sortFileItems } from "../../internal/driver/sort"
-import { sha1 } from "../../pkg/crypto"
+import { hmacSha1Base64 } from "../../pkg/crypto"
 import {
   PikPakAboutResp,
   PikPakAddition,
   PikPakFile,
   PikPakFileListResp,
 } from "./types"
-import { PikPakApiClient } from "./util"
+import { calcGcid, PikPakApiClient } from "./util"
 
 export class PikPakDriver implements StorageDriver {
   private addition: PikPakAddition
@@ -40,6 +40,40 @@ export class PikPakDriver implements StorageDriver {
   private cleanPath(p: string): string {
     const s = "/" + (p || "").split("/").filter(Boolean).join("/")
     return s === "/" ? "" : s
+  }
+
+  /**
+   * F-258：把 oldClean 及其全部子路径的缓存键迁移到 newClean 前缀。
+   * rename/move 后 PikPak 文件 ID 不变，因此只需重写路径键；
+   * 不迁移会让旧子路径继续命中缓存、新子路径则每次重新遍历。
+   */
+  private rekeyCache(oldClean: string, newClean: string): void {
+    if (!oldClean || oldClean === newClean) return
+    const entries: Array<{ oldKey: string; newKey: string; id: string }> = []
+    for (const [key, id] of this.idCache) {
+      if (key === oldClean || key.startsWith(oldClean + "/")) {
+        entries.push({
+          oldKey: key,
+          newKey: newClean + key.slice(oldClean.length),
+          id,
+        })
+      }
+    }
+    for (const e of entries) this.idCache.delete(e.oldKey)
+    for (const e of entries) this.idCache.set(e.newKey, e.id)
+  }
+
+  /** F-258：删除某个路径及其全部子路径的缓存（remove 使用）。 */
+  private invalidateCache(clean: string): void {
+    if (!clean) {
+      this.idCache.clear()
+      return
+    }
+    for (const key of this.idCache.keys()) {
+      if (key === clean || key.startsWith(clean + "/")) {
+        this.idCache.delete(key)
+      }
+    }
   }
 
   private async resolveParentId(physicalPath: string): Promise<string> {
@@ -249,7 +283,9 @@ export class PikPakDriver implements StorageDriver {
     )
 
     const clean = this.cleanPath(physicalPath)
-    this.idCache.delete(clean)
+    const parentPath = clean.split("/").slice(0, -1).join("/")
+    const newClean = (parentPath ? parentPath + "/" : "/") + newName
+    this.rekeyCache(clean, newClean)
   }
 
   async remove(
@@ -266,7 +302,10 @@ export class PikPakDriver implements StorageDriver {
     const parentId = await this.resolveParentId(parentPath)
     const files = await this.getFiles(parentId)
     const match = files.find((f) => f.name === targetName)
-    if (!match) return
+    // F-256：找不到目标项必须报错，不能让调用方/用户看到「成功」。
+    if (!match) {
+      throw new Error(`PikPak remove: object not found: ${targetName}`)
+    }
 
     await this.client.request(
       "https://api-drive.mypikpak.net/drive/v1/files:batchTrash",
@@ -278,7 +317,7 @@ export class PikPakDriver implements StorageDriver {
       },
     )
 
-    this.idCache.delete(clean)
+    this.invalidateCache(clean)
   }
 
   async move(
@@ -302,7 +341,10 @@ export class PikPakDriver implements StorageDriver {
     const dstParentId = await this.resolveParentId(dstParentPath)
     const srcFiles = await this.getFiles(srcParentId)
     const match = srcFiles.find((f) => f.name === srcName)
-    if (!match) return
+    // F-256：找不到源项必须报错（静默 return 会让 MOVE 假成功）。
+    if (!match) {
+      throw new Error(`PikPak move: object not found: ${srcName}`)
+    }
 
     await this.client.request(
       "https://api-drive.mypikpak.net/drive/v1/files:batchMove",
@@ -317,7 +359,9 @@ export class PikPakDriver implements StorageDriver {
       },
     )
 
-    this.idCache.delete(srcClean)
+    // F-258：把源路径（含子项）的缓存键迁移到目标路径，并为目标项本身建立键。
+    this.rekeyCache(srcClean, dstClean)
+    this.idCache.set(dstClean, match.id)
   }
 
   async copy(
@@ -339,7 +383,10 @@ export class PikPakDriver implements StorageDriver {
     const dstParentId = await this.resolveParentId(dstParentPath)
     const srcFiles = await this.getFiles(srcParentId)
     const match = srcFiles.find((f) => f.name === srcName)
-    if (!match) return
+    // F-256：找不到源项必须报错（静默 return 会让 COPY 假成功）。
+    if (!match) {
+      throw new Error(`PikPak copy: object not found: ${srcName}`)
+    }
 
     await this.client.request(
       "https://api-drive.mypikpak.net/drive/v1/files:batchCopy",
@@ -361,10 +408,17 @@ export class PikPakDriver implements StorageDriver {
   async rapidUpload(
     _virtualPath: string,
     physicalPath: string,
-    metadata: { size: number; sha1?: string },
+    metadata: {
+      size: number
+      sha1?: string
+      hashes?: { gcid?: string; sha1?: string }
+    },
   ): Promise<boolean> {
-    const sha1Hex = String(metadata.sha1 || "").toUpperCase()
-    if (!/^[0-9A-F]{40}$/.test(sha1Hex)) return false
+    // F-254：PikPak 秒传按 GCID（分块双重 SHA-1）匹配，普通整文件 SHA-1
+    // 永远不可能命中。只有 seed 里带了真实 GCID 时才尝试秒传；缺 GCID
+    // 时返回 false 走真实上传，不能拿裸 SHA-1 冒充。
+    const gcid = String(metadata.hashes?.gcid || "").toUpperCase()
+    if (!/^[0-9A-F]{40}$/.test(gcid)) return false
     const clean = this.cleanPath(physicalPath)
     const parentPath = clean.split("/").slice(0, -1).join("/")
     const fileName = clean.split("/").pop() || "upload"
@@ -377,7 +431,7 @@ export class PikPakDriver implements StorageDriver {
           kind: "drive#file",
           name: fileName,
           size: String(metadata.size),
-          hash: sha1Hex,
+          hash: gcid,
           upload_type: "UPLOAD_TYPE_RESUMABLE",
           objProvider: { provider: "UPLOAD_TYPE_UNKNOWN" },
           parent_id: parentId,
@@ -399,7 +453,8 @@ export class PikPakDriver implements StorageDriver {
     const fileName = clean.split("/").pop() || "upload"
     const parentId = await this.resolveParentId(parentPath)
 
-    const sha1Hex = (await sha1(new Uint8Array(content))).toUpperCase()
+    // F-254：hash 必须是 GCID（分块双重 SHA-1），裸 SHA-1 永远不会命中
+    const gcid = await calcGcid(new Uint8Array(content))
 
     const taskResp: any = await this.client.request(
       "https://api-drive.mypikpak.net/drive/v1/files",
@@ -409,7 +464,7 @@ export class PikPakDriver implements StorageDriver {
           kind: "drive#file",
           name: fileName,
           size: String(content.length),
-          hash: sha1Hex,
+          hash: gcid,
           upload_type: "UPLOAD_TYPE_RESUMABLE",
           objProvider: { provider: "UPLOAD_TYPE_UNKNOWN" },
           parent_id: parentId,
@@ -423,24 +478,71 @@ export class PikPakDriver implements StorageDriver {
       return
     }
 
-    const params = taskResp.resumable.params
-    let endpoint = params.endpoint
+    const params = taskResp.resumable.params || {}
+    let endpoint = String(params.endpoint || "")
     if (this.addition.platform === "android") {
       endpoint = "mypikpak.net"
     }
+    const bucket = String(params.bucket || "")
+    const objectKey = String(params.key || "").replace(/^\/+/, "")
+    const accessKeyId = String(params.access_key_id || "")
+    const accessKeySecret = String(params.access_key_secret || "")
+    const securityToken = String(params.security_token || "")
 
-    const uploadUrl = `https://${params.bucket}.${endpoint}/${params.key}`
+    // F-253：OSS 写入必须用 AK/SK 生成 Authorization 签名，
+    // x-oss-security-token 只是签名之外的补充，单独携带必然 403。
+    if (!bucket || !objectKey || !accessKeyId || !accessKeySecret) {
+      throw new Error(
+        "[PikPak] OSS upload params incomplete (missing bucket/key/access_key_id/access_key_secret)",
+      )
+    }
+
+    let endpointHost = endpoint
+      .trim()
+      .replace(/^https?:\/\//, "")
+      .replace(/\/+$/, "")
+    if (endpointHost.startsWith(bucket + ".")) {
+      endpointHost = endpointHost.slice(bucket.length + 1)
+    }
+    // F-257：object key 逐段 URL 编码后再拼请求路径（保留 "/" 分隔符）；
+    // 签名仍使用 OSS 规范要求的原始（未编码）路径。
+    const encodedObjectKey = objectKey
+      .split("/")
+      .map((seg) => encodeURIComponent(seg))
+      .join("/")
+    const uploadUrl = `https://${bucket}.${endpointHost}/${encodedObjectKey}`
+
+    // 阿里云 OSS V1 签名：VERB\nContent-MD5\nContent-Type\nDate\nCanonicalizedOSSHeaders + CanonicalizedResource
+    const contentType = "application/octet-stream"
+    const dateStr = new Date().toUTCString()
+    const canonicalizedOSSHeaders = securityToken
+      ? `x-oss-security-token:${securityToken}\n`
+      : ""
+    const canonicalizedResource = `/${bucket}/${objectKey}`
+    const stringToSign =
+      `PUT\n\n${contentType}\n${dateStr}\n` +
+      `${canonicalizedOSSHeaders}${canonicalizedResource}`
+    const signature = await hmacSha1Base64(stringToSign, accessKeySecret)
+
+    const headers: Record<string, string> = {
+      "Content-Length": String(content.length),
+      "Content-Type": contentType,
+      Date: dateStr,
+      Authorization: `OSS ${accessKeyId}:${signature}`,
+    }
+    if (securityToken) headers["x-oss-security-token"] = securityToken
+
     const uploadRes = await fetch(uploadUrl, {
       method: "PUT",
-      headers: {
-        "Content-Length": String(content.length),
-        "x-oss-security-token": params.security_token,
-      },
+      headers,
       body: new Uint8Array(content),
     })
 
     if (!uploadRes.ok) {
-      throw new Error(`PikPak OSS upload failed: ${uploadRes.statusText}`)
+      const detail = await uploadRes.text().catch(() => "")
+      throw new Error(
+        `PikPak OSS upload failed: ${uploadRes.status} ${uploadRes.statusText} ${detail.slice(0, 200)}`,
+      )
     }
   }
 

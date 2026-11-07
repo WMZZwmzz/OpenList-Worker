@@ -384,7 +384,15 @@ export class BaiduClient {
       redirect: "manual",
       headers: { "User-Agent": "pan.baidu.com" },
     })
-    const location = res.headers.get("location") || u
+    const location = res.headers.get("location")
+    // F-210：只有 302 Location 才做 sanitizeDlink。HEAD 未返回 Location 时
+    // 不能把回退 URL 过 sanitizeDlink —— 那会剥掉唯一用于鉴权的 access_token，
+    // 返回必然 401 的断链。这里选择抛错，由 get() 写入 raw_url_error。
+    if (!location) {
+      throw new Error(
+        `baidu official link: HEAD returned no redirect location (HTTP ${res.status})`,
+      )
+    }
     return {
       url: sanitizeDlink(location),
       headers: { "User-Agent": "pan.baidu.com" },

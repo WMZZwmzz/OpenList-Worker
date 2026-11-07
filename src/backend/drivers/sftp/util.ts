@@ -27,6 +27,20 @@ export interface ParsedHostPort {
   port: number
 }
 
+/**
+ * ssh2 的 SFTP 错误：.code 为 "NO_SUCH_FILE"/"SSH_FX_NO_SUCH_FILE"，
+ * .status 为 SSH_FX_NO_SUCH_FILE(2)。只有这一类才能当作「路径不存在」。
+ */
+export function isNoSuchFileError(err: any): boolean {
+  if (!err) return false
+  const code = String(err.code || "").toUpperCase()
+  if (code === "NO_SUCH_FILE" || code === "SSH_FX_NO_SUCH_FILE") return true
+  if (err.status === 2) return true
+  // OpenSSH 服务端在部分路径上只回文本
+  const message = String(err.message || "")
+  return /no such file|not found/i.test(message)
+}
+
 export function parseAddress(address: string): ParsedHostPort {
   const clean = (address || "").trim()
   if (!clean) return { host: "127.0.0.1", port: 22 }
@@ -44,6 +58,11 @@ export function parseAddress(address: string): ParsedHostPort {
   }
 
   const parts = clean.split(":")
+  // F-326：不带方括号的 IPv6（"::1"、"2001:db8::1"）按 ":" 切分会把末段当端口。
+  // 冒号多于一个时整串视为主机，端口取默认 22。
+  if (parts.length > 2) {
+    return { host: clean, port: 22 }
+  }
   if (parts.length === 1) {
     return { host: parts[0], port: 22 }
   }
@@ -317,8 +336,13 @@ export class SFTPClientWrapper {
     let stats: any
     try {
       stats = await this.lstat(remotePath)
-    } catch {
-      return // doesn't exist
+    } catch (err: any) {
+      // F-325：只有「确实不存在」才能当成成功的 no-op。lstat 的其它错误
+      //（权限拒绝、连接被重置、keepalive 超时）原先也被吞掉，导致 removeItems
+      // 报「删除成功」而远端文件仍在。ssh2 用 .code / .status 区分：
+      // NO_SUCH_FILE / SSH_FX_NO_SUCH_FILE(2)。
+      if (isNoSuchFileError(err)) return
+      throw err
     }
 
     if (stats.isDirectory()) {

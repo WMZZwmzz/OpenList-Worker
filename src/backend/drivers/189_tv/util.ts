@@ -69,10 +69,14 @@ export function appKeySignatureOfHmac(
   return hmacSha1Hex(data, appSignatureSecret).toUpperCase()
 }
 
-/** 保护 JSON 中大整数 ID（int64 超 JS 安全整数） */
+/**
+ * 保护 JSON 中大整数 ID（int64 超 JS 安全整数）。
+ * 除了 "id" 之外，上传协议里的 uploadFileId 同样是 int64（Go 侧 UploadFileId int64），
+ * 精度丢失后会被写进 PUT 请求头 / 提交表单，指向不存在的上传会话。
+ */
 function parseJsonPreservingIds(text: string): any {
   const protectedText = text.replace(
-    /("id"\s*:\s*)(-?\d{16,})(?=\s*[,}])/g,
+    /("(?:id|uploadFileId)"\s*:\s*)(-?\d{16,})(?=\s*[,}])/g,
     '$1"$2"',
   )
   return JSON.parse(protectedText)
@@ -109,6 +113,11 @@ export class Client189TV {
   private addition: Driver189TVAddition
   private tokenInfo: AppSessionResp | null = null
   private persistAccessToken?: (accessToken: string) => void | Promise<void>
+  /**
+   * 单次驱动操作允许的上游子请求数。Cloudflare Workers 免费版每个 invocation 上限 50，
+   * 这里留出余量；超出时抛出可读错误，而不是让平台抛 "Too many subrequests"。
+   */
+  private budget = { used: 0, limit: 45 }
 
   constructor(
     addition: Driver189TVAddition,
@@ -124,6 +133,20 @@ export class Client189TV {
 
   getFamilyId(): string {
     return this.addition.family_id || ""
+  }
+
+  /** 每次驱动操作开始时重置子请求预算 */
+  resetBudget(): void {
+    this.budget.used = 0
+  }
+
+  private reserve(): void {
+    this.budget.used++
+    if (this.budget.used > this.budget.limit) {
+      throw new Error(
+        `[189TV] 单次操作上游请求数超过 ${this.budget.limit} 次（Cloudflare Workers 子请求上限），结果不完整：请拆分为更小的目录或改用其他运行时`,
+      )
+    }
   }
 
   async init(): Promise<void> {
@@ -186,12 +209,13 @@ export class Client189TV {
     options: {
       query?: Record<string, string>
       form?: Record<string, string>
+      headers?: Record<string, string>
       isFamily?: boolean
       isAppKey?: boolean
       retryCount?: number
     } = {},
   ): Promise<any> {
-    const { query, form, isFamily = false, isAppKey = false } = options
+    const { query, form, headers: extraHeaders, isFamily = false, isAppKey = false } = options
     const retryCount = options.retryCount ?? 0
 
     const urlObj = new URL(url)
@@ -213,6 +237,8 @@ export class Client189TV {
     } else {
       Object.assign(headers, this.signatureHeader(url, method, isFamily))
     }
+    // 调用方自定义请求头（如家庭云提交所需的 ResumePolicy/UploadFileId/FamilyId）后置覆盖
+    if (extraHeaders) Object.assign(headers, extraHeaders)
 
     let body: string | undefined
     if (form) {
@@ -221,6 +247,7 @@ export class Client189TV {
       body = new URLSearchParams(form).toString()
     }
 
+    this.reserve()
     const resp = await fetch(urlObj.toString(), { method, headers, body })
     const text = await resp.text()
 
@@ -346,6 +373,13 @@ export class Client189TV {
       if (probe.status === 302 && loc) {
         url = loc.replace(/^http:\/\//i, "https://")
       }
+      // CDN 直接返回 200 时响应体是完整文件流；不消费就必须取消，
+      // 否则 Workers 上会一直占用上游连接/带宽（见 server/raw.ts 的同类处理）。
+      try {
+        await probe.body?.cancel()
+      } catch {
+        // ignore
+      }
     } catch {
       // ignore
     }
@@ -416,7 +450,12 @@ export class Client189TV {
   }
 
   private async waitBatchTask(aType: string, taskId: string): Promise<void> {
-    for (let i = 0; i < 20; i++) {
+    // 批量任务在服务端异步执行（大目录很容易超过几秒）。这里用指数退避轮询约 30 秒，
+    // 截止时任务通常仍在后台继续——此时抛错会让调用方误判为失败并重试
+    // （COPY 重试会在云端产生重复副本），因此记录告警后按"已受理"返回。
+    const deadline = Date.now() + 30_000
+    let delay = 300
+    for (;;) {
       const resp = (await this.request(
         ApiUrl + "/batch/checkBatchTask.action",
         "POST",
@@ -425,9 +464,15 @@ export class Client189TV {
       const status = resp.taskStatus
       if (status === 4) return
       if (status === 2) throw new Error("[189TV] 目标存在同名冲突")
-      await new Promise((r) => setTimeout(r, 300))
+      if (Date.now() + delay > deadline) {
+        console.warn(
+          `[189TV] 批量任务 ${aType}（taskId=${taskId}）仍在后台执行，已按受理返回`,
+        )
+        return
+      }
+      await new Promise((r) => setTimeout(r, delay))
+      delay = Math.min(Math.round(delay * 1.5), 5_000)
     }
-    throw new Error("[189TV] 批量任务超时")
   }
 
   async move(
@@ -517,7 +562,46 @@ export class Client189TV {
         isFamily,
       })) as CreateUploadFileResp
     }
-    return createResp.fileDataExists === 1
+    if (createResp.fileDataExists !== 1) return false
+    // 秒传命中后必须执行提交（上游 OldUploadCommit）：只建会话不 commit 的话
+    // 会话最终过期，文件永远不会真正创建——UI 显示秒传成功但云端没有文件。
+    const uploadFileId = createResp.uploadFileId
+    const fileCommitUrl = createResp.fileCommitUrl
+    if (!uploadFileId || !fileCommitUrl) {
+      throw new Error("[189TV] 秒传会话缺少 uploadFileId/fileCommitUrl，无法提交")
+    }
+    await this.commitUpload(fileCommitUrl, String(uploadFileId), isFamily)
+    return true
+  }
+
+  /** 提交上传会话（个人云 form / 家庭云请求头，与 Go 原版 OldUploadCommit 一致） */
+  private async commitUpload(
+    fileCommitUrl: string,
+    uploadFileId: string,
+    isFamily: boolean,
+  ): Promise<void> {
+    if (isFamily) {
+      // 参考实现（Go 189_tv OldUploadCommit / 189pc）：家庭云这三个字段通过请求头传递，
+      // 个人云才用 form 表单。
+      await this.request(fileCommitUrl, "POST", {
+        headers: {
+          ResumePolicy: "1",
+          UploadFileId: uploadFileId,
+          FamilyId: this.addition.family_id || "",
+        },
+        isFamily,
+      })
+    } else {
+      await this.request(fileCommitUrl, "POST", {
+        form: {
+          opertype: "3",
+          resumePolicy: "1",
+          uploadFileId,
+          isLog: "0",
+        },
+        isFamily,
+      })
+    }
   }
 
   /** 单片上传（Worker 的 put 接收完整 Buffer） */
@@ -591,32 +675,20 @@ export class Client189TV {
     const putResp = await fetch(fileUploadUrl, {
       method: "PUT",
       headers: putHeaders,
-      body: new Uint8Array(content),
+      // content 本身即 Uint8Array（Buffer），无需再整包拷贝一份
+      body: content as unknown as BodyInit,
     })
+    // 响应体不需要，及时取消以释放上游连接
+    try {
+      await putResp.body?.cancel()
+    } catch {
+      // ignore
+    }
     if (putResp.status !== 200) {
       throw new Error(`[189TV] 上传失败: HTTP ${putResp.status}`)
     }
 
     // 3. 提交上传
-    if (isFamily) {
-      await this.request(fileCommitUrl!, "POST", {
-        query: {
-          ResumePolicy: "1",
-          UploadFileId: String(uploadFileId),
-          FamilyId: this.addition.family_id || "",
-        },
-        isFamily,
-      })
-    } else {
-      await this.request(fileCommitUrl!, "POST", {
-        form: {
-          opertype: "3",
-          resumePolicy: "1",
-          uploadFileId: String(uploadFileId),
-          isLog: "0",
-        },
-        isFamily,
-      })
-    }
+    await this.commitUpload(fileCommitUrl!, String(uploadFileId), isFamily)
   }
 }

@@ -74,6 +74,82 @@ function isDiagnosticPath(pathname: string): boolean {
 }
 
 /**
+ * 存储状态判定的短 TTL 缓存（F-112）。
+ *
+ * 背景：全局 503 拦截中间件对**每个**非豁免请求调用
+ * `getStoreConfigErrorDetail(env)`，而它最终会执行 `driver.health(env)`：
+ * KV 绑定模式每次 1 次 `kv.get` + 1 次 `kv.list`（免费版 list 配额仅
+ * 1000 次/天），DO 模式每次 1 次 RPC + 12 条 SQL。这与 KV 驱动里声明的
+ * 设计不变量「health 只在手动诊断路径被调用，不在每请求路径上」直接冲突：
+ * 正常流量就会耗尽 list 配额，耗尽后 health 失败 → 中间件对全部请求回
+ * 503，形成「配额耗尽 = 全站 API 宕机」的自伤回路。
+ *
+ * 处理：按 env 配置指纹缓存判定结果 30 秒。健康时直接放行、不触碰
+ * `driver.health()`；不健康时也不逐请求重探测（否则故障期间配额反而被
+ * 烧得更快）。30s 的恢复窗口与「诊断端点始终实时」共同保证可运维性：
+ * `/api/public/env_check`、`/api/public/init_status`、`/api/healthz` 豁免
+ * 本缓存，依旧调用最新判定。
+ *
+ * 缓存键必须包含「影响判定结果的环境特征」，而不只是 env 对象身份：
+ * Node/Vercel 等运行时可能为每个请求重建 env 对象，同部署内应当命中；
+ * 而不同 DB_DRIVER / DB_FORMAT / 代理配置 / 绑定集合必须互不串味。
+ */
+const STORE_GATE_CACHE_TTL_MS = 30_000
+
+type StoreConfigErrorDetail = Awaited<
+  ReturnType<typeof getStoreConfigErrorDetail>
+>
+
+let storeGateCache: {
+  key: string
+  at: number
+  detail: StoreConfigErrorDetail
+} | null = null
+
+function storeGateEnvKey(env: any): string {
+  if (!env || typeof env !== "object") return "none"
+  // 只取会影响存储判定 / 代理配置的值；JWT_SECRET 只取存在性与长度，
+  // 避免把密钥原文拼进缓存键。
+  const scalars: string[] = [
+    `DB_DRIVER=${String(env.DB_DRIVER ?? "")}`,
+    `DB_FORMAT=${String(env.DB_FORMAT ?? "")}`,
+    `DB_CIPHER=${String(env.DB_CIPHER ?? "")}`,
+    `EO_KV_URLS=${String(env.EO_KV_URLS ?? "")}`,
+    `MYSQL_HOST=${String(env.MYSQL_HOST ?? env.MYSQL_URLS ?? "")}`,
+    `JWT_SECRET=${String(env.JWT_SECRET ?? "").length}`,
+  ]
+  let bindingNames = ""
+  try {
+    bindingNames = Object.keys(env).sort().join(",")
+  } catch {
+    // 绑定对象上可能出现异常 getter：退化为仅按上面的标量区分
+  }
+  return scalars.join("|") + "||" + bindingNames
+}
+
+async function getStoreConfigErrorDetailCached(
+  env: any,
+): Promise<StoreConfigErrorDetail> {
+  const key = storeGateEnvKey(env)
+  const now = Date.now()
+  if (
+    storeGateCache &&
+    storeGateCache.key === key &&
+    now - storeGateCache.at < STORE_GATE_CACHE_TTL_MS
+  ) {
+    return storeGateCache.detail
+  }
+  const detail = await getStoreConfigErrorDetail(env)
+  storeGateCache = { key, at: now, detail }
+  return detail
+}
+
+/** 仅供测试：清空存储状态缓存，避免用例之间互相串味。 */
+export function __resetStorageGateCacheForTest(): void {
+  storeGateCache = null
+}
+
+/**
  * KV 代理传输端点（EdgeOne Edge Function 侧由 functions/kv-* 提供）。
  *
  * 这些路径是「驱动探测/读写」的传输层，不是业务请求，本 Worker 也不提供它们
@@ -127,7 +203,10 @@ app.use("*", async (c, next) => {
     // 用 Detail 版本：除完整原因外还带分类码与一句话修复建议，前端据此
     // 展示「哪里错了 + 该改成什么」。只给一段长文本时，用户（和日志读者）
     // 能看到的只是「驱动不可用」，不知道该把 DB_DRIVER 改成什么。
-    const detail = await getStoreConfigErrorDetail(env)
+    //
+    // F-112：走 30s 短 TTL 缓存，避免每个请求都触发 driver.health()（KV list
+    // 配额 / DO RPC 成本，且配额耗尽会自伤式全站 503）。
+    const detail = await getStoreConfigErrorDetailCached(env)
     if (detail.message) {
       const ui = uiStorageError(detail)
       return c.json(
@@ -203,7 +282,7 @@ app.use("*", async (c, next) => {
     const extra = cdnOrigins ? ` ${cdnOrigins}` : ""
     c.res.headers.set(
       "Content-Security-Policy",
-      `default-src 'self'; script-src 'self' 'unsafe-inline' data: https://static.cloudflareinsights.com${extra}; style-src 'self' 'unsafe-inline'${extra}; img-src 'self' data: blob: https:; font-src 'self' data:${extra}; connect-src 'self'${extra}; media-src 'self' blob:${extra}; frame-ancestors 'none'; base-uri 'self'; form-action 'self'`,
+      `default-src 'self'; script-src 'self' 'unsafe-inline' data: https://static.cloudflareinsights.com${extra}; style-src 'self' 'unsafe-inline'${extra}; img-src 'self' data: blob: https:; font-src 'self' data:${extra}; connect-src 'self'${extra}; media-src 'self' blob: https:${extra}; frame-ancestors 'none'; base-uri 'self'; form-action 'self'`,
     )
   }
 })

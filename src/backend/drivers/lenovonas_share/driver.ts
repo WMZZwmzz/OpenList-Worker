@@ -40,31 +40,32 @@ export class DriverLenovoNasShare implements StorageDriver {
     const parts = physicalPath.split("/").filter(Boolean)
     const name = parts[parts.length - 1] || "root"
     const parentPath = "/" + parts.slice(0, -1).join("/")
-    try {
-      const files = await this.client.list(parentPath === "//" ? "/" : parentPath)
-      const file = files.find((f) => f.name === name || f.path === physicalPath)
-      if (file) {
-        const isDir = file.type === "dir"
-        const item: FileItem = {
-          name: file.name,
-          size: file.size || 0,
-          is_dir: isDir,
-          modified: file.chtime
-            ? new Date(file.chtime * 1000).toISOString()
-            : new Date().toISOString(),
-          sign: "",
-          type: calcFileType(file.name, isDir),
-          raw_url: "",
-        }
-        if (!isDir) {
-          item.raw_url = await this.client.getDownloadUrl(file.path)
-          item.raw_url_headers = this.client.downloadHeaders()
-        }
-        return item
-      }
-    } catch {}
 
-    // Fallback: 目录
+    // F-483：父目录列表失败（鉴权/限流/网络）必须向上抛；只有「列表成功但
+    // 未命中」才进入目录探测，已确认是文件时换链失败同样向上抛。
+    const files = await this.client.list(parentPath === "//" ? "/" : parentPath)
+    const file = files.find((f) => f.name === name || f.path === physicalPath)
+    if (file) {
+      const isDir = file.type === "dir"
+      const item: FileItem = {
+        name: file.name,
+        size: file.size || 0,
+        is_dir: isDir,
+        modified: file.chtime
+          ? new Date(file.chtime * 1000).toISOString()
+          : new Date().toISOString(),
+        sign: "",
+        type: calcFileType(file.name, isDir),
+        raw_url: "",
+      }
+      if (!isDir) {
+        item.raw_url = await this.client.getDownloadUrl(file.path)
+        item.raw_url_headers = this.client.downloadHeaders()
+      }
+      return item
+    }
+
+    // 未命中：只有列它自己能成功才确认是目录，否则 not found。
     try {
       await this.client.list(physicalPath)
       return {
@@ -77,15 +78,7 @@ export class DriverLenovoNasShare implements StorageDriver {
         raw_url: "",
       }
     } catch {
-      return {
-        name,
-        size: 0,
-        is_dir: false,
-        modified: new Date().toISOString(),
-        sign: "",
-        type: 0,
-        raw_url: "",
-      }
+      throw new Error(`[Lenovo NAS Share] '${physicalPath}' not found`)
     }
   }
 

@@ -7,7 +7,7 @@ import {
   calcFileType,
 } from "../../internal/driver/base"
 import { sortFileItems } from "../../internal/driver/sort"
-import { md5 } from "../../pkg/crypto"
+import { createMD5, md5 } from "../../internal/seed/hashers"
 import { BaiduAddition, BaiduFile } from "./types"
 import {
   BaiduClient,
@@ -62,8 +62,6 @@ export class BaiduDriver implements StorageDriver {
   private addition: BaiduAddition
   private uploadThread = 3
   private vipType = 0
-  /** cache: physical path → { fsId, parentPath, name } for move/copy/rename */
-  private pathCache = new Map<string, { fsId: number; parent: string }>()
 
   constructor(
     addition: BaiduAddition,
@@ -79,7 +77,11 @@ export class BaiduDriver implements StorageDriver {
   async init(): Promise<void> {
     const a = this.addition
     // upload_thread clamp 1..32 (Go Init)
+    // F-209：不可解析字符串会让 parseInt 得到 NaN，而 NaN 通过 <1/>32 两个
+    // 比较后仍是 NaN，最终并发 worker 数为 0、所有分片被静默跳过。这里先
+    // 把非有限值回退到 1（对齐 Go：Atoi 失败得 0，再被 clamp 到 1）。
     let thread = parseInt(a.upload_thread || "3", 10)
+    if (!Number.isFinite(thread)) thread = 1
     if (thread < 1) thread = 1
     if (thread > 32) thread = 32
     this.uploadThread = thread
@@ -99,17 +101,18 @@ export class BaiduDriver implements StorageDriver {
   }
 
   private baiduPath(physicalPath: string): string {
-    const clean = "/" + String(physicalPath || "").replace(/\/+/g, "/")
+    const clean =
+      "/" +
+      String(physicalPath || "")
+        .replace(/\\/g, "/")
+        .replace(/^\/+/, "")
+        .replace(/\/+/g, "/")
     return clean === "/" ? "/" : clean.replace(/\/$/, "")
   }
 
   async list(_virtualPath: string, physicalPath: string): Promise<FileItem[]> {
     const files = await this.client.getFiles(this.baiduPath(physicalPath))
     const items = files.map(baiduFileToFileItem)
-    // Cache fsId for file ops (move/copy/rename/remove)
-    for (const f of files) {
-      this.pathCache.set(f.path, { fsId: f.fs_id, parent: dirname(f.path) })
-    }
     return sortFileItems(
       items,
       this.addition.order_by || "name",
@@ -151,7 +154,6 @@ export class BaiduDriver implements StorageDriver {
     if (!file) {
       throw new Error(`file not found: ${rawName}`)
     }
-    this.pathCache.set(file.path, { fsId: file.fs_id, parent })
     const item = baiduFileToFileItem(file)
     if (file.isdir !== 1) {
       try {
@@ -159,6 +161,9 @@ export class BaiduDriver implements StorageDriver {
         item.raw_url = link.url
         item.raw_url_headers = link.headers
       } catch (e: any) {
+        // F-211：把真实原因（风控 31023 / token 失效等）写入 raw_url_error，
+        // 让下载端点回 404 + 原因，而不是仅留在服务端日志里。
+        item.raw_url_error = e?.message || String(e)
         console.warn(
           `[baidu_netdisk] getDownloadLink warning for ${file.server_filename}:`,
           e.message,
@@ -213,7 +218,9 @@ export class BaiduDriver implements StorageDriver {
     dstPhys: string,
   ): Promise<void> {
     const name = names[0] || basename(srcPhys)
-    const dest = this.baiduPath(dstDir)
+    // F-208：dstDir 是站点虚拟路径（含挂载前缀），不能直接交给百度；
+    // dstPhys 才是目标条目自身的物理路径，取其父目录作为目标目录。
+    const dest = dirname(this.baiduPath(dstPhys))
     await this.client.manage("move", [
       { path: this.baiduPath(srcPhys), dest, newname: name },
     ])
@@ -227,7 +234,8 @@ export class BaiduDriver implements StorageDriver {
     dstPhys: string,
   ): Promise<void> {
     const name = names[0] || basename(srcPhys)
-    const dest = this.baiduPath(dstDir)
+    // 同 move：目标目录必须由物理目标路径推导
+    const dest = dirname(this.baiduPath(dstPhys))
     await this.client.manage("copy", [
       { path: this.baiduPath(srcPhys), dest, newname: name },
     ])
@@ -280,8 +288,31 @@ export class BaiduDriver implements StorageDriver {
     const mtime = now
     const ctime = now
 
-    // --- step 0: rapid upload (秒传) ---
-    const contentMd5 = md5(content)
+    // --- steps 0+1: 单遍哈希 ---
+    // F-213：整文件 MD5、分片 MD5 与 256KB 头部 MD5 在同一次遍历中增量计算
+    // （分片边界与头部位置已知），把降级路径上对整块 Buffer 的哈希遍历从
+    // 两遍降为一遍；同时全程使用流式 hasher，避免为整个文件分配 padded 拷贝。
+    const sliceSize = this.client.getSliceSize(streamSize, this.vipType)
+    const count = Math.max(1, Math.ceil(streamSize / sliceSize))
+    const lastBlockSize = streamSize % sliceSize || sliceSize
+    const contentHasher = (await createMD5()).init()
+    const blockList: string[] = []
+    let headMd5 = ""
+    for (let i = 0; i < count; i++) {
+      const byteSize = i === count - 1 ? lastBlockSize : sliceSize
+      const slice = content.subarray(i * sliceSize, i * sliceSize + byteSize)
+      contentHasher.update(slice)
+      blockList.push(await md5(slice))
+      if (i === 0) {
+        // precreate 的 slice-md5 = 文件头 256KB 的 MD5（不足 256KB 则取整个文件）
+        headMd5 = await md5(
+          slice.subarray(0, Math.min(256 * 1024, slice.length)),
+        )
+      }
+    }
+    const contentMd5 = contentHasher.digest("hex") as string
+
+    // --- step 2: rapid upload (秒传) ---
     const rapidBlockList = JSON.stringify([contentMd5])
     try {
       await this.client.create(
@@ -298,25 +329,15 @@ export class BaiduDriver implements StorageDriver {
       // fall through to chunked upload
     }
 
-    // --- step 1: chunk the buffer, compute per-slice md5s ---
-    const sliceSize = this.client.getSliceSize(streamSize, this.vipType)
-    const count = Math.max(1, Math.ceil(streamSize / sliceSize))
-    const lastBlockSize = streamSize % sliceSize || sliceSize
-    const blockList: string[] = []
-    for (let i = 0; i < count; i++) {
-      const byteSize = i === count - 1 ? lastBlockSize : sliceSize
-      const slice = content.subarray(i * sliceSize, i * sliceSize + byteSize)
-      blockList.push(md5(slice))
-    }
     const blockListStr = JSON.stringify(blockList)
 
-    // --- step 2: precreate ---
+    // --- step 3: precreate ---
     let pre = await this.client.precreate(
       path,
       streamSize,
       blockListStr,
       contentMd5,
-      md5(content.subarray(0, 256 * 1024)),
+      headMd5,
       ctime,
       mtime,
     )
@@ -327,7 +348,7 @@ export class BaiduDriver implements StorageDriver {
 
     // Upload retry loop (Go: for range 2 + ErrUploadIDExpired restart)
     for (let loop = 0; loop < 2; loop++) {
-      // --- step 3: resolve upload domain ---
+      // --- step 4: resolve upload domain ---
       let uploadUrl = this.addition.upload_api || UPLOAD_FALLBACK_API
       if (this.addition.use_dynamic_upload_api && pre.uploadid) {
         try {
@@ -337,7 +358,7 @@ export class BaiduDriver implements StorageDriver {
         }
       }
 
-      // --- step 4: upload all missing slices, honoring upload_thread ---
+      // --- step 5: upload all missing slices, honoring upload_thread ---
       const parts = pre.block_list || []
       let failed = false
       // Sequential queue with limited concurrency
@@ -416,7 +437,7 @@ export class BaiduDriver implements StorageDriver {
         throw e
       }
 
-      // --- step 5: create file ---
+      // --- step 6: create file ---
       await this.client.create(
         path,
         streamSize,

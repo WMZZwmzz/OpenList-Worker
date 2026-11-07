@@ -1,3 +1,4 @@
+import { randomInt } from "../rand"
 import {
   Pan123ShareAddition,
   Pan123ShareFileInfo,
@@ -24,6 +25,13 @@ export function crc32(str: string | Uint8Array): number {
     crc = (crc >>> 8) ^ CRC_TABLE[(crc ^ bytes[i]) & 0xff]
   }
   return (crc ^ -1) >>> 0
+}
+
+/** 按北京时间（UTC+8，上游钉死 CST）格式化 yyyyMMddHHmm，与宿主时区无关 */
+export function formatCstTime(now: Date): string {
+  const cst = new Date(now.getTime() + 8 * 3600 * 1000)
+  const pad = (n: number) => String(n).padStart(2, "0")
+  return `${cst.getUTCFullYear()}${pad(cst.getUTCMonth() + 1)}${pad(cst.getUTCDate())}${pad(cst.getUTCHours())}${pad(cst.getUTCMinutes())}`
 }
 
 export function signPath(
@@ -59,12 +67,12 @@ export function signPath(
     "s",
     "z",
   ]
-  const random = String(Math.round(1e7 * Math.random()))
+  // S-04 同类清单：sign 随机数改用 CSPRNG（原 Math.random）。
+  const random = String(randomInt(1e7))
   const now = new Date()
   const timestamp = String(Math.floor(now.getTime() / 1000))
 
-  const pad = (n: number) => String(n).padStart(2, "0")
-  const nowStr = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}${pad(now.getHours())}${pad(now.getMinutes())}`
+  const nowStr = formatCstTime(now)
 
   const mappedChars: string[] = []
   for (let i = 0; i < nowStr.length; i++) {

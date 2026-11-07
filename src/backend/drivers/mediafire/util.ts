@@ -16,6 +16,7 @@ export interface MFEntry {
   size: number
   isDir: boolean
   created: string
+  createdUtc?: string
 }
 
 export class ClientMediafire {
@@ -40,7 +41,11 @@ export class ClientMediafire {
     }
   }
 
-  private async postForm<T = any>(endpoint: string, data: Record<string, string>): Promise<T> {
+  private async postForm<T = any>(
+    endpoint: string,
+    data: Record<string, string>,
+    retried = false,
+  ): Promise<T> {
     const form = new URLSearchParams({
       session_token: this.sessionToken,
       response_format: "json",
@@ -57,7 +62,64 @@ export class ClientMediafire {
       },
       body: form.toString(),
     })
-    return (await resp.json().catch(() => ({}))) as T
+
+    // F-410：HTTP 状态码与非 JSON 响应都不再被静默当成成功（以前
+    // `resp.json().catch(() => ({}))` 会把 5xx / 登录页变成空对象）。
+    const text = await resp.text()
+    const snippet = text ? text.replace(/\s+/g, " ").slice(0, 200) : "(empty)"
+    if (!resp.ok) {
+      // F-415：session_token / cookie 失效时 MediaFire 常返回 4xx 或登录页，
+      // 重新从 cookie 换一次 session_token 并重试一次。
+      if (!retried && (await this.tryRefreshSession())) {
+        return this.postForm<T>(endpoint, data, true)
+      }
+      throw new Error(
+        `[MediaFire] HTTP ${resp.status} on ${endpoint}: ${snippet}`,
+      )
+    }
+
+    let json: any
+    try {
+      json = text ? JSON.parse(text) : {}
+    } catch {
+      if (!retried && (await this.tryRefreshSession())) {
+        return this.postForm<T>(endpoint, data, true)
+      }
+      throw new Error(
+        `[MediaFire] non-JSON response on ${endpoint} (HTTP ${resp.status}): ${snippet}`,
+      )
+    }
+
+    if (!retried && this.isSessionError(json)) {
+      if (await this.tryRefreshSession()) {
+        return this.postForm<T>(endpoint, data, true)
+      }
+    }
+    return json as T
+  }
+
+  /** 重新换取 session_token；失败时返回 false，让调用方抛出原始错误 */
+  private async tryRefreshSession(): Promise<boolean> {
+    try {
+      await this.getSessionToken()
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /** result 形如 "Success" 时才算成功；其余（含缺失）一律视为失败 */
+  private isSessionError(json: any): boolean {
+    const r = json?.response
+    if (!r || r.result === "Success") return false
+    const code = String(r.error ?? r.code ?? "")
+    const message = String(r.message || "")
+    return (
+      code === "1271" ||
+      /session/i.test(message) ||
+      /cookie/i.test(message) ||
+      /not\s*logged\s*in/i.test(message)
+    )
   }
 
   private async getSessionToken(): Promise<void> {
@@ -70,19 +132,21 @@ export class ClientMediafire {
         "Content-Length": "0",
       },
     })
+    if (!resp.ok) {
+      throw new Error(
+        `[MediaFire] failed to get session token: HTTP ${resp.status}`,
+      )
+    }
     const data: any = await resp.json().catch(() => ({}))
     const token = data?.response?.session_token
     if (!token) throw new Error("[MediaFire] failed to get session token from cookie")
     this.sessionToken = token
-    this.addition_session_token = token
   }
 
-  // 保存刷新后的 token 供上层持久化
-  addition_session_token = ""
-
   private checkResult(result?: string): void {
-    if (result && result !== "Success") {
-      throw new Error(`[MediaFire] API error: ${result}`)
+    // F-410：result 缺失（undefined/null）以前会被放行，把失败当成功。
+    if (result !== "Success") {
+      throw new Error(`[MediaFire] API error: ${result || "missing result"}`)
     }
   }
 
@@ -117,10 +181,20 @@ export class ClientMediafire {
           filter: "",
         },
       )
+      // F-410：list() 以前是唯一不校验 result 的方法，错误响应会被当成空目录。
+      this.checkResult(foldersResp.response?.result)
+      this.checkResult(filesResp.response?.result)
       const folders = foldersResp.response?.folder_content?.folders || []
       const files = filesResp.response?.folder_content?.files || []
       for (const f of folders) {
-        entries.push({ id: f.folderkey, name: f.name, size: 0, isDir: true, created: f.created })
+        entries.push({
+          id: f.folderkey,
+          name: f.name,
+          size: 0,
+          isDir: true,
+          created: f.created || "",
+          createdUtc: f.created_utc,
+        })
       }
       for (const f of files) {
         entries.push({
@@ -128,7 +202,8 @@ export class ClientMediafire {
           name: f.filename,
           size: parseInt(f.size, 10) || 0,
           isDir: false,
-          created: f.created,
+          created: f.created || "",
+          createdUtc: f.created_utc,
         })
       }
       more =

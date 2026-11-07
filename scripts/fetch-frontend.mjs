@@ -118,6 +118,31 @@ function captureArgv(file, args, opts = {}) {
 }
 
 /**
+ * Windows 上 npm / npx / pnpm 都是 .cmd shim：execFileSync 不经 shell 无法启动
+ * 它们（ENOENT；Node ≥18.20.2 出于 CVE-2024-27980 的缓解还会对 .cmd 直接 EINVAL）。
+ * 包管理器调用统一走这里：win32 下用 cmd.exe /d /s /c 执行。
+ *
+ * 命令串只由本文件生成的固定 token 组成（"install" / "--trust-lockfile" /
+ * "run" / "build" / 经严格正则校验的 pnpm@x.y.z），外部输入（registry 响应、
+ * cwd、env）都不进入命令串，遇到白名单外的 token 直接报错而不是降级拼接。
+ */
+const PM_TOKEN = /^[A-Za-z0-9@._/+=:-]+$/
+function runPm(file, args, opts = {}) {
+  if (process.platform !== "win32") return runArgv(file, args, opts)
+  const tokens = [file, ...args]
+  if (!tokens.every((t) => PM_TOKEN.test(t))) {
+    throw new Error(
+      `[fetch-frontend] unsafe package manager invocation: ${JSON.stringify(tokens)}`,
+    )
+  }
+  return runArgv(
+    process.env.ComSpec || "cmd.exe",
+    ["/d", "/s", "/c", tokens.join(" ")],
+    opts,
+  )
+}
+
+/**
  * 即便走 argv，以 `-` 开头的值仍会被 git/curl 当成选项解析（例如
  * `FRONTEND_GIT_REF=--upload-pack=...`），所以外部传入的 ref/url 还要过白名单。
  */
@@ -325,9 +350,27 @@ function supportsWorkerSetup(src) {
 }
 
 function replaceDist(src) {
+  const resolvedSrc = path.resolve(src)
+  const resolvedDest = path.resolve(DEST)
   console.log(`  Copying frontend dist: ${src} -> ${DEST}`)
-  fs.rmSync(DEST, { recursive: true, force: true })
-  fs.cpSync(src, DEST, { recursive: true })
+  if (resolvedSrc === resolvedDest) {
+    // FRONTEND_DIST 指向仓库自身 dist（CI 缓存恢复的常见用法）：先 rm 会把唯一
+    // 一份产物删掉、随后的 cp 抛 ENOENT。源=目标时跳过删除/复制，只做后续加工。
+    console.log(
+      "  [fetch-frontend] FRONTEND_DIST 指向 dist 本身，跳过删除/复制（保留缓存产物）",
+    )
+  } else if (
+    resolvedDest.startsWith(resolvedSrc + path.sep) ||
+    resolvedSrc.startsWith(resolvedDest + path.sep)
+  ) {
+    throw new Error(
+      `[fetch-frontend] FRONTEND_DIST 与目标 dist 目录相互嵌套：${resolvedSrc} vs ${resolvedDest}。` +
+        `先删后拷会破坏源目录，请改用独立目录`,
+    )
+  } else {
+    fs.rmSync(DEST, { recursive: true, force: true })
+    fs.cpSync(src, DEST, { recursive: true })
+  }
   copyManifestToRoot()
   stampFrontendVersion(src)
   patchManifestCredentials()
@@ -348,7 +391,9 @@ function tarBin() {
   if (process.platform === "win32") {
     const sys = process.env.SystemRoot || "C:\\Windows"
     const bsdtar = path.join(sys, "System32", "tar.exe")
-    if (fs.existsSync(bsdtar)) return `"${bsdtar}"`
+    // 唯一调用方 runArgv 走 execFileSync（不经 shell）：参数必须是裸路径，
+    // 带引号会被当成文件名的一部分而 ENOENT。路径含空格时 argv 天然安全。
+    if (fs.existsSync(bsdtar)) return bsdtar
   }
   return "tar"
 }
@@ -584,6 +629,7 @@ async function fetchI18n(repo) {
     runArgv(tarBin(), ["-xzf", tmpTar, "-C", langDir])
   }
   console.log(`  Fetching i18n translations: ${I18N_TAR_URL}`)
+  let lastError = null
   try {
     fetchOnce()
   } catch (err) {
@@ -596,7 +642,7 @@ async function fetchI18n(repo) {
       fetchOnce()
     } catch (err2) {
       if (isIntegrityError(err2)) throw err2
-      /* 交由下面的落地检查统一报错 */
+      lastError = err2
     }
   } finally {
     fs.rmSync(tmpTar, { force: true })
@@ -604,6 +650,20 @@ async function fetchI18n(repo) {
 
   // 落地检查：下载"没报错"但没解出任何语言目录，同样是英文产物
   const langs = extraLangs(langDir)
+  if (lastError) {
+    // 第二次失败同样必须可见：复用仓库（FRONTEND_REPO / 同级 monorepo）时
+    // src/lang 里可能残留上一轮解出的语言目录，只看「有没有目录」会把陈旧翻译
+    // 当成本次成功。按本函数声明的「失败即中断」处理，降级需显式 I18N_OPTIONAL=1。
+    const detail = `i18n 下载两次均失败（${lastError?.message || lastError}）`
+    if (langs.length === 0) return bail("未解出任何非英文语言包，")
+    const hint = `src/lang 现有目录将被沿用，可能陈旧或缺少上游新增语言：${langs.join(", ")}`
+    if (!optional) {
+      throw new Error(
+        `[fetch-frontend] ${detail}；${hint}。确认接受现有语言包请显式设 I18N_OPTIONAL=1`,
+      )
+    }
+    console.warn(`  [fetch-frontend] ${detail}；${hint}（I18N_OPTIONAL=1，已降级继续）`)
+  }
   if (langs.length === 0) return bail("未解出任何非英文语言包，")
   console.log(`  [fetch-frontend] i18n ready: ${langs.join(", ")}`)
 
@@ -620,7 +680,7 @@ async function buildLocalRepo(repo) {
   const pm = detectPackageManager(abs)
   const cmd = resolvePmCommand(abs, pm)
   const install = (extra = []) =>
-    runArgv(cmd.file, [...cmd.args, "install", ...extra], { cwd: abs })
+    runPm(cmd.file, [...cmd.args, "install", ...extra], { cwd: abs })
   try {
     install()
   } catch (err) {
@@ -642,7 +702,7 @@ async function buildLocalRepo(repo) {
   // 环境（如 EdgeOne 控制台环境变量）误设 VITE_API_URL=/api，官方前端会拼成
   // baseURL=/api/api，导致 API 请求双前缀、落到 SPA 兜底返回 HTML。
   // 这里构建前端时强制覆盖为 "/"，杜绝外部污染。
-  runArgv(cmd.file, [...cmd.args, "run", "build"], {
+  runPm(cmd.file, [...cmd.args, "run", "build"], {
     cwd: abs,
     env: { ...process.env, VITE_API_URL: "/" },
   })

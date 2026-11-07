@@ -29,6 +29,9 @@ import {
   ProtonLink,
   ProtonShare,
   ProtonListResp,
+  ProtonBlock,
+  ProtonRevisionListResp,
+  ProtonRevisionResp,
 } from "./types"
 import { ProtonShareTypeMain } from "./consts"
 import {
@@ -40,15 +43,20 @@ import {
 import {
   KeyRing,
   decryptArmoredText,
+  decryptNodeHashKey,
   decryptSessionKeyPacket,
   decryptBinaryWithSessionKey,
-  decryptXAttrSize,
+  decryptXAttr,
+  encryptBinary,
   encryptText,
   getNameHash,
+  signDetachedText,
 } from "./crypto"
 import * as openpgp from "openpgp"
 
 const LIST_PAGE_SIZE = 150
+// 修订详情的 Blocks 分页大小（官方 SDK 使用 20）
+const BLOCK_PAGE_SIZE = 50
 
 function parseProtonDate(timestamp: number): string {
   if (!timestamp) return new Date().toISOString()
@@ -58,13 +66,39 @@ function parseProtonDate(timestamp: number): string {
 export function normalizeProtonDriveAddition(a: any): ProtonDriveAddition {
   const norm = { ...(a || {}) } as any
   norm.email = (norm.email || "").trim()
-  norm.password = (norm.password || "").trim()
+  // Do not trim the password: leading/trailing whitespace can be part of a
+  // legitimate password and trimming silently changes the SRP verifier.
+  norm.password = norm.password || ""
   norm.two_fa_code = (norm.two_fa_code || "").trim()
   norm.root_folder_id = (norm.root_folder_id || "").trim() || "root"
   norm.use_reusable_login = !!norm.use_reusable_login
   norm.chunk_size = norm.chunk_size || "4"
   norm.reusable_credential = (norm.reusable_credential || "").trim()
   return norm as ProtonDriveAddition
+}
+
+/**
+ * 计算每个加密块的明文起始偏移。
+ *
+ * Proton 的 Block.Index 是 1-based（官方上传循环 `for i := 1`、
+ * go-proton-api 校验 `fromBlock < 1` 即报错），因此绝不能按 Index * chunkSize
+ * 计算。优先使用解密后 XAttr 里的 BlockSizes 逐块累计真实长度，缺失时按
+ * (Index - 1) * chunkSize 退化。
+ */
+export function computeBlockOffsets<T extends { Index: number }>(
+  blocks: T[],
+  blockSizes: number[],
+  chunkSize: number,
+): { blocks: T[]; offsets: number[]; totalSize: number } {
+  const ordered = [...blocks].sort((a, b) => a.Index - b.Index)
+  const offsets: number[] = []
+  let total = 0
+  for (let i = 0; i < ordered.length; i++) {
+    offsets.push(total)
+    const declared = blockSizes[i]
+    total += typeof declared === "number" && declared > 0 ? declared : chunkSize
+  }
+  return { blocks: ordered, offsets, totalSize: total }
 }
 
 export class ProtonDriveDriver implements StorageDriver {
@@ -76,12 +110,14 @@ export class ProtonDriveDriver implements StorageDriver {
   private addrKRs: Map<string, KeyRing> = new Map()
   private defaultAddrKR: KeyRing = []
   private defaultAddrID = ""
+  private defaultAddrEmail = ""
 
   // 路径/ID 缓存
   private idCache = new Map<string, string>()
   private linkCache = new Map<string, ProtonLink>()
   private nodeKRcache = new Map<string, KeyRing>()
   private childrenCache = new Map<string, ProtonLink[]>()
+  private hashKeyCache = new Map<string, Uint8Array>()
 
   constructor(addition: any) {
     this.addition = normalizeProtonDriveAddition(addition)
@@ -115,6 +151,7 @@ export class ProtonDriveDriver implements StorageDriver {
 
     // 默认地址（第一个地址）
     this.defaultAddrID = addresses[0]?.ID || ""
+    this.defaultAddrEmail = addresses[0]?.Email || ""
     this.defaultAddrKR = this.addrKRs.get(this.defaultAddrID) || []
 
     // 获取主 share 并解锁 share 密钥环
@@ -177,6 +214,61 @@ export class ProtonDriveDriver implements StorageDriver {
     const kr = [...parentKR, unlocked]
     this.nodeKRcache.set(linkID, kr)
     return kr
+  }
+
+  /**
+   * Decrypt the folder's NodeHashKey (the HMAC key for child names).
+   * `FolderProperties.NodeHashKey` is an armored OpenPGP message encrypted
+   * with the folder's own keyring.
+   */
+  private async getNodeHashKey(folderID: string): Promise<Uint8Array> {
+    const cached = this.hashKeyCache.get(folderID)
+    if (cached) return cached
+    const link = await this.fetchLink(folderID)
+    const armored = link.FolderProperties?.NodeHashKey
+    if (!armored) {
+      throw new Error(`folder has no NodeHashKey: ${folderID}`)
+    }
+    const kr = await this.getLinkKR(folderID)
+    const hashKey = await decryptNodeHashKey(armored, kr)
+    if (hashKey.length === 0) {
+      throw new Error(`empty NodeHashKey: ${folderID}`)
+    }
+    this.hashKeyCache.set(folderID, hashKey)
+    return hashKey
+  }
+
+  /** Address private key used to sign names / node passphrases. */
+  private getSigningKey(): openpgp.PrivateKey {
+    const key = this.defaultAddrKR[0]
+    if (!key) throw new Error("no unlocked address key for signing")
+    return key as openpgp.PrivateKey
+  }
+
+  /**
+   * Invalidate driver-level caches after a successful write. The driver
+   * instance is cached by storage.id_modified, so stale entries would
+   * otherwise survive for the whole isolate lifetime.
+   */
+  private invalidateWriteCaches(opts: {
+    parentID?: string
+    linkID?: string
+    path?: string
+  }): void {
+    if (opts.parentID) this.childrenCache.delete(opts.parentID)
+    if (opts.linkID) {
+      this.linkCache.delete(opts.linkID)
+      this.nodeKRcache.delete(opts.linkID)
+      this.hashKeyCache.delete(opts.linkID)
+    }
+    if (opts.path) {
+      const prefix = this.cleanPath(opts.path)
+      for (const key of [...this.idCache.keys()]) {
+        if (key === prefix || key.startsWith(prefix + "/")) {
+          this.idCache.delete(key)
+        }
+      }
+    }
   }
 
   /** 解密文件名 */
@@ -265,9 +357,27 @@ export class ProtonDriveDriver implements StorageDriver {
       const name = await this.decryptName(link)
       this.idCache.set(this.joinPath(clean, name), link.LinkID)
       const isDir = link.Type === 2
+      let size = 0
+      if (!isDir) {
+        // `link.Size` is the *encrypted* size; the real size lives in XAttr.
+        try {
+          const nodeKR = await this.getLinkKR(link.LinkID)
+          // List responses may omit XAttr; fetchLink is already cached by
+          // getLinkKR, so use the full link metadata.
+          const full = await this.fetchLink(link.LinkID)
+          const xattr = await decryptXAttr(full.XAttr || link.XAttr || "", nodeKR)
+          size =
+            xattr.size ||
+            xattr.blockSizes.reduce((a, b) => a + b, 0) ||
+            link.Size ||
+            0
+        } catch {
+          size = link.Size || 0
+        }
+      }
       items.push({
         name,
-        size: isDir ? 0 : link.Size || 0,
+        size,
         is_dir: isDir,
         modified: parseProtonDate(link.ModifyTime || link.CreateTime),
         sign: link.LinkID,
@@ -300,8 +410,12 @@ export class ProtonDriveDriver implements StorageDriver {
     let size = 0
     if (!isDir) {
       const nodeKR = await this.getLinkKR(linkID)
-      size = await decryptXAttrSize(link.XAttr || "", nodeKR)
-      if (!size) size = link.Size || 0
+      const xattr = await decryptXAttr(link.XAttr || "", nodeKR)
+      size =
+        xattr.size ||
+        xattr.blockSizes.reduce((a, b) => a + b, 0) ||
+        link.Size ||
+        0
     }
 
     return {
@@ -334,52 +448,57 @@ export class ProtonDriveDriver implements StorageDriver {
       throw new Error("file has no content key packet")
     }
 
-    // 解密 content session key
+    // 解密 content session key（ContentKeyPacket 是 base64 二进制 PKESK）
     const sessionKey = await decryptSessionKeyPacket(contentKeyPacket, nodeKR)
 
-    // 获取 revision（含加密分块列表）
-    const revisions = (await this.client.requestAPI(
-      `/drive/volumes/${this.getVolumeID()}/links/${linkID}/revisions`,
-    )) as { Code: number; Revisions: any[] }
-    const revision = revisions.Revisions?.find((r) => r.State === 1) || revisions.Revisions?.[0]
-    if (!revision?.Blocks?.length) {
-      throw new Error("file has no blocks")
-    }
-    const blocks = revision.Blocks as {
-      Index: number
-      BareURL: string
-      Token: string
-    }[]
+    // 修订列表只返回元数据；Blocks 必须从单个修订详情接口分页获取。
+    const blocks = await this.getRevisionBlocks(linkID)
 
-    // 解密后真实大小（用于无 Range 请求时的 end 计算）
-    const decryptedSize =
-      (await decryptXAttrSize(link.XAttr || "", nodeKR)) || revision.Size || 0
+    const xattr = await decryptXAttr(link.XAttr || "", nodeKR)
     const chunkSize = (parseInt(this.addition.chunk_size || "4") || 4) * 1024 * 1024
 
+    // 每个块的真实明文偏移：优先用 XAttr 的 BlockSizes 逐块累计，
+    // 缺失时退化为 (Index - 1) * chunkSize（Index 是 1-based）。
+    const {
+      blocks: ordered,
+      offsets,
+      totalSize,
+    } = computeBlockOffsets(blocks, xattr.blockSizes, chunkSize)
+    const decryptedSize = xattr.size || Math.min(totalSize, Number.MAX_SAFE_INTEGER)
+
     const start = options?.start ?? 0
-    // 当解密后大小未知时（decryptedSize <= 0），使用一个足够大的上界，
-    // 避免无 Range 的完整下载只流式传输第一个字节。
+    // 解密后大小未知时使用足够大的上界，保证无 Range 请求能读到最后一个块。
     const end =
       options?.end ?? (decryptedSize > 0 ? decryptedSize - 1 : Number.MAX_SAFE_INTEGER)
 
-    let self = this
+    const self = this
+    let position = start
+    let index = 0
     return new ReadableStream<Uint8Array>({
       async pull(controller) {
         try {
-          let position = start
-          for (const block of blocks) {
+          while (index < ordered.length) {
+            const block = ordered[index]
+            const blockStart = offsets[index]
+            index++
             if (position > end) break
+            // 解密后的块长度即真实长度；估算偏移只用于判断是否需要读取。
+            const estimatedLength =
+              xattr.blockSizes[index - 1] > 0
+                ? xattr.blockSizes[index - 1]
+                : chunkSize
+            if (blockStart + estimatedLength - 1 < position) continue
+
             const blockBytes = await self.downloadBlock(block.BareURL, block.Token)
             const plain = await decryptBinaryWithSessionKey(blockBytes, [sessionKey])
-
-            // 按字节区间切片
-            const blockStart = block.Index * chunkSize
             const blockEnd = blockStart + plain.length - 1
-            const from = Math.max(start, blockStart)
+            const from = Math.max(position, blockStart)
             const to = Math.min(end, blockEnd)
             if (from <= to) {
               controller.enqueue(plain.slice(from - blockStart, to - blockStart + 1))
               position = to + 1
+              if (position > end) break
+              return
             }
           }
           controller.close()
@@ -390,9 +509,48 @@ export class ProtonDriveDriver implements StorageDriver {
     })
   }
 
+  /**
+   * 获取文件的（活跃修订的）加密块列表。
+   *
+   * GET .../revisions 只返回修订元数据（无 Blocks）；Blocks 属于单个修订详情，
+   * 需 GET .../revisions/{revisionID}?FromBlockIndex=N&PageSize=M 分页拉取。
+   * Block.Index 是 1-based（官方客户端与 go-proton-api 一致）。
+   */
+  private async getRevisionBlocks(linkID: string): Promise<ProtonBlock[]> {
+    const list = (await this.client.requestAPI(
+      `/drive/volumes/${this.getVolumeID()}/links/${linkID}/revisions`,
+    )) as ProtonRevisionListResp
+    const revision =
+      list.Revisions?.find((r) => r.State === 1) || list.Revisions?.[0]
+    if (!revision?.ID) throw new Error("file has no active revision")
+
+    const all: ProtonBlock[] = []
+    let fromBlockIndex = 1
+    for (let page = 0; page < 1000; page++) {
+      const resp = (await this.client.requestAPI(
+        `/drive/volumes/${this.getVolumeID()}/links/${linkID}/revisions/${revision.ID}`,
+        {
+          params: {
+            FromBlockIndex: String(fromBlockIndex),
+            PageSize: String(BLOCK_PAGE_SIZE),
+          },
+        },
+      )) as ProtonRevisionResp
+      const got = resp.Revision?.Blocks || []
+      all.push(...got)
+      if (got.length < BLOCK_PAGE_SIZE) break
+      const lastIndex = got[got.length - 1]?.Index
+      if (!lastIndex) break
+      fromBlockIndex = lastIndex + 1
+    }
+    if (!all.length) throw new Error("file has no blocks")
+    return all
+  }
+
   private async downloadBlock(bareURL: string, token: string): Promise<Uint8Array> {
+    // Proton 存储端点只接受 pm-storage-token，不接受 Authorization: Bearer。
     const res = await fetch(bareURL, {
-      headers: { Authorization: `Bearer ${token}` },
+      headers: { "pm-storage-token": token },
     })
     if (!res.ok) {
       throw new Error(`block download failed: ${res.status}`)
@@ -409,31 +567,56 @@ export class ProtonDriveDriver implements StorageDriver {
     const parentId = await this.resolveId(parentPath)
 
     const parentKR = await this.getLinkKR(parentId)
-    const encryptedName = await encryptText(dirName, parentKR)
-    const nameHash = await getNameHash(dirName)
+    const parentHashKey = await this.getNodeHashKey(parentId)
+    const signingKey = this.getSigningKey()
+    const encryptedName = await encryptText(dirName, parentKR, signingKey)
+    const nameHash = await getNameHash(dirName, parentHashKey)
 
-    // 生成节点密钥对（公钥作为 NodeKey 上传，私钥的 passphrase 用父密钥环加密）
-    const { publicKey: nodePublicArmored } = await openpgp.generateKey({
+    // 生成节点密钥对；Proton 的 NodeKey 字段存放的是用 NodePassphrase
+    // 加密后的 armored **私钥**（getLinkKR 用 NodePassphrase 解锁它）。
+    const nodePassphrase = randomPassphrase()
+    const { privateKey: nodePrivateArmored } = await openpgp.generateKey({
       type: "ecc",
       curve: "curve25519Legacy",
-      userIDs: [{ name: dirName, email: this.mainShare?.Creator || "" }],
+      userIDs: [{ name: dirName, email: this.defaultAddrEmail }],
+      passphrase: nodePassphrase,
     })
-    const nodePassphrase = randomPassphrase()
+    // NodePassphraseSignature 必须是 passphrase 明文的地址密钥 detached 签名。
     const encryptedPassphrase = await encryptText(nodePassphrase, parentKR)
+    const passphraseSignature = await signDetachedText(
+      nodePassphrase,
+      signingKey,
+    )
 
-    await this.client.requestAPI("/drive/shares/" + this.getShareID() + "/folders", {
-      method: "POST",
-      body: {
-        ParentLinkID: parentId,
-        Name: encryptedName,
-        Hash: nameHash,
-        NodeKey: nodePublicArmored,
-        NodePassphrase: encryptedPassphrase,
-        NodePassphraseSignature: "",
-        SignatureAddress: this.defaultAddrID,
-        NameSignatureEmail: this.mainShare?.Creator || "",
+    // 新目录的 NodeHashKey：随机 32 字节名称哈希密钥，用父节点密钥环加密
+    // 并由地址密钥签名（与官方 encryptWithSignature 行为一致）。
+    const newHashKey = crypto.getRandomValues(new Uint8Array(32))
+    const nodeHashKey = await encryptBinary(newHashKey, parentKR, signingKey)
+
+    const resp = (await this.client.requestAPI(
+      "/drive/shares/" + this.getShareID() + "/folders",
+      {
+        method: "POST",
+        body: {
+          ParentLinkID: parentId,
+          Name: encryptedName,
+          Hash: nameHash,
+          NodeKey: nodePrivateArmored,
+          NodeHashKey: nodeHashKey,
+          NodePassphrase: encryptedPassphrase,
+          NodePassphraseSignature: passphraseSignature,
+          SignatureAddress: this.defaultAddrEmail,
+          NameSignatureEmail: this.defaultAddrEmail,
+        },
       },
-    })
+    )) as { Link?: ProtonLink }
+
+    this.invalidateWriteCaches({ parentID: parentId, path: clean })
+    const createdID = resp?.Link?.LinkID
+    if (createdID) {
+      this.linkCache.set(createdID, resp.Link as ProtonLink)
+      this.hashKeyCache.set(createdID, newHashKey)
+    }
   }
 
   async rename(
@@ -441,12 +624,19 @@ export class ProtonDriveDriver implements StorageDriver {
     physicalPath: string,
     newName: string,
   ): Promise<void> {
-    const linkID = await this.resolveId(physicalPath)
+    const clean = this.cleanPath(physicalPath)
+    const linkID = await this.resolveId(clean)
     const link = await this.fetchLink(linkID)
-    const parentKR = await this.getLinkKR(link.ParentLinkID)
+    const parentID = link.ParentLinkID
+    const parentKR = await this.getLinkKR(parentID)
+    const parentHashKey = await this.getNodeHashKey(parentID)
 
-    const encryptedName = await encryptText(newName, parentKR)
-    const newHash = await getNameHash(newName)
+    const encryptedName = await encryptText(
+      newName,
+      parentKR,
+      this.getSigningKey(),
+    )
+    const newHash = await getNameHash(newName, parentHashKey)
     const originalHash = link.Hash || ""
 
     await this.client.requestAPI(
@@ -455,12 +645,19 @@ export class ProtonDriveDriver implements StorageDriver {
         method: "PUT",
         body: {
           Name: encryptedName,
-          NameSignatureEmail: this.mainShare?.Creator || "",
+          NameSignatureEmail: this.defaultAddrEmail,
           Hash: newHash,
           OriginalHash: originalHash,
         },
       },
     )
+
+    // Path and name caches are now stale.
+    this.invalidateWriteCaches({
+      parentID,
+      linkID,
+      path: clean,
+    })
   }
 
   async remove(
@@ -468,11 +665,18 @@ export class ProtonDriveDriver implements StorageDriver {
     physicalPath: string,
     names: string[],
   ): Promise<void> {
-    const linkID = await this.resolveId(physicalPath)
+    const clean = this.cleanPath(physicalPath)
+    const linkID = await this.resolveId(clean)
+    const link = await this.fetchLink(linkID)
     await this.client.requestAPI(
       `/drive/volumes/${this.getVolumeID()}/links/${linkID}/trash`,
       { method: "POST" },
     )
+    this.invalidateWriteCaches({
+      parentID: link.ParentLinkID,
+      linkID,
+      path: clean,
+    })
   }
 
   async move(

@@ -74,7 +74,7 @@ test("401 响应转换为 Session 失效提示", async () => {
   }
 })
 
-test("folder/meta ID 形态回退：400 后自动去掉 d 前缀重试", async () => {
+test("folder/meta 按文档优先去前缀，400 后回退带 d 前缀 (F-234)", async () => {
   const stub = stubFetch([
     { code: 400, message: "资源不存在" },
     { code: 200, key: "d123", name: "相册" },
@@ -84,8 +84,8 @@ test("folder/meta ID 形态回退：400 后自动去掉 d 前缀重试", async (
     const meta = await client.folderMeta("d123")
     assert.equal(meta.name, "相册")
     assert.equal(stub.calls.length, 2)
-    assert.equal(stub.calls[0].body.folder_id, "d123")
-    assert.equal(stub.calls[1].body.folder_id, "123")
+    assert.equal(stub.calls[0].body.folder_id, "123")
+    assert.equal(stub.calls[1].body.folder_id, "d123")
     assert.equal(
       stub.calls[1].url,
       "https://rest.ctfile.com/v1/public/folder/meta",
@@ -225,4 +225,106 @@ test("normalizeCtFileAddition 填充默认值", () => {
   assert.equal(custom.cloud_type, "private")
   assert.equal(custom.order_by, "size")
   assert.equal(custom.order_direction, "desc")
+})
+
+test("withOrder：asc 的 size/time 发出升序令牌，desc 翻转 (F-233)", async () => {
+  const stub = stubFetch([{ code: 200, results: [] }])
+  try {
+    const asc = new CtFileClient({
+      session: "s",
+      order_by: "size",
+      order_direction: "asc",
+    } as any)
+    await asc.listFolders("d0")
+    assert.equal(stub.calls[0].body.orderby, "small")
+
+    const desc = new CtFileClient({
+      session: "s",
+      order_by: "time",
+      order_direction: "desc",
+    } as any)
+    await desc.listFolders("d0")
+    assert.equal(stub.calls[1].body.orderby, "new")
+  } finally {
+    stub.restore()
+  }
+})
+
+test("429/5xx 会继续重试且不把响应体留在未消费状态 (F-232)", async () => {
+  const original = globalThis.fetch
+  let calls = 0
+  let cancelled = false
+  globalThis.fetch = (async () => {
+    calls++
+    if (calls === 1) {
+      const res = new Response("rate limited", { status: 429 })
+      const origBody = res.body
+      Object.defineProperty(res, "body", {
+        value: {
+          cancel: async () => {
+            cancelled = true
+            await origBody?.cancel()
+          },
+        },
+      })
+      return res
+    }
+    return new Response(JSON.stringify({ code: 200, results: [] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    })
+  }) as any
+  try {
+    const client = new CtFileClient({ session: "s" } as any)
+    const folders = await client.listFolders("d0")
+    assert.deepEqual(folders, [])
+    assert.equal(calls, 2)
+    assert.equal(cancelled, true)
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test("读取响应体中途失败时走重试与统一错误包装 (F-232)", async () => {
+  const original = globalThis.fetch
+  let calls = 0
+  globalThis.fetch = (async () => {
+    calls++
+    if (calls === 1) {
+      return {
+        status: 200,
+        ok: true,
+        text: async () => {
+          throw new TypeError("terminated")
+        },
+      }
+    }
+    return new Response(JSON.stringify({ code: 200, results: [] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    })
+  }) as any
+  try {
+    const client = new CtFileClient({ session: "s" } as any)
+    assert.deepEqual(await client.listFolders("d0"), [])
+    assert.equal(calls, 2)
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test("uploadTicket 只对传入的视图计算 md5（不复制整文件）(F-231)", async () => {
+  const stub = stubFetch([{ code: 200, upload_url: "https://u/" }])
+  try {
+    const client = new CtFileClient({ session: "s" } as any)
+    const backing = new TextEncoder().encode("XXhelloYY")
+    const view = backing.subarray(2, 7) // "hello"
+    await client.uploadTicket("d0", "hello.txt", view)
+    assert.equal(
+      stub.calls[0].body.checksum,
+      "5d41402abc4b2a76b9719d911017c592-5",
+    )
+  } finally {
+    stub.restore()
+  }
 })

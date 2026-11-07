@@ -39,11 +39,12 @@ export class PikPakShareDriver implements StorageDriver {
       const folder = files.find(
         (f) => f.kind === "drive#folder" && f.name === part,
       )
-      if (folder) {
-        currentId = folder.id
-      } else {
-        break
+      if (!folder) {
+        // F-450：任一段不存在必须报错；静默 break 会把根目录内容当成
+        // 不存在的子路径返回，get() 还可能取到错误层级的同名文件。
+        throw new Error(`Directory '${part}' not found`)
       }
+      currentId = folder.id
     }
 
     return currentId

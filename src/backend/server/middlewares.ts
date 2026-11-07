@@ -232,9 +232,22 @@ export async function getJwtSecret(c?: Context | any): Promise<string> {
 // 需要更强保证时应改用短 TTL 的强制撤销或服务端会话表。
 const REVOKED_KV_KEY = "openlist_revoked_tokens"
 const REVOKED_RELOAD_MS = 30_000
-const revokedJtis = new Set<string>()
+/**
+ * jti → exp（秒）。用 Map 而不是 Set：注销时必须记住每条记录的过期时间，
+ * 否则过期条目在 isolate 存续期内永驻内存（F-051：Set 只增不减）。
+ */
+const revokedJtis = new Map<string, number>()
 let revokedLoadedAt = 0
 let revokedInflight: Promise<void> | null = null
+/** 串行化持久层的 read-modify-write，避免同实例并发注销互相覆盖（F-045）。 */
+let revokedWriteChain: Promise<void> = Promise.resolve()
+
+/** 剔除本地已过期的 jti（惰性清理，无需定时器）。 */
+function pruneRevokedJtis(now = Math.floor(Date.now() / 1000)): void {
+  for (const [jti, exp] of revokedJtis) {
+    if (!(exp > now)) revokedJtis.delete(jti)
+  }
+}
 
 /** 按 TTL 回读整表黑名单，让其他实例的注销在有限时间内收敛。 */
 async function ensureRevokedLoaded(env: any): Promise<void> {
@@ -244,11 +257,17 @@ async function ensureRevokedLoaded(env: any): Promise<void> {
     try {
       const { readPersistedSecret } = await import("../internal/model/db")
       const raw = await readPersistedSecret(env, REVOKED_KV_KEY)
+      const now = Math.floor(Date.now() / 1000)
+      // 回读时顺带清掉本地已过期的条目，Map 不会单调增长
+      pruneRevokedJtis(now)
       if (raw) {
-        const arr = JSON.parse(String(raw))
-        const now = Math.floor(Date.now() / 1000)
-        for (const item of arr) {
-          if (item && item.jti && item.exp > now) revokedJtis.add(item.jti)
+        const parsed = JSON.parse(String(raw))
+        if (Array.isArray(parsed)) {
+          for (const item of parsed) {
+            if (item && item.jti && item.exp > now) {
+              revokedJtis.set(item.jti, Number(item.exp))
+            }
+          }
         }
       }
     } catch {
@@ -268,38 +287,56 @@ export async function revokeToken(
   env: any,
 ): Promise<void> {
   if (!jti) return
-  // 本实例立即生效
-  revokedJtis.add(jti)
-  try {
-    const { readPersistedSecret, writePersistedSecret } = await import(
-      "../internal/model/db"
-    )
-    let arr: Array<{ jti: string; exp: number }> = []
-    const raw = await readPersistedSecret(env, REVOKED_KV_KEY)
-    if (raw) {
-      try {
-        const parsed = JSON.parse(String(raw))
-        if (Array.isArray(parsed)) arr = parsed
-      } catch {
-        arr = []
+  const now = Math.floor(Date.now() / 1000)
+  // 本实例立即生效（exp 缺失/非法时按「已过期」之前的保守值处理）
+  revokedJtis.set(jti, Number.isFinite(exp) && exp > 0 ? exp : now)
+  // 同一实例内的并发注销必须串行执行 read-modify-write：整表覆盖写下，
+  // 两个并发请求各读旧表再写回会互相丢弃对方的 jti（F-045）。
+  // 跨实例的丢更新仍无法在「整表单键」布局下原子解决（需要后端 CAS 或按
+  // jti 分键），这里保证同实例不丢，并依靠 30s 回读收敛无冲突的写入。
+  const task = revokedWriteChain.then(async () => {
+    try {
+      const { readPersistedSecret, writePersistedSecret } = await import(
+        "../internal/model/db"
+      )
+      let arr: Array<{ jti: string; exp: number }> = []
+      const raw = await readPersistedSecret(env, REVOKED_KV_KEY)
+      if (raw) {
+        try {
+          const parsed = JSON.parse(String(raw))
+          if (Array.isArray(parsed)) arr = parsed
+        } catch {
+          arr = []
+        }
       }
+      const ts = Math.floor(Date.now() / 1000)
+      // exp 过期的条目自动淘汰，列表不会无限增长
+      arr = arr.filter((i) => i && i.jti && i.exp > ts)
+      if (!arr.some((i) => i.jti === jti)) arr.push({ jti, exp })
+      await writePersistedSecret(env, REVOKED_KV_KEY, JSON.stringify(arr))
+    } catch (e) {
+      console.warn("[JWT] Failed to persist revoked token:", e)
     }
-    const now = Math.floor(Date.now() / 1000)
-    // exp 过期的条目自动淘汰，列表不会无限增长
-    arr = arr.filter((i) => i && i.jti && i.exp > now)
-    if (!arr.some((i) => i.jti === jti)) arr.push({ jti, exp })
-    await writePersistedSecret(env, REVOKED_KV_KEY, JSON.stringify(arr))
-  } catch (e) {
-    console.warn("[JWT] Failed to persist revoked token:", e)
-  }
+  })
+  revokedWriteChain = task
+  await task
 }
 
 export async function isTokenRevoked(jti: string, env: any): Promise<boolean> {
   if (!jti) return false
-  // 本实例的注销无需等待回读即可生效
-  if (revokedJtis.has(jti)) return true
+  const now = Math.floor(Date.now() / 1000)
+  // 本实例的注销无需等待回读即可生效；过期条目顺手剔除（F-051）
+  const localExp = revokedJtis.get(jti)
+  if (localExp !== undefined) {
+    if (localExp > now) return true
+    revokedJtis.delete(jti)
+  }
   await ensureRevokedLoaded(env)
-  return revokedJtis.has(jti)
+  const loadedExp = revokedJtis.get(jti)
+  if (loadedExp === undefined) return false
+  if (loadedExp > now) return true
+  revokedJtis.delete(jti)
+  return false
 }
 
 export async function adminAuthMiddleware(
@@ -401,91 +438,13 @@ export async function matchCronSecret(c: Context): Promise<boolean> {
  * - 无凭证时，仅当数据库中存在且未禁用的 guest 用户时才返回该游客信息；
  * - 若 guest 用户不存在（被删除）或被禁用，则返回 null（未授权状态）。
  */
-// ============ CSRF 防护 (添加日期: 2026-09-05) ============
-/**
- * 生成 CSRF Token（短期有效，1小时过期）
- */
-export async function generateCSRFToken(c: Context): Promise<string> {
-  const { sign } = await import("hono/jwt")
-  const secret = await getJwtSecret(c)
-  const token = await sign(
-    {
-      type: "csrf",
-      jti: crypto.randomUUID
-        ? crypto.randomUUID()
-        : generateRandomSecret().slice(0, 16),
-      exp: Math.floor(Date.now() / 1000) + 3600, // 1 小时过期
-    },
-    secret,
-  )
-  return token
-}
-
-/**
- * CSRF 保护中间件：对 POST/PUT/DELETE/PATCH 请求验证 CSRF token
- * GET/HEAD/OPTIONS 请求豁免检查
- *
- * 安全增强 (2026-09-08):
- * - 仅允许从 HTTP Header 获取 token（移除 Query 和 Body 获取）
- * - 防止 JSON 劫持和 URL 泄露攻击
- */
-/**
- * CSRF 双提交校验中间件。
- *
- * 现状：本项目的会话凭证只走 `Authorization: Bearer`（登录响应体里返回，前端存
- * localStorage），服务端从不签发承载身份的 Cookie（唯一写 Cookie 的地方是本模块，
- * 而它未被挂载）。跨站表单/fetch 无法自带攻击者不知道的 Authorization 头，因此
- * 传统 CSRF 在这里不成立；把本中间件挂上去只会让不发送 X-CSRF-Token 的既有客户端
- * （官方前端、curl、SDK）全部写失败。
- *
- * 若将来引入 Cookie 会话（例如 HttpOnly JWT），必须同时在此挂载本中间件，并把
- * SameSite 设为 Strict/Lax。
- */
-export async function csrfProtection(c: Context, next: () => Promise<void>) {
-  const method = c.req.method.toUpperCase()
-
-  // GET/HEAD/OPTIONS 请求无需 CSRF 验证
-  if (["GET", "HEAD", "OPTIONS"].includes(method)) {
-    return next()
-  }
-
-  // 仅从 HTTP Header 获取 CSRF token（安全最佳实践）
-  // 移除 Query 和 Body 获取以防止攻击者通过 JSON 劫持或 URL 泄露绕过 CSRF 防护
-  const token = c.req.header("x-csrf-token") || c.req.header("X-CSRF-Token")
-
-  if (!token) {
-    return c.json(
-      {
-        code: 403,
-        message: "CSRF token missing. Please include X-CSRF-Token header.",
-        data: null,
-      },
-      403,
-    )
-  }
-
-  try {
-    const { verify } = await import("hono/jwt")
-    const secret = await getJwtSecret(c)
-    const payload: any = await verify(token, secret, "HS256")
-
-    if (payload.type !== "csrf") {
-      throw new Error("Invalid token type")
-    }
-
-    // Token 有效，继续处理
-    await next()
-  } catch (err: any) {
-    return c.json(
-      {
-        code: 403,
-        message: "Invalid or expired CSRF token",
-        data: null,
-      },
-      403,
-    )
-  }
-}
+// ============ CSRF 防护（已删除，S-18）============
+// 本项目的会话凭证只走 `Authorization: Bearer`（登录响应体里返回，前端存
+// localStorage），服务端从不签发承载身份的 Cookie。跨站表单/fetch 无法自带
+// 攻击者不知道的 Authorization 头，因此传统 CSRF 在这里不成立；此前的
+// generateCSRFToken / csrfProtection 从未被挂载（死代码），已随 pkg/csrf.ts
+// 一并移除。若将来引入 Cookie 会话（例如 HttpOnly JWT），必须重新实现并
+// 挂载 CSRF 中间件，同时把 SameSite 设为 Strict/Lax。
 
 // ============ 审计日志中间件 (添加日期: 2026-09-05) ============
 /**
@@ -594,11 +553,26 @@ export async function requireAuthenticatedUser(
   return await getUserFromContext(c)
 }
 
+/**
+ * 静态 API token 的合成身份 id。
+ *
+ * 静态 token 不是一个真实用户行，但它必须带一个**稳定且非空**的 id：
+ * 否则 `user.id` 为 undefined，凡是按 id 做归属校验的地方都会失败。典型后果
+ * （F-011）：/fs/multipart/init 把 `owner_id: user.id`（undefined）写进会话，
+ * 而续传/完成/查询用 `owner_id !== undefined && owner_id === user.id` 校验，
+ * 于是 API token 自建的会话永远 404，分片上传在该鉴权方式下完全不可用。
+ *
+ * 取负数：真实用户 id 由 `Math.max(...)+1` 生成，恒 >= 1；负数不会与任何真实
+ * 用户冲突（0 会与 `user.id || 0` 这类兜底值混淆）。
+ */
+export const STATIC_API_TOKEN_USER_ID = -1
+
 async function resolveUserFromContext(c: Context): Promise<AuthedUser | null> {
   // 仅静态 API token（api_token / API_TOKEN）命中才视为匿名管理员；
   // JWT 管理员走下方正常解析，避免用户名被硬编码成 "api-token"。
   if (await isStaticApiToken(c)) {
     return {
+      id: STATIC_API_TOKEN_USER_ID,
       role: 2,
       permission: 0,
       disabled: false,

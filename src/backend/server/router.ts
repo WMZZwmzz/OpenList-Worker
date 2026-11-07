@@ -65,6 +65,13 @@ export async function rateLimitMiddleware(c: any, next: () => Promise<void>) {
   } catch {}
   cleanupMaps()
 
+  // M-1（安全审计报告）：IP 不可信（未设 TRUST_PROXY_HEADERS=1 的自托管 /
+  // EdgeOne 部署）时 clientIp 恒为 "unknown"。此时**跳过 IP 维度限流**——
+  // 否则所有访客共用同一个计数器，任意一个脚本打满配额即全站 429（DoS）。
+  // 与 auth.ts 登录锁定的 loginLockByIpEnabled 同一策略：IP 不可信就关闭
+  // IP 维度，只保留用户名/全局维度。
+  if (ip === "unknown") ipLimit = 0
+
   // 1) IP 请求速率限制（每分钟）
   if (ipLimit > 0) {
     const rec = ipReqCounts.get(ip)
@@ -82,7 +89,8 @@ export async function rateLimitMiddleware(c: any, next: () => Promise<void>) {
   }
 
   // 2) 流量限制（每小时，按响应 Content-Length 估算；超限后拒绝后续请求）
-  if (trafficLimitMb > 0) {
+  // IP 不可信时同样跳过（见上：unknown 共享计数器 = 全站 DoS）。
+  if (trafficLimitMb > 0 && ip !== "unknown") {
     const tRec = ipTraffic.get(ip)
     const limitBytes = trafficLimitMb * 1024 * 1024
     if (tRec && now - tRec.start <= 3600000 && tRec.bytes >= limitBytes) {
@@ -103,7 +111,7 @@ export async function rateLimitMiddleware(c: any, next: () => Promise<void>) {
     c.res?.headers?.set("Pragma", "no-cache")
   }
 
-  if (trafficLimitMb > 0) {
+  if (trafficLimitMb > 0 && ip !== "unknown") {
     const len = parseInt(c.res?.headers?.get("content-length") || "0", 10) || 0
     if (len > 0) {
       const tRec = ipTraffic.get(ip)
@@ -313,38 +321,32 @@ export function setupRouter(app: Hono) {
   // with mode="memory" — this covers Vercel, Lambda, and Docker-in-memory
   // deployments where persistence is intentionally absent.
   app.get("/healthz", async (c) => {
+    // L-1（安全审计报告）：/healthz 匿名可达，是零成本侦察面——storages/users
+    // 数量、存储平台、错误详情都会帮攻击者画像。响应只保留布尔健康信号；
+    // 计数与错误详情留给管理员诊断端点（/api/admin/... 与 F-112 的诊断缓存）。
     const checks: Record<string, any> = {}
     let healthy = true
 
     try {
       const db = await getDb(c.env)
-      checks.config = {
-        ok: true,
-        storages: db?.storages?.length ?? 0,
-        users: db?.users?.length ?? 0,
-      }
-    } catch (err: any) {
+      checks.config = { ok: true }
+      if (!db) healthy = false
+    } catch {
       healthy = false
-      checks.config = { ok: false, error: err?.message || String(err) }
+      checks.config = { ok: false }
     }
 
     let kv: any
     try {
       kv = await getKvStatus(c.env)
-    } catch (err: any) {
+    } catch {
       healthy = false
-      kv = {
-        configured: false,
-        connected: false,
-        error: err?.message || String(err),
-      }
+      kv = { configured: false, connected: false }
     }
 
     checks.persistence = {
       configured: !!kv?.configured,
       connected: !!kv?.connected,
-      platform: kv?.platform ?? null,
-      error: kv?.error ?? null,
     }
     // Serverless / Worker runtimes must never fall back to memory: instances
     // are multi-tenant and short-lived, so writes silently vanish and users
@@ -353,6 +355,7 @@ export function setupRouter(app: Hono) {
     const serverless = isServerlessRuntime(c.env)
     if (!kv?.configured) {
       checks.persistence.mode = serverless ? "unavailable" : "memory"
+      // note 是**静态**运维提示，不含实例信息（L-1 只裁剪计数/平台/错误详情）。
       if (serverless) {
         checks.persistence.note = NO_STORAGE_MESSAGE
         healthy = false
@@ -371,7 +374,6 @@ export function setupRouter(app: Hono) {
         ok: healthy,
         name: "OpenList",
         version: "v4.2.3",
-        environment: (c.env as any)?.ENVIRONMENT || "development",
         checks,
       },
       healthy ? 200 : 503,

@@ -71,6 +71,37 @@ export function rfc3986UriEncode(str: string, encodeSlash = true): string {
   return result
 }
 
+/**
+ * F-148：SigV4 的 canonical query string 必须按 RFC 3986 编码——空格编成 %20、
+ * 字面 "+" 编成 %2B。URLSearchParams 走的是 application/x-www-form-urlencoded
+ * 规则（空格 → "+"），若直接把它 toString() 的结果当作 wire URL，服务端收到的
+ * "+" 与签名里的 "%20" 不一致，必然 SignatureDoesNotMatch。
+ *
+ * 因此 wire 侧也统一用本函数序列化 query，使签名内容与实际发送字节完全一致。
+ * 排序规则按 AWS 规范：先比编码后的 key，再比编码后的 value。
+ */
+export function buildCanonicalQueryString(
+  params: Array<[string, string]>,
+): string {
+  const encoded = params.map(
+    ([k, v]) => [rfc3986UriEncode(k), rfc3986UriEncode(v)] as [string, string],
+  )
+  encoded.sort(([ak, av], [bk, bv]) => {
+    if (ak !== bk) return ak < bk ? -1 : 1
+    if (av === bv) return 0
+    return av < bv ? -1 : 1
+  })
+  return encoded.map(([k, v]) => `${k}=${v}`).join("&")
+}
+
+/**
+ * 把 canonical 形式的 query 写回 URL。`URL.search` 的 setter 只做最小转义，
+ * 不会把 `%20` 改写成 "+"，因此回写后的 URL 与 canonical query 逐字节一致。
+ */
+function applyCanonicalQuery(url: URL, canonicalQuery: string): void {
+  url.search = canonicalQuery
+}
+
 export function formatAmzDates(date: Date = new Date()): {
   amzDate: string
   dateStamp: string
@@ -181,10 +212,10 @@ export async function signS3Headers(
   parsedUrl.searchParams.forEach((val, key) => {
     queryParams.push([key, val])
   })
-  queryParams.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-  const canonicalQueryString = queryParams
-    .map(([k, v]) => `${rfc3986UriEncode(k)}=${rfc3986UriEncode(v)}`)
-    .join("&")
+  const canonicalQueryString = buildCanonicalQueryString(queryParams)
+  // F-148：把 canonical query 回写到 wire URL，保证实际请求与签名一致
+  //（URLSearchParams 会把空格序列化成 "+"，与签名的 "%20" 不匹配）。
+  applyCanonicalQuery(parsedUrl, canonicalQueryString)
 
   const canonicalRequest = [
     method.toUpperCase(),
@@ -253,22 +284,29 @@ export async function presignS3Url(opts: PresignUrlOptions): Promise<string> {
   const { amzDate, dateStamp } = formatAmzDates(date)
   const credentialScope = `${dateStamp}/${region}/${service}/aws4_request`
 
-  // Base query params for presigned URL
-  parsedUrl.searchParams.set("X-Amz-Algorithm", "AWS4-HMAC-SHA256")
-  parsedUrl.searchParams.set(
-    "X-Amz-Credential",
-    `${accessKeyId}/${credentialScope}`,
-  )
-  parsedUrl.searchParams.set("X-Amz-Date", amzDate)
-  parsedUrl.searchParams.set("X-Amz-Expires", expiresInSeconds.toString())
-  parsedUrl.searchParams.set("X-Amz-SignedHeaders", "host")
+  // Base query params for presigned URL。F-148：全部先在 Map 里累积，最后用
+  // RFC 3986 规则一次性序列化并回写 URL（而不是 searchParams.set + toString，
+  // 后者会把空格编成 "+"，与签名的 "%20" 不一致 → SignatureDoesNotMatch）。
+  const queryParams = new Map<string, string>()
+  parsedUrl.searchParams.forEach((val, key) => {
+    if (key.toLowerCase() !== "x-amz-signature") {
+      queryParams.set(key, val)
+    }
+  })
+  queryParams.set("X-Amz-Algorithm", "AWS4-HMAC-SHA256")
+  queryParams.set("X-Amz-Credential", `${accessKeyId}/${credentialScope}`)
+  queryParams.set("X-Amz-Date", amzDate)
+  queryParams.set("X-Amz-Expires", expiresInSeconds.toString())
+  queryParams.set("X-Amz-SignedHeaders", "host")
 
   if (sessionToken) {
-    parsedUrl.searchParams.set("X-Amz-Security-Token", sessionToken)
+    queryParams.set("X-Amz-Security-Token", sessionToken)
   }
 
   for (const [k, v] of Object.entries(customQueryParams)) {
-    parsedUrl.searchParams.set(k, v)
+    if (k.toLowerCase() !== "x-amz-signature") {
+      queryParams.set(k, v)
+    }
   }
 
   // Same double-encoding fix as in signS3Headers: decode first.
@@ -281,16 +319,9 @@ export async function presignS3Url(opts: PresignUrlOptions): Promise<string> {
   }
   const canonicalUri = rfc3986UriEncode(decodedPathname2, false)
 
-  const queryParams: [string, string][] = []
-  parsedUrl.searchParams.forEach((val, key) => {
-    if (key.toLowerCase() !== "x-amz-signature") {
-      queryParams.push([key, val])
-    }
-  })
-  queryParams.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-  const canonicalQueryString = queryParams
-    .map(([k, v]) => `${rfc3986UriEncode(k)}=${rfc3986UriEncode(v)}`)
-    .join("&")
+  const canonicalQueryString = buildCanonicalQueryString([
+    ...queryParams.entries(),
+  ])
 
   const hostHeader = parsedUrl.host
   const canonicalHeaders = `host:${hostHeader}\n`
@@ -322,7 +353,14 @@ export async function presignS3Url(opts: PresignUrlOptions): Promise<string> {
   )
   const signature = await hmacSha256Hex(signingKey, stringToSign)
 
-  parsedUrl.searchParams.set("X-Amz-Signature", signature)
+  // F-148：签名串用 canonical 形式（%20/%2B），wire URL 必须逐字节相同，
+  // 否则服务端按收到的 "+" 重算会得到不同签名。X-Amz-Signature 追加在末尾。
+  applyCanonicalQuery(
+    parsedUrl,
+    canonicalQueryString
+      ? `${canonicalQueryString}&X-Amz-Signature=${signature}`
+      : `X-Amz-Signature=${signature}`,
+  )
   return parsedUrl.toString()
 }
 

@@ -16,7 +16,7 @@
       "headers": [
         {
           "key": "Content-Security-Policy",
-          "value": "default-src 'self'; script-src 'self' 'unsafe-inline' data:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self'; media-src 'self' blob:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+          "value": "default-src 'self'; script-src 'self' 'unsafe-inline' data:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self'; media-src 'self' blob: https:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
         },
         {
           "key": "X-Content-Type-Options",
@@ -60,11 +60,11 @@
   },
   "schedules": [
     {
-      "name": "token-refresh",
+      "name": "token-refresh-unconfigured",
       "cron": "0 2 * * *",
       "path": "/api/task/refresh",
       "method": "POST",
-      "payload": { "cron_secret": "" },
+      "payload": { "cron_secret": "__REPLACE_WITH_CRON_SECRET__" },
       "timezone": "Asia/Shanghai"
     }
   ]

@@ -8,6 +8,7 @@ import {
   QuarkRefreshResp,
 } from "./types"
 import { md5 } from "../../pkg/crypto"
+import { randomHex } from "../rand"
 
 const API = "https://open-api-drive.quark.cn"
 const UA = "go-resty/3.0.0-beta.1 (https://resty.dev)"
@@ -28,6 +29,8 @@ export class ClientQuarkOpen {
   private refreshToken: string
   private appId: string
   private signKey: string
+  /** 秒传 proof_seed1 需要的账号 user_id（由 /open/v1/user/info 获取） */
+  private userId = ""
 
   constructor(addition: DriverQuarkOpenAddition) {
     this.addition = addition
@@ -40,6 +43,28 @@ export class ClientQuarkOpen {
   async init(): Promise<void> {
     if (!this.refreshToken)
       throw new Error("[QuarkOpen] refresh_token is required")
+    // F-400：对齐 Go 版 Init —— 挂载期就取回 user_id。此前 proof_seed1 依赖
+    // addition 里根本不存在的 user_id（恒为空串），秒传校验不可能通过。
+    await this.ensureUserId()
+  }
+
+  /**
+   * 取并缓存账号 user_id（GET /open/v1/user/info）。
+   * 拿不到时抛错（与 Go 的 "failed to get user ID" 一致），而不是继续用空串
+   * 生成必然失败的 proof。
+   */
+  private async ensureUserId(): Promise<string> {
+    if (this.userId) return this.userId
+    const resp = await this.request<QuarkCommonResp>(
+      "/open/v1/user/info",
+      "GET",
+    )
+    const raw = (resp?.data as any)?.user_id
+    this.userId = raw === undefined || raw === null ? "" : String(raw)
+    if (!this.userId) {
+      throw new Error("[QuarkOpen] failed to get user ID")
+    }
+    return this.userId
   }
 
   private async proofCode(
@@ -70,7 +95,9 @@ export class ClientQuarkOpen {
       "POST",
       "/open/v1/file/upload_pre",
     )
-    const userId = String((this.addition as any).user_id || "")
+    // F-400：proof_seed1 = md5(user_id + x-pan-token)，user_id 必须来自
+    // /open/v1/user/info（对齐 Go），不能依赖不存在的 addition 字段。
+    const userId = await this.ensureUserId()
     const proofSeed1 = md5(`${userId}${token}`)
     const proofSeed2 = md5(String(input.size))
     const proofCode1 = await this.proofCode(
@@ -113,7 +140,8 @@ export class ClientQuarkOpen {
     const reqId =
       typeof crypto.randomUUID === "function"
         ? crypto.randomUUID()
-        : `${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`
+        // S-04 同类清单：fallback 改用 CSPRNG（原 Math.random）。
+        : randomHex(16) + Date.now().toString(36)
     return { tm, token, reqId }
   }
 

@@ -87,6 +87,31 @@ export class LanzouDriver implements StorageDriver {
   }
 
   /**
+   * 失效 pathIdCache 中 path 自身及其所有后代的条目（F-156）。
+   *
+   * 驱动实例被 storage 层跨请求缓存，写操作后不清理会让「删除目录→同名重建」
+   * 命中已删除的旧 fol_id（列表报错/为空、子树操作全部失败）。
+   */
+  private invalidatePathCache(physicalPath: string): void {
+    const clean =
+      "/" +
+      String(physicalPath || "")
+        .split("/")
+        .filter(Boolean)
+        .join("/")
+    if (clean === "/") {
+      this.pathIdCache.clear()
+      return
+    }
+    const prefix = `${clean}/`
+    for (const key of Array.from(this.pathIdCache.keys())) {
+      if (key === clean || key.startsWith(prefix)) {
+        this.pathIdCache.delete(key)
+      }
+    }
+  }
+
+  /**
    * 将 physicalPath 解析为对应的 folderId
    */
   private async resolveFolderId(physicalPath: string): Promise<string> {
@@ -345,6 +370,8 @@ export class LanzouDriver implements StorageDriver {
     const parentPath = "/" + segs.join("/")
     const parentId = await this.resolveFolderId(parentPath)
     await this.client.mkdir(parentId, dirName)
+    // 同名目录可能残留旧 fol_id（删除后重建），新建后必须失效（F-156）
+    this.invalidatePathCache("/" + [...segs, dirName].join("/"))
   }
 
   async rename(
@@ -360,6 +387,7 @@ export class LanzouDriver implements StorageDriver {
       throw new Error("[Lanzou] 蓝奏云不支持重命名文件夹")
     }
     await this.client.rename(item.id || "", newName)
+    this.invalidatePathCache(physicalPath)
   }
 
   async remove(
@@ -372,6 +400,8 @@ export class LanzouDriver implements StorageDriver {
     }
     const { item, isDir } = await this.resolveItem(physicalPath)
     await this.client.remove(item.fol_id || item.id || "", isDir)
+    // resolveItem 刚把被删目录的 fol_id 写进缓存，必须连同子树一起失效（F-156）
+    this.invalidatePathCache(physicalPath)
   }
 
   async move(
@@ -379,7 +409,7 @@ export class LanzouDriver implements StorageDriver {
     dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
     if (this.isUrlMode()) {
       throw new Error("[Lanzou] 分享链接模式不支持移动")
@@ -388,9 +418,16 @@ export class LanzouDriver implements StorageDriver {
     if (isDir) {
       throw new Error("[Lanzou] 蓝奏云不支持移动文件夹")
     }
-    const dstParts = String(dstDir).split("/").filter(Boolean)
-    const targetParentId = await this.resolveFolderId("/" + dstParts.join("/"))
+    // F-157：dstDir 是站点虚拟路径（含挂载前缀/用户 base_path），不能直接
+    // 当作网盘物理路径。第 5 参 dstPhysical 才是目标条目自身的物理路径，
+    // 取其父目录解析目标 folderId；缺省时回退到 dstDir 以保持兼容。
+    const dstTarget = String(dstPhysical || dstDir || "")
+    const dstSegs = dstTarget.split("/").filter(Boolean)
+    dstSegs.pop()
+    const targetParentId = await this.resolveFolderId("/" + dstSegs.join("/"))
     await this.client.move(item.id || "", targetParentId)
+    this.invalidatePathCache(srcPhysical)
+    this.invalidatePathCache("/" + String(dstPhysical || "").split("/").filter(Boolean).join("/"))
   }
 
   async copy(): Promise<void> {

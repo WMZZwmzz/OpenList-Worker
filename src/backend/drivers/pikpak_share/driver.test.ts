@@ -45,3 +45,25 @@ test("PikPakShareDriver instantiation and methods", async () => {
   const link = await driver.link("/ep01.mkv", "/ep01.mkv")
   assert.equal(link.url, "https://dl.pikpak.example.com/ep01.mkv")
 })
+
+// ---- F-450: 路径段不存在必须报错 ----
+test("resolveParentId 对不存在的目录段抛错（F-450）", async () => {
+  const driver = new PikPakShareDriver({ share_id: "pikpak_share_123" })
+  ;(driver as any).client.getFiles = async () => [
+    {
+      id: "folder_1",
+      share_id: "pikpak_share_123",
+      kind: "drive#folder",
+      name: "Anime",
+      modified_time: "2026-08-24T12:00:00Z",
+    },
+  ]
+  await assert.rejects(
+    () => driver.list("/missing", "/missing"),
+    /Directory 'missing' not found/,
+  )
+  await assert.rejects(
+    () => driver.get("/missing/ep01.mkv", "/missing/ep01.mkv"),
+    /Directory 'missing' not found/,
+  )
+})

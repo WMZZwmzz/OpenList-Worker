@@ -34,12 +34,21 @@ export function decodePathFully(value: string): string {
     if (decoded === out) break
     out = decoded
   }
-  return out
-    .replace(/\\/g, "/")
-    .replace(/%5c/gi, "/")
-    .replace(/%2f/gi, "/")
-    .replace(/\.{3,}/g, "..")
-    .replace(/\/+/g, "/")
+  return (
+    out
+      .replace(/\\/g, "/")
+      .replace(/%5c/gi, "/")
+      .replace(/%2f/gi, "/")
+      .replace(/\/+/g, "/")
+      // F-075: 旧实现是整串 `.replace(/\.{3,}/g, "..")`，会把文件名里合法的
+      // 连续点静默改写（`别哭了...(1).mp3` → `别哭了..(1).mp3`），这类文件因此
+      // 永远无法按原名访问。防穿越只需要保证「整段全部由点组成」的段被折叠：
+      // 这里把 `...`/`....` 这类**整段**归一成 `..`（resolvePath 只折叠 `..`，
+      // 必须保持同源），段内连续点（`a...b`）原样保留。
+      .split("/")
+      .map((seg) => (/^\.+$/.test(seg) && seg.length >= 2 ? ".." : seg))
+      .join("/")
+  )
 }
 
 /** 段是否为 `..`：resolvePath 把 3 个及以上点也归一成 `..`，所以 `...` 同样上跳。 */

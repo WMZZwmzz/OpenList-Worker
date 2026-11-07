@@ -32,7 +32,7 @@ const DEDICATED_DRIVERS: Record<string, Driver> = {
   memory: memoryDriver,
 }
 
-/** 缓存条目信封：值 + 过期时间戳 */
+/** 缓存条目信封：值 + 过期时间戳 + 存储修订号 */
 export interface CacheEnvelope<T = any> {
   /** 载荷 */
   v: T
@@ -40,6 +40,18 @@ export interface CacheEnvelope<T = any> {
   ts: number
   /** 过期时间（ms，绝对时间） */
   exp: number
+  /**
+   * 写入时的存储修订号（`storage.modified`，F-104）。
+   *
+   * 缓存键只含 storageId，而管理端新建存储的 id 取 `max+1`（会复用），且存储
+   * 编辑/删除与「先清后写」的失效存在竞态：在途请求可能在 clear 之后把旧内容
+   * 写回，随后被同 id 的新存储（甚至不同账号凭据）按同路径命中。
+   *
+   * 读路径校验修订号即可闭环：修订号不同 → 视为未命中（并顺手清掉这一条）；
+   * 写路径记录当前修订号。旧条目（无 rev）在提供了修订号时同样按未命中处理，
+   * 代价只是一次回源。
+   */
+  rev?: string
 }
 
 /**
@@ -167,10 +179,16 @@ async function coerceText(value: any): Promise<string | null> {
  *
  * 多个后端时按配置顺序逐个尝试：任一命中即返回（先写 KV 后写 DB 的部署，
  * 即使 DB 侧被清理过也仍能命中 KV）。
+ *
+ * @param opts.revision 当前存储修订号（`storage.modified`，F-104）。提供时，
+ *        信封里记录的修订号必须与之相同，否则视为未命中 —— 这是「存储被编辑 /
+ *        id 被复用」后不命中旧内容的唯一保证（缓存键本身不含修订号，
+ *        否则按存储失效时算不出要删的键）。
  */
 export async function cacheGetEnvelope<T = any>(
   key: string,
   env?: any,
+  opts: { revision?: string } = {},
 ): Promise<CacheEnvelope<T> | null> {
   let drivers: Driver[]
   try {
@@ -180,15 +198,48 @@ export async function cacheGetEnvelope<T = any>(
   }
   if (drivers.length === 0) return null
 
+  const revision = opts.revision
+
   for (const driver of drivers) {
     try {
       const raw = await coerceText(await driver.get(key, env))
       if (!raw) continue
       const parsed = JSON.parse(raw) as CacheEnvelope<T>
       if (!parsed || typeof parsed !== "object") continue
+
+      // F-104：修订号不匹配（或旧条目没有修订号）→ 不能当作命中。
+      // 顺手删掉**这一个**后端上的陈旧条目（不要调 cacheDelete：那会连其他
+      // 后端上仍有效的条目一起删，见 F-105）。
+      if (revision !== undefined && revision !== "") {
+        if (parsed.rev !== revision) {
+          try {
+            await driver.delete(key, env)
+          } catch (err: any) {
+            warnOnce(
+              `${driver.name}:delete`,
+              `[Cache] delete failed on backend "${driver.name}": ${err?.message || err}`,
+            )
+          }
+          continue
+        }
+      }
+
       if (typeof parsed.exp === "number" && parsed.exp <= Date.now()) {
-        // 惰性清理过期条目，避免缓存无限膨胀
-        void cacheDelete(key, env)
+        // 惰性清理过期条目，避免缓存无限膨胀。
+        //
+        // F-105：只删「恰好命中过期条目的这个后端」。历史实现调用 cacheDelete，
+        // 它会遍历所有后端删除同一个键 —— 各后端的最新成功写入时间可能分叉
+        // （双写时某后端失败被 warnOnce 吞掉），于是另一个后端上仍然有效的
+        // 条目会被这次清理误删；而且 `void` 掉的删除与并发回写存在窄窗竞态，
+        // 在 Workers 上还可能随响应结束被取消。这里改为 await + 仅当前驱动。
+        try {
+          await driver.delete(key, env)
+        } catch (err: any) {
+          warnOnce(
+            `${driver.name}:delete`,
+            `[Cache] delete failed on backend "${driver.name}": ${err?.message || err}`,
+          )
+        }
         continue
       }
       return parsed
@@ -208,6 +259,7 @@ export async function cacheSetEnvelope<T = any>(
   value: T,
   ttlMs: number,
   env?: any,
+  opts: { revision?: string } = {},
 ): Promise<void> {
   if (!Number.isFinite(ttlMs) || ttlMs <= 0) return
 
@@ -221,6 +273,9 @@ export async function cacheSetEnvelope<T = any>(
 
   const now = Date.now()
   const envelope: CacheEnvelope<T> = { v: value, ts: now, exp: now + ttlMs }
+  if (opts.revision !== undefined && opts.revision !== "") {
+    envelope.rev = opts.revision
+  }
   let raw: string
   try {
     raw = JSON.stringify(envelope)

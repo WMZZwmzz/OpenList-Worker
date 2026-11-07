@@ -332,28 +332,43 @@ export const kvDriver: Driver = {
       //   - 签名不兼容会抛 TypeError（参数类型不符），此时才应回退到第二种签名；
       //   - 网络/权限错误（401、超时等）必须**原样抛出**，否则会被第二次尝试
       //     掩盖成 "key not found"，让调用方误判为数据不存在而写入错误状态。
+      //
+      // F-088：判定**只依据异常类型**（TypeError / "is not a function"）。
+      // 历史实现还匹配 invalid / unexpected / argument 这类常见词，于是
+      // "Invalid argument"（POSIX EINVAL）、"WRONGPASS invalid ..."、"unexpected
+      // status 502" 等真实故障会被当成签名错误吞掉，最终伪装成「键不存在」，
+      // 正是 db.ts 要根除的「读取失败被吞 → 空库」链路。宁可让真实错误抛出。
       const isSignatureError = (e: any): boolean =>
         e instanceof TypeError ||
-        /not a function|invalid|unexpected|argument/i.test(
-          String(e?.message || ""),
-        )
+        /not a function|is not a function/i.test(String(e?.message || ""))
 
       let value: any
+      let firstThrewSignatureError = false
       try {
         value = await kv.get(key, "text")
       } catch (e) {
         if (!isSignatureError(e)) throw e
+        // F-087：记录「第一次是签名不兼容」，只有这种情况下才允许第二次调用。
+        firstThrewSignatureError = true
         value = undefined
       }
 
-      if (value === undefined || value === null) {
+      // F-087：CF 的 get(key,"text") 对 miss 正常返回 null（不抛错），
+      // 历史实现却以 `value == null` 为条件重试第二种签名 —— 每次 miss 都多一次
+      // 真实 KV 读，把读配额翻倍。现在只有第一次**抛了签名错误**才重试。
+      if (firstThrewSignatureError) {
         try {
           value = await kv.get(key, { type: "text" })
         } catch (e) {
-          // 若第一种签名已成功执行（未抛签名错误），说明第二种只是"空结果"的回退，
-          // 此时真实错误同样要抛出，不得吞掉。
-          if (!isSignatureError(e)) throw e
-          value = null
+          // 两种签名都不可用：这是环境/绑定问题，不是「键不存在」。
+          // 继续按 null 返回会把配置读取失败伪装成空库，必须显式抛出（F-088）。
+          if (isSignatureError(e)) {
+            throw new Error(
+              `KV binding rejected both get() signatures (key="${key}"): ` +
+                `${(e as any)?.message || e}`,
+            )
+          }
+          throw e
         }
       }
 

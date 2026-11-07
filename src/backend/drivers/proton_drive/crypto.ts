@@ -50,10 +50,6 @@ export function toBase64(bytes: Uint8Array): string {
   return btoa(bin)
 }
 
-async function sha256(data: Uint8Array): Promise<Uint8Array> {
-  return new Uint8Array(await crypto.subtle.digest("SHA-256", data as BufferSource))
-}
-
 /**
  * Derive the salted key passphrase used to unlock Proton private keys.
  * This is bcrypt(password, keySalt, cost=10); the raw 31-char bcrypt digest
@@ -125,24 +121,113 @@ export async function encryptText(
   }) as unknown as string
 }
 
-/**
- * Proton name hash: base64(SHA-256(plaintext name)).
- * Used for dedup / rename / move bookkeeping.
- */
-export async function getNameHash(name: string): Promise<string> {
-  const bytes = await sha256(new TextEncoder().encode(name))
-  return toBase64(bytes)
+/** Encrypt raw bytes into an armored OpenPGP message for the given keys. */
+export async function encryptBinary(
+  bytes: Uint8Array,
+  encryptionKeys: openpgp.Key[],
+  signingKey?: openpgp.PrivateKey,
+): Promise<string> {
+  const message = await openpgp.createMessage({ binary: bytes })
+  return openpgp.encrypt({
+    message,
+    encryptionKeys,
+    signingKeys: signingKey ? [signingKey] : undefined,
+    format: "armored",
+  }) as unknown as string
+}
+
+/** Create an armored detached signature over UTF-8 text. */
+export async function signDetachedText(
+  text: string,
+  signingKey: openpgp.PrivateKey,
+): Promise<string> {
+  const message = await openpgp.createMessage({ text })
+  return openpgp.sign({
+    message,
+    signingKeys: [signingKey],
+    detached: true,
+    format: "armored",
+  }) as unknown as string
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  let out = ""
+  for (const b of bytes) out += b.toString(16).padStart(2, "0")
+  return out
+}
+
+function hexToBytes(hex: string): Uint8Array {
+  const out = new Uint8Array(hex.length / 2)
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16)
+  }
+  return out
 }
 
 /**
- * Decrypt a detached session key (e.g. a file's ContentKeyPacket) with a keyring.
- * The ContentKeyPacket is a public-key-encrypted session key packet.
+ * Proton name hash: hex(HMAC-SHA256(name, parentFolderHashKey)).
+ *
+ * The key is the parent folder's `FolderProperties.NodeHashKey` decrypted with
+ * the parent node keyring (see go-proton-api Link.GetHashKey). The unkeyed
+ * base64(SHA-256(name)) digest used previously is not a valid Proton hash.
+ */
+export async function getNameHash(
+  name: string,
+  hashKey: Uint8Array,
+): Promise<string> {
+  if (!hashKey || hashKey.length === 0) {
+    throw new Error("Proton name hash requires the parent folder hash key")
+  }
+  const key = await crypto.subtle.importKey(
+    "raw",
+    hashKey as unknown as BufferSource,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  )
+  const mac = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(name),
+  )
+  return bytesToHex(new Uint8Array(mac))
+}
+
+/**
+ * Decrypt a folder's `FolderProperties.NodeHashKey`.
+ *
+ * The API returns an armored OpenPGP message whose plaintext is the 32-byte
+ * HMAC key. Some clients historically stored the token as a hex string, so a
+ * 64-character hex payload is decoded as bytes defensively.
+ */
+export async function decryptNodeHashKey(
+  armoredHashKey: string,
+  keyRing: KeyRing,
+): Promise<Uint8Array> {
+  const plain = await decryptArmoredBinary(armoredHashKey, keyRing)
+  const text = new TextDecoder().decode(plain).trim()
+  if (/^[0-9a-fA-F]{64}$/.test(text)) return hexToBytes(text)
+  return plain
+}
+
+/**
+ * Decrypt a detached session key packet with a keyring.
+ *
+ * The API returns `FileProperties.ContentKeyPacket` as **base64 of a binary
+ * OpenPGP message** (a PKESK packet), not as an armored message — go-proton-api
+ * does `base64.StdEncoding.DecodeString` before decrypting. Armored input is
+ * still accepted for defensive compatibility with hand-built packets.
  */
 export async function decryptSessionKeyPacket(
-  armoredKeyPacket: string,
+  contentKeyPacketBase64: string,
   keyRing: KeyRing,
 ): Promise<openpgp.SessionKey> {
-  const message = await openpgp.readMessage({ armoredMessage: armoredKeyPacket })
+  if (!contentKeyPacketBase64) {
+    throw new Error("empty content key packet")
+  }
+  const message = contentKeyPacketBase64.trimStart().startsWith("-----BEGIN")
+    ? await openpgp.readMessage({ armoredMessage: contentKeyPacketBase64 })
+    : await openpgp.readMessage({ binaryMessage: fromBase64(contentKeyPacketBase64) })
   const sessionKeys = await openpgp.decryptSessionKeys({
     message,
     decryptionKeys: keyRing,
@@ -179,56 +264,131 @@ export async function generateKeyPair(
 }
 
 /**
- * Decrypt a link's XAttr (base64 OpenPGP-encrypted protobuf) and extract the
- * decrypted file size (FileSystemAttr.Size, protobuf field 1 varint).
- * Falls back to 0 on any parse/decrypt failure.
+ * Decrypted extended attributes (XAttr).
+ * `blockSizes` is the plaintext size of every encrypted block, in block order.
  */
-export async function decryptXAttrSize(
+export interface ProtonXAttr {
+  size: number
+  blockSizes: number[]
+}
+
+/**
+ * Decrypt a link's XAttr and extract the plaintext file size and the per-block
+ * plaintext sizes.
+ *
+ * Modern API responses carry an **armored** OpenPGP message (go-proton-api
+ * `NewPGPMessageFromArmored`, WebClients `armoredMessage`); older/hand-built
+ * fixtures may use base64 of a binary message. The decrypted payload is JSON
+ * (`{"Common":{"Size":..,"BlockSizes":[..]}}`), in ascending block order; a
+ * legacy protobuf FileSystemAttr is still accepted as a fallback. Any failure
+ * degrades to `{size: 0, blockSizes: []}` so listing still works.
+ */
+export async function decryptXAttr(
   xattrBase64: string,
   keyRing: KeyRing,
-): Promise<number> {
-  if (!xattrBase64) return 0
+): Promise<ProtonXAttr> {
+  const empty: ProtonXAttr = { size: 0, blockSizes: [] }
+  if (!xattrBase64) return empty
+  let plain: Uint8Array
   try {
-    const xattrBytes = fromBase64(xattrBase64)
-    const message = await openpgp.readMessage({ binaryMessage: xattrBytes })
+    const message = xattrBase64.trimStart().startsWith("-----BEGIN")
+      ? await openpgp.readMessage({ armoredMessage: xattrBase64 })
+      : await openpgp.readMessage({
+          binaryMessage: fromBase64(xattrBase64),
+        })
     const { data } = await openpgp.decrypt({
       message,
       decryptionKeys: keyRing,
       format: "binary",
     })
-    return parseProtobufVarintSize(data as Uint8Array)
+    plain = data as Uint8Array
   } catch {
-    return 0
+    return empty
   }
+
+  // Modern format: the decrypted payload is JSON.
+  const text = new TextDecoder().decode(plain).replace(/\u0000+$/g, "").trim()
+  if (text.startsWith("{")) {
+    try {
+      const json = JSON.parse(text) as {
+        Common?: { Size?: number; BlockSizes?: number[] }
+      }
+      const size =
+        typeof json.Common?.Size === "number" ? json.Common.Size : 0
+      const raw = json.Common?.BlockSizes
+      // BlockSizes are stored in ascending block order (index 1..n); the
+      // official bridge accumulates them as-is when mapping offsets.
+      const blockSizes =
+        Array.isArray(raw) && raw.every((n) => typeof n === "number")
+          ? [...raw]
+          : []
+      return { size, blockSizes }
+    } catch {
+      // fall through to the protobuf parser
+    }
+  }
+
+  return parseLegacyXAttr(plain)
 }
 
-/** Minimal protobuf walker: extract field 1 (varint) = file size. */
-function parseProtobufVarintSize(bytes: Uint8Array): number {
+/** Backwards-compatible helper: only the decrypted size. */
+export async function decryptXAttrSize(
+  xattrBase64: string,
+  keyRing: KeyRing,
+): Promise<number> {
+  return (await decryptXAttr(xattrBase64, keyRing)).size
+}
+
+/**
+ * Minimal protobuf walker for the legacy FileSystemAttr message:
+ *   field 1 (varint)              = Size
+ *   field 2 (varint | packed)     = BlockSizes
+ */
+export function parseLegacyXAttr(bytes: Uint8Array): ProtonXAttr {
+  const out: ProtonXAttr = { size: 0, blockSizes: [] }
   let i = 0
+
+  const readVarint = (): bigint | null => {
+    let value = 0n
+    let shift = 0n
+    while (i < bytes.length) {
+      const b = bytes[i++]
+      value |= BigInt(b & 0x7f) << shift
+      if ((b & 0x80) === 0) return value
+      shift += 7n
+      if (shift > 63n) return null
+    }
+    return null
+  }
+
   while (i < bytes.length) {
-    const tag = bytes[i++]
-    const fieldNum = tag >> 3
-    const wireType = tag & 0x07
+    const tagStart = i
+    const tag = readVarint()
+    if (tag === null || tag > 0xffffffffn) break
+    const fieldNum = Number(tag >> 3n)
+    const wireType = Number(tag & 0x07n)
     if (wireType === 0) {
-      let value = 0n
-      let shift = 0n
-      while (i < bytes.length) {
-        const b = bytes[i++]
-        value |= BigInt(b & 0x7f) << shift
-        if ((b & 0x80) === 0) break
-        shift += 7n
+      const value = readVarint()
+      if (value === null) break
+      if (fieldNum === 1) {
+        if (out.size === 0) out.size = Number(value)
+      } else if (fieldNum === 2) {
+        out.blockSizes.push(Number(value))
       }
-      if (fieldNum === 1) return Number(value)
     } else if (wireType === 2) {
-      let len = 0
-      let shift = 0
-      while (i < bytes.length) {
-        const b = bytes[i++]
-        len |= (b & 0x7f) << shift
-        if ((b & 0x80) === 0) break
-        shift += 7
+      const len = readVarint()
+      if (len === null) break
+      const end = i + Number(len)
+      if (end > bytes.length) break
+      if (fieldNum === 2) {
+        // packed repeated int64
+        while (i < end) {
+          const v = readVarint()
+          if (v === null) break
+          out.blockSizes.push(Number(v))
+        }
       }
-      i += len
+      i = end
     } else if (wireType === 1) {
       i += 8
     } else if (wireType === 5) {
@@ -236,6 +396,7 @@ function parseProtobufVarintSize(bytes: Uint8Array): number {
     } else {
       break
     }
+    if (i <= tagStart) break
   }
-  return 0
+  return out
 }

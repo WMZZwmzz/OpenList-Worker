@@ -43,25 +43,18 @@ export class Driver115 implements StorageDriver {
   async get(_virtualPath: string, physicalPath: string): Promise<FileItem> {
     const parts = physicalPath.split("/").filter(Boolean)
     const rawName = parts[parts.length - 1] || "root"
-    const decodedName = (() => {
-      try {
-        return decodeURIComponent(rawName)
-      } catch {
-        return rawName
-      }
-    })()
+    // physicalPath 已由上游完全解码（db.ts decodePathFully），此处不能再
+    // decodeURIComponent：字面名含 %XX 的条目会与解码后的同名条目混淆。
     const parentPath = "/" + parts.slice(0, -1).join("/")
     const parentId = await this.client.resolvePathId(parentPath, this.pathCache)
     const files = await this.client.getFiles(parentId)
-    const file = files.find(
-      (f) => f.Fn === rawName || f.Fn === decodedName || f.Fid === rawName,
-    )
+    const file = files.find((f) => f.Fn === rawName || f.Fid === rawName)
 
     if (file) {
       const item = fileToItem(file)
       if (!item.is_dir && file.Pc) {
         try {
-          const url = await this.client.getDownloadUrl(file.Pc)
+          const url = await this.client.getDownloadUrl(file.Pc, file.Fid)
           item.raw_url = url
         } catch (e: any) {
           item.raw_url_error = e.message
@@ -75,7 +68,7 @@ export class Driver115 implements StorageDriver {
       const fid = await this.client.resolvePathId(physicalPath, this.pathCache)
       await this.client.getFiles(fid)
       return {
-        name: decodedName || "root",
+        name: rawName,
         size: 0,
         is_dir: true,
         modified: new Date().toISOString(),
@@ -85,7 +78,7 @@ export class Driver115 implements StorageDriver {
       }
     } catch {
       return {
-        name: decodedName || "root",
+        name: rawName,
         size: 0,
         is_dir: false,
         modified: new Date().toISOString(),
@@ -102,6 +95,9 @@ export class Driver115 implements StorageDriver {
     const parentPath = "/" + parts.join("/")
     const parentId = await this.client.resolvePathId(parentPath, this.pathCache)
     await this.client.mkdir(parentId, name)
+    // 变更后必须失效路径缓存：驱动实例按 storage.id_modified 跨请求复用，
+    // 残留的 path→fid 映射会让后续 list/remove/move 命中已失效的旧对象。
+    this.pathCache.clear()
   }
 
   async rename(
@@ -111,6 +107,7 @@ export class Driver115 implements StorageDriver {
   ): Promise<void> {
     const fid = await this.client.resolvePathId(physicalPath, this.pathCache)
     await this.client.rename(fid, newName)
+    this.pathCache.clear()
   }
 
   async remove(
@@ -118,32 +115,56 @@ export class Driver115 implements StorageDriver {
     physicalPath: string,
     _names: string[],
   ): Promise<void> {
+    const parts = physicalPath.split("/").filter(Boolean)
+    parts.pop()
+    const parentPath = "/" + parts.join("/")
+    const parentId = await this.client.resolvePathId(parentPath, this.pathCache)
     const fid = await this.client.resolvePathId(physicalPath, this.pathCache)
-    await this.client.remove([fid])
+    await this.client.remove([fid], parentId)
+    this.pathCache.clear()
+  }
+
+  /**
+   * dstPhys 是**目标项自身**的物理路径（已含文件名），目标父目录需取其
+   * dirname。dstDir 是用户视角的虚拟路径（含挂载点/base_path 前缀），不能
+   * 当作 115 账号内的路径解析，否则挂载点非根时必然移/复制到错误目录或报错。
+   */
+  private parentPhysicalPath(physicalPath: string): string {
+    const segs = physicalPath.split("/").filter(Boolean)
+    segs.pop()
+    return "/" + segs.join("/")
   }
 
   async move(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
     const fid = await this.client.resolvePathId(srcPhysical, this.pathCache)
-    const dstId = await this.client.resolvePathId(dstDir, this.pathCache)
+    const dstId = await this.client.resolvePathId(
+      this.parentPhysicalPath(dstPhysical),
+      this.pathCache,
+    )
     await this.client.move(dstId, [fid])
+    this.pathCache.clear()
   }
 
   async copy(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
     const fid = await this.client.resolvePathId(srcPhysical, this.pathCache)
-    const dstId = await this.client.resolvePathId(dstDir, this.pathCache)
+    const dstId = await this.client.resolvePathId(
+      this.parentPhysicalPath(dstPhysical),
+      this.pathCache,
+    )
     await this.client.copy(dstId, [fid])
+    this.pathCache.clear()
   }
 
   readonly rapidHashAlgos = ["sha1"]

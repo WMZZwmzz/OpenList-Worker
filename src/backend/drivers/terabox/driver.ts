@@ -7,12 +7,29 @@ import { sortFileItems } from "../../internal/driver/sort"
 import { md5 } from "../../pkg/crypto"
 import {
   TeraboxAddition,
+  TeraboxCreateResp,
   TeraboxFile,
   TeraboxListResp,
   TeraboxLocateUploadResp,
   TeraboxPrecreateResp,
+  TeraboxSuperfileResp,
 } from "./types"
 import { TeraboxApiClient } from "./util"
+
+// 与上游 OpenList drivers/terabox 一致：初始分片 4MB，文件超过 4GB 后逐级翻倍
+const initialChunkSize = 4 * 1024 * 1024
+const initialSizeThreshold = 4 * 1024 * 1024 * 1024
+
+function calculateChunkSize(streamSize: number): number {
+  let chunkSize = initialChunkSize
+  let sizeThreshold = initialSizeThreshold
+  if (streamSize < chunkSize) return streamSize
+  while (streamSize > sizeThreshold) {
+    chunkSize *= 2
+    sizeThreshold *= 2
+  }
+  return chunkSize
+}
 
 export class TeraboxDriver implements StorageDriver {
   private addition: TeraboxAddition
@@ -35,15 +52,15 @@ export class TeraboxDriver implements StorageDriver {
     return s === "/" ? "/" : s
   }
 
-  async list(virtualPath: string, physicalPath: string): Promise<FileItem[]> {
-    const clean = this.cleanPath(physicalPath)
+  /** 列出目录全部条目（分页翻全量），任何 errno≠0 都抛错而不是当作空目录 */
+  private async listDir(dir: string): Promise<TeraboxFile[]> {
     const allFiles: TeraboxFile[] = []
     let page = 1
-    const num = 100
+    const num = 1000
 
     while (true) {
       const params: Record<string, string> = {
-        dir: clean,
+        dir,
         page: String(page),
         num: String(num),
       }
@@ -62,6 +79,9 @@ export class TeraboxDriver implements StorageDriver {
       if (resp.errno === 9000) {
         throw new Error("TeraBox is not yet available in this area")
       }
+      if (resp.errno !== 0) {
+        throw new Error(`[TeraBox] list failed (errno: ${resp.errno})`)
+      }
 
       if (!resp.list || resp.list.length === 0) {
         break
@@ -70,6 +90,13 @@ export class TeraboxDriver implements StorageDriver {
       allFiles.push(...resp.list)
       page++
     }
+
+    return allFiles
+  }
+
+  async list(virtualPath: string, physicalPath: string): Promise<FileItem[]> {
+    const clean = this.cleanPath(physicalPath)
+    const allFiles = await this.listDir(clean)
 
     const items: FileItem[] = allFiles.map((f) => {
       const isDir = f.isdir === 1
@@ -96,7 +123,6 @@ export class TeraboxDriver implements StorageDriver {
 
   async get(virtualPath: string, physicalPath: string): Promise<FileItem> {
     const clean = this.cleanPath(physicalPath)
-    const name = clean.split("/").filter(Boolean).pop() || "root"
 
     if (clean === "/") {
       return {
@@ -113,26 +139,11 @@ export class TeraboxDriver implements StorageDriver {
     const parentDir = clean.split("/").slice(0, -1).join("/") || "/"
     const fileName = clean.split("/").pop() || ""
 
-    const resp: TeraboxListResp = await this.client.request("/api/list", {
-      method: "GET",
-      params: {
-        dir: parentDir,
-        page: "1",
-        num: "1000",
-      },
-    })
-
-    const found = resp.list?.find((f) => f.server_filename === fileName)
+    // 翻全量后再查找：父目录超过单页上限时，后面的文件不能被当成不存在。
+    const allFiles = await this.listDir(parentDir)
+    const found = allFiles.find((f) => f.server_filename === fileName)
     if (!found) {
-      return {
-        name,
-        size: 0,
-        is_dir: false,
-        modified: new Date().toISOString(),
-        sign: "",
-        type: 0,
-        raw_url: "",
-      }
+      throw new Error(`[TeraBox] '${fileName}' not found`)
     }
 
     const isDir = found.isdir === 1
@@ -169,7 +180,7 @@ export class TeraboxDriver implements StorageDriver {
 
   async mkdir(virtualPath: string, physicalPath: string): Promise<void> {
     const clean = this.cleanPath(physicalPath)
-    await this.client.request("/api/create", {
+    const resp: TeraboxCreateResp = await this.client.request("/api/create", {
       method: "POST",
       isFormData: true,
       params: { a: "commit" },
@@ -179,6 +190,11 @@ export class TeraboxDriver implements StorageDriver {
         block_list: "[]",
       },
     })
+    if (!resp || Number(resp.errno) !== 0) {
+      throw new Error(
+        `[TeraBox] mkdir failed (errno: ${(resp as any)?.errno})`,
+      )
+    }
   }
 
   async rename(
@@ -254,34 +270,56 @@ export class TeraboxDriver implements StorageDriver {
     const clean = this.cleanPath(physicalPath)
     const parentPath = clean.split("/").slice(0, -1).join("/") || "/"
     const fileName = clean.split("/").pop() || "upload"
+    const size = content.length
 
     const locateRes = await fetch(
       "https://jp-data.terabox.com/rest/2.0/pcs/file?method=locateupload",
     )
-    const locateData: TeraboxLocateUploadResp = await locateRes.json()
-    const uploadHost = locateData.host || "d.terabox.com"
-
-    const contentMd5 = md5(new Uint8Array(content))
-    const precreateBody = {
-      path: clean,
-      autoinit: "1",
-      target_path: parentPath,
-      block_list: JSON.stringify([contentMd5]),
-      local_mtime: String(Math.floor(Date.now() / 1000)),
-      file_limit_switch_v34: "true",
+    if (!locateRes.ok) {
+      throw new Error(
+        `TeraBox locateupload failed: HTTP ${locateRes.status} ${locateRes.statusText}`,
+      )
     }
+    const locateData: TeraboxLocateUploadResp = await locateRes.json()
+    const uploadHost = locateData?.host
+    if (!uploadHost) {
+      throw new Error("TeraBox locateupload returned no upload host")
+    }
+
+    // 上游 precreate 的 block_list 只是占位（服务端据此分配分片槽位），
+    // 真正的逐片 MD5 在上传完成后用于 create。
+    const precreateBlockList =
+      size > initialChunkSize
+        ? [
+            "5910a591dd8fc18c32a8f3df4fdc1761",
+            "a5fc157d78e6ad1c7e114b056c92821e",
+          ]
+        : ["5910a591dd8fc18c32a8f3df4fdc1761"]
 
     const precreateRes: TeraboxPrecreateResp = await this.client.request(
       "/api/precreate",
       {
         method: "POST",
         isFormData: true,
-        body: precreateBody,
+        body: {
+          path: clean,
+          autoinit: "1",
+          target_path: parentPath,
+          block_list: JSON.stringify(precreateBlockList),
+          local_mtime: String(Math.floor(Date.now() / 1000)),
+          file_limit_switch_v34: "true",
+        },
       },
     )
 
-    if (precreateRes.errno !== 0) {
-      throw new Error(`TeraBox precreate failed (errno: ${precreateRes.errno})`)
+    if (
+      !precreateRes ||
+      typeof precreateRes !== "object" ||
+      Number(precreateRes.errno) !== 0
+    ) {
+      throw new Error(
+        `[TeraBox] precreate failed (errno: ${(precreateRes as any)?.errno})`,
+      )
     }
 
     // Direct rapid return
@@ -289,46 +327,111 @@ export class TeraboxDriver implements StorageDriver {
       return
     }
 
-    const uploadUrl = `https://${uploadHost}/rest/2.0/pcs/superfile2?method=upload&path=${encodeURIComponent(clean)}&uploadid=${encodeURIComponent(precreateRes.uploadid)}&partseq=0`
-
-    const formData = new FormData()
-    formData.append(
-      "file",
-      new Blob([new Uint8Array(content)], { type: "application/octet-stream" }),
-      fileName,
-    )
-
-    const uploadRes = await fetch(uploadUrl, {
-      method: "POST",
-      headers: {
-        Cookie: this.addition.cookie,
-        "User-Agent":
-          "terabox;1.37.0.7;PC;PC-Windows;10.0.22631;WindowsTeraBox",
-      },
-      body: formData,
-    })
-
-    if (!uploadRes.ok) {
-      throw new Error(`TeraBox upload chunk failed: ${uploadRes.statusText}`)
+    const uploadId = precreateRes.uploadid
+    if (!uploadId) {
+      throw new Error("[TeraBox] precreate returned no uploadid")
     }
 
-    const createBody = {
-      path: clean,
-      size: String(content.length),
-      uploadid: precreateRes.uploadid,
-      target_path: parentPath,
-      block_list: JSON.stringify([contentMd5]),
-      local_mtime: String(Math.floor(Date.now() / 1000)),
+    const chunkSize = size > 0 ? calculateChunkSize(size) : initialChunkSize
+    const chunkCount = Math.ceil(size / chunkSize)
+    const uploadBlockList: string[] = []
+
+    for (let partseq = 0; partseq < chunkCount; partseq++) {
+      const start = partseq * chunkSize
+      const end = Math.min(start + chunkSize, size)
+      const chunk = content.subarray(start, end)
+      const localMd5 = md5(chunk)
+      uploadBlockList.push(localMd5)
+
+      const uploadUrl =
+        `https://${uploadHost}/rest/2.0/pcs/superfile2?method=upload` +
+        `&path=${encodeURIComponent(clean)}` +
+        `&uploadid=${encodeURIComponent(uploadId)}` +
+        `&partseq=${partseq}`
+
+      let lastErr: Error | null = null
+      // 上游对每片最多重试 5 次（网络错误、errno、MD5 mismatch 均重试）
+      for (let attempt = 0; attempt < 5; attempt++) {
+        try {
+          const formData = new FormData()
+          formData.append(
+            "file",
+            new Blob([new Uint8Array(chunk)], {
+              type: "application/octet-stream",
+            }),
+            fileName,
+          )
+
+          const uploadRes = await fetch(uploadUrl, {
+            method: "POST",
+            headers: {
+              Cookie: this.addition.cookie,
+              "User-Agent":
+                "terabox;1.37.0.7;PC;PC-Windows;10.0.22631;WindowsTeraBox",
+            },
+            body: formData,
+          })
+
+          if (!uploadRes.ok) {
+            throw new Error(
+              `TeraBox upload chunk ${partseq} failed: HTTP ${uploadRes.status} ${uploadRes.statusText}`,
+            )
+          }
+
+          const text = await uploadRes.text()
+          let data: TeraboxSuperfileResp = {}
+          try {
+            data = JSON.parse(text)
+          } catch {
+            data = {}
+          }
+
+          const errno = Number(data?.errno ?? 0)
+          if (errno !== 0) {
+            throw new Error(
+              `TeraBox upload chunk ${partseq} failed (errno: ${errno})`,
+            )
+          }
+          if (data?.md5 !== localMd5) {
+            throw new Error(
+              `TeraBox upload chunk ${partseq} MD5 mismatch (local: ${localMd5}, server: ${data?.md5})`,
+            )
+          }
+
+          lastErr = null
+          break
+        } catch (e: any) {
+          lastErr = e instanceof Error ? e : new Error(String(e))
+        }
+      }
+      if (lastErr) throw lastErr
     }
 
-    await this.client.request("/api/create", {
+    const createRes: TeraboxCreateResp = await this.client.request("/api/create", {
       method: "POST",
       isFormData: true,
       params: {
         isdir: "0",
         rtype: "1",
       },
-      body: createBody,
+      body: {
+        path: clean,
+        size: String(size),
+        uploadid: uploadId,
+        target_path: parentPath,
+        block_list: JSON.stringify(uploadBlockList),
+        local_mtime: String(Math.floor(Date.now() / 1000)),
+      },
     })
+
+    if (
+      !createRes ||
+      typeof createRes !== "object" ||
+      Number(createRes.errno) !== 0
+    ) {
+      throw new Error(
+        `[TeraBox] failed to create file (errno: ${(createRes as any)?.errno})`,
+      )
+    }
   }
 }

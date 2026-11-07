@@ -6,6 +6,21 @@ import {
 import { DriverTeldriveAddition, TeldriveFile } from "./types"
 import { ClientTeldrive } from "./util"
 
+/** 物理路径的父目录（根为 "/"），F-477 */
+export function parentPath(physicalPath: string): string {
+  const parts = String(physicalPath || "")
+    .split("/")
+    .filter(Boolean)
+  return parts.length > 1 ? "/" + parts.slice(0, -1).join("/") : "/"
+}
+
+/**
+ * pathCache 条目 TTL（F-484）。驱动实例经 driverCache 跨请求复用，远端
+ * （TelDrive 自己的管理界面）删除/重建同名目录后，缓存的旧 id 会指向已删除
+ * 的对象；TTL 保证最多 5 分钟后自动重新解析，写入操作另外强制刷新。
+ */
+const PATH_CACHE_TTL_MS = 5 * 60 * 1000
+
 function fileToItem(f: TeldriveFile): FileItem {
   const isDir = f.type === "folder"
   return {
@@ -21,9 +36,11 @@ function fileToItem(f: TeldriveFile): FileItem {
 
 export class DriverTeldrive implements StorageDriver {
   private client: ClientTeldrive
-  private pathCache = new Map<string, string>()
+  private addition: DriverTeldriveAddition
+  private pathCache = new Map<string, { id: string; expires: number }>()
 
   constructor(addition: DriverTeldriveAddition) {
+    this.addition = addition
     this.client = new ClientTeldrive(addition)
   }
 
@@ -31,31 +48,40 @@ export class DriverTeldrive implements StorageDriver {
     await this.client.init()
   }
 
+  /** 物理路径：拼接 root_path 前缀（F-481，与 kodbox/ipfs_api 的 fullPath 一致） */
+  private fullPath(physicalPath: string): string {
+    const root = (this.addition.root_path || "").replace(/^\/+|\/+$/g, "")
+    const p = String(physicalPath || "").replace(/^\/+/, "")
+    if (!root) return "/" + p
+    return "/" + (p ? `${root}/${p}` : root)
+  }
+
   async list(_virtualPath: string, physicalPath: string): Promise<FileItem[]> {
-    const files = await this.client.listFiles(physicalPath)
+    const files = await this.client.listFiles(this.fullPath(physicalPath))
     return files.map(fileToItem)
   }
 
   async get(_virtualPath: string, physicalPath: string): Promise<FileItem> {
-    const parts = physicalPath.split("/").filter(Boolean)
+    const full = this.fullPath(physicalPath)
+    const parts = full.split("/").filter(Boolean)
     const rawName = parts[parts.length - 1] || "root"
-    const parentPath = "/" + parts.slice(0, -1).join("/")
-    try {
-      const files = await this.client.listFiles(parentPath === "//" ? "/" : parentPath)
-      const file = files.find((f) => f.name === rawName)
-      if (file) {
-        const item = fileToItem(file)
-        if (!item.is_dir) {
-          item.raw_url = this.client.downloadUrl(file.id)
-          item.raw_url_headers = this.client.downloadHeaders()
-        }
-        return item
-      }
-    } catch {}
+    const parent = parentPath(full)
 
-    // Fallback: 目录
+    // F-483：父目录列表失败（鉴权/限流/网络）必须向上抛，不能降级成假文件。
+    const files = await this.client.listFiles(parent)
+    const file = files.find((f) => f.name === rawName)
+    if (file) {
+      const item = fileToItem(file)
+      if (!item.is_dir) {
+        item.raw_url = this.client.downloadUrl(file.id)
+        item.raw_url_headers = this.client.downloadHeaders()
+      }
+      return item
+    }
+
+    // 列表成功但没有该名字：只有「列它自己能成功」才确认是目录，否则 not found。
     try {
-      await this.client.listFiles(physicalPath)
+      await this.client.listFiles(full)
       return {
         name: rawName,
         size: 0,
@@ -66,20 +92,13 @@ export class DriverTeldrive implements StorageDriver {
         raw_url: "",
       }
     } catch {
-      return {
-        name: rawName,
-        size: 0,
-        is_dir: false,
-        modified: new Date().toISOString(),
-        sign: "",
-        type: 0,
-        raw_url: "",
-      }
+      throw new Error(`[TelDrive] '${full}' not found`)
     }
   }
 
   async mkdir(_virtualPath: string, physicalPath: string): Promise<void> {
-    await this.client.mkdir(physicalPath)
+    await this.client.mkdir(this.fullPath(physicalPath))
+    this.pathCache.clear()
   }
 
   async rename(
@@ -95,20 +114,25 @@ export class DriverTeldrive implements StorageDriver {
     physicalPath: string,
     _names: string[],
   ): Promise<void> {
-    const id = await this.resolveFileId(physicalPath)
+    // F-484：写入操作强制重新解析，避免命中过期 id。
+    const id = await this.resolveFileId(physicalPath, true)
     await this.client.remove(id)
+    this.pathCache.clear()
   }
 
   async move(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
-    const srcId = await this.resolveFileId(srcPhysical)
-    const dstId = await this.resolveFileId(dstDir)
+    // F-477：dstDir 是含挂载前缀的虚拟路径；目标目录必须从物理路径派生
+    // （去掉目标项自身的名字），与 srcPhysical 保持同一命名空间。
+    const srcId = await this.resolveFileId(srcPhysical, true)
+    const dstId = await this.resolveFileId(parentPath(dstPhysical), true)
     await this.client.move([srcId], dstId)
+    this.pathCache.clear()
   }
 
   async copy(
@@ -129,10 +153,22 @@ export class DriverTeldrive implements StorageDriver {
     throw new Error("[TelDrive] Direct put not supported in stateless environment")
   }
 
-  private async resolveFileId(physicalPath: string): Promise<string> {
-    const clean = physicalPath.split("/").filter(Boolean).join("/")
+  private async resolveFileId(
+    physicalPath: string,
+    force = false,
+  ): Promise<string> {
+    const clean = this.fullPath(physicalPath)
+      .split("/")
+      .filter(Boolean)
+      .join("/")
     if (!clean) return "/"
-    if (this.pathCache.has(clean)) return this.pathCache.get(clean)!
+    const key = "/" + clean
+    if (!force) {
+      const hit = this.pathCache.get(key)
+      // F-484：过期条目必须丢弃，否则跨请求复用时会返回陈旧 id。
+      if (hit && hit.expires > Date.now()) return hit.id
+      if (hit) this.pathCache.delete(key)
+    }
 
     const parts = clean.split("/")
     let currentPath = ""
@@ -145,7 +181,10 @@ export class DriverTeldrive implements StorageDriver {
       }
       currentId = target.id
       currentPath = currentPath ? `${currentPath}/${parts[i]}` : `/${parts[i]}`
-      this.pathCache.set(currentPath, currentId)
+      this.pathCache.set(currentPath, {
+        id: currentId,
+        expires: Date.now() + PATH_CACHE_TTL_MS,
+      })
     }
     return currentId
   }

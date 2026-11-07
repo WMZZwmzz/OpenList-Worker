@@ -86,6 +86,17 @@ function keyFor(target: CacheTarget, env?: any): string {
 }
 
 /**
+ * 存储修订号（`storage.modified`），用于缓存信封的修订校验（F-104）。
+ *
+ * 键里不含修订号（否则按存储失效时算不出要删的键）；改为把修订号写进信封、
+ * 读路径比对 —— 存储被编辑（含 id 被复用）后旧条目一律不命中。
+ */
+function revisionOf(target: CacheTarget): string {
+  const modified = (target?.storage as any)?.modified
+  return modified === undefined || modified === null ? "" : String(modified)
+}
+
+/**
  * 读取文件树缓存。未命中 / 已过期 / 任何异常都返回 null（由调用方回源）。
  */
 export async function getCachedFileTree(
@@ -94,7 +105,9 @@ export async function getCachedFileTree(
 ): Promise<FileItem[] | null> {
   if (!target || !isFileTreeCacheable(target, env)) return null
   try {
-    const hit = await cacheGetEnvelope<FileItem[]>(keyFor(target, env), env)
+    const hit = await cacheGetEnvelope<FileItem[]>(keyFor(target, env), env, {
+      revision: revisionOf(target),
+    })
     if (!hit) return null
     const items = hit.v
     if (!Array.isArray(items)) return null
@@ -116,7 +129,9 @@ export async function setCachedFileTree(
   const ttlMinutes = resolveFileTreeTtlMinutes(target, env)
   if (ttlMinutes <= 0) return
   try {
-    await cacheSetEnvelope(keyFor(target, env), items, ttlMinutes * 60_000, env)
+    await cacheSetEnvelope(keyFor(target, env), items, ttlMinutes * 60_000, env, {
+      revision: revisionOf(target),
+    })
   } catch {
     // 缓存写入失败绝不影响业务
   }

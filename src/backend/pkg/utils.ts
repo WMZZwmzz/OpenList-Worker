@@ -1,5 +1,6 @@
 import { Context } from "hono"
 import { getDb } from "../internal/model/db"
+import { isOtpPendingPayload } from "./otp-pending"
 import { findUserByTokenPayload, jwtClaimsAcceptable, UserRole } from "./permission"
 
 /**
@@ -16,11 +17,17 @@ export * from "./stream"
 
 // Format byte sizes to human-readable strings
 export function formatBytes(bytes: number, decimals = 2): string {
-  if (bytes === 0) return "0 Bytes"
+  // F-066: `Math.log(bytes)` is NaN for negatives and -Infinity for 0, and the
+  // resulting index can fall outside `sizes` for (0,1) or >= 1024^6 inputs —
+  // which used to print "512 undefined" / "NaN undefined" / "1 undefined".
+  // Non-finite or non-positive sizes are clamped to "0 Bytes"; the unit index
+  // is clamped into range so the unit is always defined.
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 Bytes"
   const k = 1024
   const dm = decimals < 0 ? 0 : decimals
   const sizes = ["Bytes", "KB", "MB", "GB", "TB", "PB"]
-  const i = Math.floor(Math.log(bytes) / Math.log(k))
+  const raw = Math.floor(Math.log(bytes) / Math.log(k))
+  const i = Math.min(Math.max(raw, 0), sizes.length - 1)
   return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + " " + sizes[i]
 }
 
@@ -57,6 +64,12 @@ export async function checkAdminAuth(c: Context): Promise<boolean> {
     const secret = await getJwtSecret(c)
     const payload: any = await verify(token, secret, "HS256")
     if (!jwtClaimsAcceptable(payload)) return false
+
+    // F-032: 2FA「待兑换」令牌（type:"otp_pending"）只允许打 /api/auth/otp/login。
+    // authUserFromReq 与 resolveUserFromContext 都已显式拒绝它；这里是 /api/admin/*
+    // 的唯一守卫，漏判会让未完成 TOTP 的第一因子令牌直接拿到管理员权限
+    // （历史账号缺 pwd_update_at / token_epoch 时后面的兜底检查全部命中相等）。
+    if (isOtpPendingPayload(payload)) return false
 
     // 注销黑名单对管理端同样生效：此前只有 authUserFromReq 检查，admin/mcp/
     // task 路由走 checkAdminAuth，管理员登出后旧 token 仍能继续管理。

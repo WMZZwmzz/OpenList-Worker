@@ -4,7 +4,43 @@ import {
   calcFileType,
 } from "../../internal/driver/base"
 import { DriverMediafireAddition } from "./types"
-import { ClientMediafire } from "./util"
+import { ClientMediafire, MFEntry } from "./util"
+
+/**
+ * F-418：MediaFire 的 created 是无时区标记的 "YYYY-MM-DD HH:MM:SS"（服务器本地
+ * 时间），new Date 会按运行时本地时区解析，modified 随部署环境漂移；无法解析
+ * 的字符串还会让 toISOString 抛 RangeError 拖垮整个 list。
+ * 优先使用带时区标记的 created_utc，其次把 created 当 UTC 解析，并做有效性守卫。
+ */
+function mfModified(e: MFEntry): string {
+  for (const value of [e.createdUtc, e.created]) {
+    if (!value) continue
+    let text = String(value).trim().replace(" ", "T")
+    if (!/([zZ]|[+-]\d{2}:?\d{2})$/.test(text)) text = `${text}Z`
+    const d = new Date(text)
+    if (!Number.isNaN(d.getTime())) return d.toISOString()
+  }
+  return new Date().toISOString()
+}
+
+/** 目标项自身路径 → 其父目录物理路径 */
+function parentOf(physicalPath: string): string {
+  const parts = String(physicalPath || "").split("/").filter(Boolean)
+  parts.pop()
+  return "/" + parts.join("/")
+}
+
+function entryToItem(e: MFEntry): FileItem {
+  return {
+    name: e.name,
+    size: e.size,
+    is_dir: e.isDir,
+    modified: mfModified(e),
+    sign: "",
+    type: calcFileType(e.name, e.isDir),
+    raw_url: "",
+  }
+}
 
 export class DriverMediafire implements StorageDriver {
   private client: ClientMediafire
@@ -21,51 +57,14 @@ export class DriverMediafire implements StorageDriver {
   async list(_virtualPath: string, physicalPath: string): Promise<FileItem[]> {
     const folderKey = await this.resolveFolderId(physicalPath)
     const entries = await this.client.list(folderKey)
-    return entries.map((e) => ({
-      name: e.name,
-      size: e.size,
-      is_dir: e.isDir,
-      modified: e.created ? new Date(e.created).toISOString() : new Date().toISOString(),
-      sign: "",
-      type: calcFileType(e.name, e.isDir),
-      raw_url: "",
-    }))
+    return entries.map(entryToItem)
   }
 
   async get(_virtualPath: string, physicalPath: string): Promise<FileItem> {
     const parts = physicalPath.split("/").filter(Boolean)
-    const rawName = parts[parts.length - 1] || "root"
-    const parentPath = "/" + parts.slice(0, -1).join("/")
-    try {
-      const parentId = await this.resolveFolderId(parentPath)
-      const entries = await this.client.list(parentId)
-      const entry = entries.find((e) => e.name === rawName)
-      if (entry) {
-        const item: FileItem = {
-          name: entry.name,
-          size: entry.size,
-          is_dir: entry.isDir,
-          modified: entry.created ? new Date(entry.created).toISOString() : new Date().toISOString(),
-          sign: "",
-          type: calcFileType(entry.name, entry.isDir),
-          raw_url: "",
-        }
-        if (!entry.isDir) {
-          try {
-            item.raw_url = await this.client.getDownloadUrl(entry.id)
-          } catch (e: any) {
-            item.raw_url_error = e.message
-          }
-        }
-        return item
-      }
-    } catch {}
-
-    // Fallback: 目录
-    try {
-      await this.resolveFolderId(physicalPath)
+    if (parts.length === 0) {
       return {
-        name: rawName,
+        name: "root",
         size: 0,
         is_dir: true,
         modified: new Date().toISOString(),
@@ -73,17 +72,29 @@ export class DriverMediafire implements StorageDriver {
         type: 1,
         raw_url: "",
       }
-    } catch {
-      return {
-        name: rawName,
-        size: 0,
-        is_dir: false,
-        modified: new Date().toISOString(),
-        sign: "",
-        type: 0,
-        raw_url: "",
+    }
+
+    // F-412：列表/鉴权/网络失败必须向上传播；条目不存在时抛 not-found。
+    // 之前 catch-all 会把它们伪装成伪造的目录或文件条目（raw_url 为空），
+    // /fs/get 与 WebDAV 因此永远不 404。
+    const rawName = parts[parts.length - 1]
+    const parentPath = "/" + parts.slice(0, -1).join("/")
+    const parentId = await this.resolveFolderId(parentPath)
+    const entries = await this.client.list(parentId)
+    const entry = entries.find((e) => e.name === rawName)
+    if (!entry) {
+      throw new Error(`[MediaFire] '${rawName}' not found`)
+    }
+
+    const item = entryToItem(entry)
+    if (!entry.isDir) {
+      try {
+        item.raw_url = await this.client.getDownloadUrl(entry.id)
+      } catch (e: any) {
+        item.raw_url_error = e.message
       }
     }
+    return item
   }
 
   async mkdir(_virtualPath: string, physicalPath: string): Promise<void> {
@@ -92,6 +103,7 @@ export class DriverMediafire implements StorageDriver {
     const parentPath = "/" + parts.join("/")
     const parentId = await this.resolveFolderId(parentPath)
     await this.client.mkdir(parentId, name)
+    this.pathCache.clear()
   }
 
   async rename(
@@ -101,6 +113,7 @@ export class DriverMediafire implements StorageDriver {
   ): Promise<void> {
     const { id, isDir } = await this.resolveEntry(physicalPath)
     await this.client.rename(id, newName, isDir)
+    this.pathCache.clear()
   }
 
   async remove(
@@ -110,30 +123,37 @@ export class DriverMediafire implements StorageDriver {
   ): Promise<void> {
     const { id, isDir } = await this.resolveEntry(physicalPath)
     await this.client.remove(id, isDir)
+    this.pathCache.clear()
   }
 
   async move(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
     const { id, isDir } = await this.resolveEntry(srcPhysical)
-    const dstId = await this.resolveFolderId(dstDir)
+    // F-414：dstDir 是含挂载前缀的虚拟路径，resolveFolderId 只接受物理路径，
+    // 直接用会在账户根目录里找与挂载前缀同名的文件夹。
+    // dstPhysical 是「目标项自身」的物理路径，去掉末段即得目标父目录。
+    const dstId = await this.resolveFolderId(parentOf(dstPhysical))
     await this.client.move(id, dstId, isDir)
+    this.pathCache.clear()
   }
 
   async copy(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
     const { id, isDir } = await this.resolveEntry(srcPhysical)
-    const dstId = await this.resolveFolderId(dstDir)
+    // F-414：同上，使用物理目标路径的父目录。
+    const dstId = await this.resolveFolderId(parentOf(dstPhysical))
     await this.client.copy(id, dstId, isDir)
+    this.pathCache.clear()
   }
 
   async put(
@@ -157,8 +177,9 @@ export class DriverMediafire implements StorageDriver {
       const target = entries.find((e) => e.isDir && e.name === parts[i])
       if (!target) throw new Error(`[MediaFire] Folder '${parts[i]}' not found`)
       currentId = target.id
-      const subPath = "/" + parts.slice(0, i + 1).join("/")
-      this.pathCache.set(subPath, currentId)
+      // F-417：查找键是 clean（无前导斜杠），写入必须同格式，
+      // 否则两套键永不相等、缓存 100% 不命中。
+      this.pathCache.set(parts.slice(0, i + 1).join("/"), currentId)
     }
     return currentId
   }

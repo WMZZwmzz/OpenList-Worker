@@ -20,8 +20,10 @@ export function normalizePhoneE164(phone: string): string {
     return p
   }
   const digits = p.replace(/\D/g, "")
-  if (digits.startsWith("86") && digits.length > 11) {
-    // handled below
+  // F-225：86 开头但没带 + 的 13 位号码（8613800138000）此前原样透传，
+  // 短信登录会以非 E.164 号码发起。与 +86 写法一样剥掉国家码。
+  if (digits.startsWith("86") && digits.length === 13) {
+    return "+86 " + digits.slice(2)
   }
   if (digits.length === 11) return "+86 " + digits
   return p
@@ -143,7 +145,8 @@ export class GuangYaPanClient {
     const out = (await res.json()) as any
     if (!res.ok || out.error || !out.access_token) {
       throw new Error(
-        "refresh token failed: " + (out.error_description || out.error || res.status),
+        "refresh token failed: " +
+          (out.error_description || out.error || res.status),
       )
     }
     this.accessToken = out.access_token
@@ -336,10 +339,17 @@ export class GuangYaPanClient {
     return json
   }
 
-  async getFileList(parentId: string, pageSize: number, orderBy: number, sortType: number): Promise<GypListResp> {
+  async getFileList(
+    parentId: string,
+    pageSize: number,
+    orderBy: number,
+    sortType: number,
+    page = 0,
+  ): Promise<GypListResp> {
     return this.postAPI<GypListResp>("/userres/v1/file/get_file_list", {
       parentId,
-      page: 0,
+      // F-220：page 由调用方传入，不能硬编码 0（否则翻页永远拿到第一页）
+      page: Math.max(0, Math.floor(page) || 0),
       pageSize,
       orderBy,
       sortType,
@@ -376,9 +386,12 @@ export class GuangYaPanClient {
 
   async waitTaskDone(taskId: string): Promise<void> {
     for (let i = 0; i < 30; i++) {
-      const out = await this.postAPI<any>("/nd.bizuserres.s/v1/get_task_status", {
-        taskId,
-      })
+      const out = await this.postAPI<any>(
+        "/nd.bizuserres.s/v1/get_task_status",
+        {
+          taskId,
+        },
+      )
       if (!isSuccessMsg(out.msg)) {
         throw new Error("get task status failed: " + out.msg)
       }
@@ -392,12 +405,25 @@ export class GuangYaPanClient {
   }
 
   async waitUploadTaskInfo(taskId: string): Promise<void> {
-    for (let i = 0; i < 300; i++) {
+    for (let i = 0; i < 60; i++) {
       const out = await this.postAPI<any>(
         "/nd.bizuserres.s/v1/file/get_info_by_task_id",
         { taskId },
       )
-      if (out.data?.fileId) return
+      if (out?.data?.fileId) return
+      // F-224：postAPI 只校验 HTTP 状态，HTTP 200 + 业务失败（code!=0 / msg
+      // 非成功）时旧实现会空转到超时才报通用 timeout。这里立即抛出真实原因。
+      const code = out?.code
+      if (code !== undefined && code !== null && Number(code) !== 0) {
+        throw new Error(
+          `upload task ${taskId} failed: code=${String(code)} ${out?.msg || ""}`.trim(),
+        )
+      }
+      if (!isSuccessMsg(out?.msg || "")) {
+        throw new Error(
+          `upload task ${taskId} failed: ${out?.msg || "unknown error"}`,
+        )
+      }
       await new Promise((r) => setTimeout(r, 1000))
     }
     throw new Error(`upload task ${taskId} timeout`)

@@ -8,13 +8,15 @@ import {
 import { GoogleDriveClient } from "./util"
 
 function googleFileToFileItem(f: GoogleFile): FileItem {
+  // 快捷方式按其目标类型展示（文件夹快捷方式仍显示为目录）
+  const isDir = (f.targetMimeType || f.mimeType) === GOOGLE_DRIVE_FOLDER_MIME
   return {
     name: f.name,
     size: f.size ? parseInt(f.size, 10) : 0,
-    is_dir: f.mimeType === GOOGLE_DRIVE_FOLDER_MIME,
+    is_dir: isDir,
     modified: f.modifiedTime || f.createdTime || new Date().toISOString(),
     sign: "",
-    type: f.mimeType === GOOGLE_DRIVE_FOLDER_MIME ? 1 : 0,
+    type: isDir ? 1 : 0,
     thumb: f.thumbnailLink || "",
     raw_url: "",
   }
@@ -34,12 +36,22 @@ export class GoogleDrive implements StorageDriver {
   }
 
   async list(_virtualPath: string, physicalPath: string): Promise<FileItem[]> {
-    const folderId = await this.client.resolveFileId(physicalPath)
+    // 文件夹快捷方式需要按目标 id 列子项
+    const folderId = await this.client.resolveReadId(physicalPath)
     const files = await this.client.listFiles(folderId)
     const items = files.map(googleFileToFileItem)
+    // F-361：order_by 是 Drive 专用的复合查询串（如
+    // "folder,name,modifiedTime desc"），API 已按它排好序；再喂给
+    // sortFileItems 会被本地排序覆盖掉 API 的排序（旧版启发式甚至把
+    // modifiedTime 误读成「按修改时间」）。复合串只信任服务端排序，
+    // 简单键（name/size/modified…）仍交给共享排序。
+    const orderBy = this.addition.order_by
+    if (orderBy && String(orderBy).includes(",")) {
+      return items
+    }
     return sortFileItems(
       items,
-      this.addition.order_by,
+      orderBy,
       this.addition.order_direction,
     )
   }
@@ -48,10 +60,17 @@ export class GoogleDrive implements StorageDriver {
     const fileId = await this.client.resolveFileId(physicalPath)
     const file = await this.client.getFile(fileId).catch(() => null)
     if (file) {
-      const item = googleFileToFileItem(file)
-      // Attach download URL + auth header
-      item.raw_url = this.client.getDownloadUrl(fileId)
-      item.raw_url_headers = this.client.getDownloadHeaders()
+      // 快捷方式：写操作已作用在快捷方式本身，下载链接需指向目标。
+      const targetId = file.shortcutDetails?.targetId
+      const item = googleFileToFileItem({
+        ...file,
+        targetId,
+        targetMimeType: file.shortcutDetails?.targetMimeType,
+      })
+      if (!item.is_dir) {
+        item.raw_url = this.client.getDownloadUrl(targetId || fileId)
+        item.raw_url_headers = this.client.getDownloadHeaders()
+      }
       return item
     }
     // Fallback: the path may be a folder that isn't found via getFile
@@ -85,6 +104,7 @@ export class GoogleDrive implements StorageDriver {
     const { parentId, name } =
       await this.client.resolveParentAndName(physicalPath)
     await this.client.mkdir(parentId, name)
+    this.client.invalidatePathCache(physicalPath)
   }
 
   async rename(
@@ -94,6 +114,7 @@ export class GoogleDrive implements StorageDriver {
   ): Promise<void> {
     const fileId = await this.client.resolveFileId(physicalPath)
     await this.client.rename(fileId, newName)
+    this.client.invalidatePathCache(physicalPath)
   }
 
   async remove(
@@ -103,6 +124,7 @@ export class GoogleDrive implements StorageDriver {
   ): Promise<void> {
     const fileId = await this.client.resolveFileId(physicalPath)
     await this.client.remove(fileId)
+    this.client.invalidatePathCache(physicalPath)
   }
 
   async move(
@@ -123,6 +145,8 @@ export class GoogleDrive implements StorageDriver {
     const { parentId: dstParentId } =
       await this.client.resolveParentAndName(dstPhysical)
     await this.client.move(fileId, srcParentId, dstParentId)
+    this.client.invalidatePathCache(srcPhysical)
+    this.client.invalidatePathCache(dstPhysical)
   }
 
   async copy(
@@ -137,6 +161,7 @@ export class GoogleDrive implements StorageDriver {
     const { parentId: dstParentId, name } =
       await this.client.resolveParentAndName(dstPhysical)
     await this.client.copy(fileId, dstParentId, name)
+    this.client.invalidatePathCache(dstPhysical)
   }
 
   async put(
@@ -147,5 +172,6 @@ export class GoogleDrive implements StorageDriver {
     const { parentId, name } =
       await this.client.resolveParentAndName(physicalPath)
     await this.client.putFile(parentId, name, content)
+    this.client.invalidatePathCache(physicalPath)
   }
 }

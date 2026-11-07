@@ -26,9 +26,20 @@ export class AliyundriveOpen implements StorageDriver {
   private addition: AliyundriveOpenAddition
   private pathFileIdCache = new Map<string, string>()
 
-  constructor(addition: AliyundriveOpenAddition) {
+  constructor(
+    addition: AliyundriveOpenAddition,
+    onTokenUpdate?: (refreshToken: string) => Promise<void> | void,
+  ) {
     this.addition = addition
-    this.client = new AliyunOpenClient(addition)
+    this.client = new AliyunOpenClient(addition, onTokenUpdate)
+  }
+
+  /**
+   * 变更目录结构后清空路径→fileId 缓存（F-347）。
+   * 驱动实例被 driverCache 跨请求长期缓存，陈旧的 fileId 会指向已删除/改名对象。
+   */
+  private invalidatePathCache(): void {
+    this.pathFileIdCache.clear()
   }
 
   async init(): Promise<void> {
@@ -93,6 +104,7 @@ export class AliyundriveOpen implements StorageDriver {
     const parentPath = "/" + parts.join("/")
     const parentId = await this.resolveFileId(parentPath)
     await this.client.mkdir(parentId, name)
+    this.invalidatePathCache()
   }
 
   async rename(
@@ -102,6 +114,7 @@ export class AliyundriveOpen implements StorageDriver {
   ): Promise<void> {
     const fileId = await this.resolveFileId(physicalPath)
     await this.client.rename(fileId, newName)
+    this.invalidatePathCache()
   }
 
   async remove(
@@ -111,6 +124,7 @@ export class AliyundriveOpen implements StorageDriver {
   ): Promise<void> {
     const fileId = await this.resolveFileId(physicalPath)
     await this.client.remove(fileId)
+    this.invalidatePathCache()
   }
 
   async move(
@@ -123,6 +137,7 @@ export class AliyundriveOpen implements StorageDriver {
     const fileId = await this.resolveFileId(srcPhysical)
     const dstId = await this.resolveFileId(dstDir)
     await this.client.move(fileId, dstId)
+    this.invalidatePathCache()
   }
 
   async copy(
@@ -135,6 +150,7 @@ export class AliyundriveOpen implements StorageDriver {
     const fileId = await this.resolveFileId(srcPhysical)
     const dstId = await this.resolveFileId(dstDir)
     await this.client.copy(fileId, dstId)
+    this.invalidatePathCache()
   }
 
   readonly rapidHashAlgos = ["sha1"]
@@ -175,7 +191,25 @@ export class AliyundriveOpen implements StorageDriver {
         proof_code: proofCode,
       },
     )
-    if (!createResp?.rapid_upload) return false
+    if (!createResp?.rapid_upload) {
+      // F-351：秒传未命中时 /openFile/create 已创建一个未完成的条目，
+      // 必须删除，否则调用方走 put() 会再建一份，留下无内容的孤儿条目。
+      const createdFileId = createResp?.file_id
+      if (createdFileId) {
+        try {
+          await this.client.openApiRequest("/openFile/delete", {
+            drive_id: this.client.driveId,
+            file_id: createdFileId,
+          })
+        } catch (e: any) {
+          console.warn(
+            "[AliyundriveOpen] failed to clean up incomplete rapid-upload entry:",
+            e?.message || e,
+          )
+        }
+      }
+      return false
+    }
     if (createResp.file_id) {
       await this.client.openApiRequest("/openFile/complete", {
         drive_id: this.client.driveId,

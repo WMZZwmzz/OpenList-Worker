@@ -116,26 +116,34 @@ export function parseAutoIndexHTML(
 }
 
 // 与 Go 侧 units 映射对齐（支持 KiB/MiB/GiB/TiB/PiB、KB/MB/GB/TB/PB、bytes 等）
+// 注意：不能用 `1 << 40`/`1 << 50` —— JS 位运算按 32 位取模，`1 << 40 === 256`、
+// `1 << 50 === 262144`，TB/PB 单位会被算成 KB 级假大小（F-379）。
+const KiB = 1024
+const MiB = KiB * 1024
+const GiB = MiB * 1024
+const TiB = GiB * 1024
+const PiB = TiB * 1024
+
 const sizeUnits: Record<string, number> = {
   "": 1,
   b: 1,
   byte: 1,
   bytes: 1,
-  k: 1 << 10,
-  kb: 1 << 10,
-  kib: 1 << 10,
-  m: 1 << 20,
-  mb: 1 << 20,
-  mib: 1 << 20,
-  g: 1 << 30,
-  gb: 1 << 30,
-  gib: 1 << 30,
-  t: 1 << 40,
-  tb: 1 << 40,
-  tib: 1 << 40,
-  p: 1 << 50,
-  pb: 1 << 50,
-  pib: 1 << 50,
+  k: KiB,
+  kb: KiB,
+  kib: KiB,
+  m: MiB,
+  mb: MiB,
+  mib: MiB,
+  g: GiB,
+  gb: GiB,
+  gib: GiB,
+  t: TiB,
+  tb: TiB,
+  tib: TiB,
+  p: PiB,
+  pb: PiB,
+  pib: PiB,
 }
 
 function splitUnit(s: string): [string, string] {
@@ -158,31 +166,233 @@ export function parseSize(sizeStr: string): number {
   return Math.round(num * mul)
 }
 
-export function parseTime(timeStr: string, format: string): string {
-  if (!timeStr) return new Date().toISOString()
+const MONTH_NAMES = [
+  "jan",
+  "feb",
+  "mar",
+  "apr",
+  "may",
+  "jun",
+  "jul",
+  "aug",
+  "sep",
+  "oct",
+  "nov",
+  "dec",
+]
 
+/** Go time layout 记号 → 正则片段（按长度降序匹配，避免 "2006" 被 "2" 抢先） */
+const GO_LAYOUT_TOKENS: Array<[string, string]> = [
+  ["January", "([A-Za-z]+)"],
+  ["2006", "(\\d{4})"],
+  ["Z07:00", "([+-]\\d{2}:\\d{2})"],
+  ["Z0700", "([+-]\\d{4})"],
+  ["-07:00", "([+-]\\d{2}:\\d{2})"],
+  ["-0700", "([+-]\\d{4})"],
+  ["Monday", "([A-Za-z]+)"],
+  ["Jan", "([A-Za-z]{3})"],
+  ["Mon", "([A-Za-z]{3})"],
+  ["MST", "([A-Za-z]{2,5})"],
+  ["_2", "(\\s?\\d{1,2})"],
+  ["15", "(\\d{2})"],
+  ["04", "(\\d{2})"],
+  ["05", "(\\d{2})"],
+  ["06", "(\\d{2})"],
+  ["01", "(\\d{2})"],
+  ["02", "(\\d{2})"],
+  ["03", "(\\d{2})"],
+  ["PM", "(AM|PM)"],
+  ["pm", "(am|pm)"],
+  ["1", "(\\d{1,2})"],
+  ["2", "(\\d{1,2})"],
+  ["3", "(\\d{1,2})"],
+  ["4", "(\\d{1,2})"],
+  ["5", "(\\d{1,2})"],
+]
+
+function escapeRegExp(ch: string): string {
+  return ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+/**
+ * 按 Go time layout 解析时间戳（F-380）。
+ *
+ * 支持常用记号：2006/06（年）、01/1/Jan/January（月）、02/2/_2（日）、
+ * 15/3（时）、04/4（分）、05/5（秒）、PM/pm（上下午）、
+ * -0700/Z07:00/MST（时区）。未带时区的输入按 UTC 解释（与 Go time.Parse 一致），
+ * 不随宿主 TZ 漂移。解析失败返回空串。
+ */
+export function parseWithGoLayout(timeStr: string, layout: string): string {
+  if (!timeStr || !layout) return ""
+  const tokens = [...GO_LAYOUT_TOKENS].sort((a, b) => b[0].length - a[0].length)
+  let pattern = "^"
+  const kinds: string[] = []
+  let i = 0
+  while (i < layout.length) {
+    const token = tokens.find((t) => layout.startsWith(t[0], i))
+    if (token) {
+      pattern += token[1]
+      // 记录记号首字符即可区分语义（"15"/"1" 等都以数字开头，需用完整 token）
+      kinds.push(token[0])
+      i += token[0].length
+      continue
+    }
+    // 连续空白视作 \s+
+    if (/\s/.test(layout[i])) {
+      while (i < layout.length && /\s/.test(layout[i])) i++
+      pattern += "\\s+"
+      continue
+    }
+    pattern += escapeRegExp(layout[i])
+    i++
+  }
+  pattern += "$"
+
+  let m: RegExpExecArray | null
   try {
-    // Simple date parsing - support common formats
-    // Go format: Mon Jan 2 15:04:05 -0700 MST 2006
-    // Common formats: "2006-01-02 15:04", "02-Jan-2006 15:04", etc.
+    m = new RegExp(pattern).exec(timeStr.trim())
+  } catch {
+    return ""
+  }
+  if (!m) return ""
+  const values = m.slice(1)
 
-    // Try ISO format first
-    const isoMatch = timeStr.match(/(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})/)
-    if (isoMatch) {
-      const [, year, month, day, hour, minute] = isoMatch
-      return new Date(
-        `${year}-${month}-${day}T${hour}:${minute}:00`,
-      ).toISOString()
-    }
+  const year: number[] = []
+  const month: number[] = []
+  const day: number[] = []
+  const hour: number[] = []
+  const minute: number[] = []
+  const second: number[] = []
+  let meridiem = ""
+  let offsetMinutes: number | null = null
 
-    // Try common formats
-    const parsed = new Date(timeStr)
-    if (!isNaN(parsed.getTime())) {
-      return parsed.toISOString()
+  for (let k = 0; k < kinds.length; k++) {
+    const token = kinds[k]
+    const raw = values[k]
+    switch (token) {
+      case "2006":
+        year.push(parseInt(raw, 10))
+        break
+      case "06": {
+        const yy = parseInt(raw, 10)
+        year.push(yy >= 69 ? 1900 + yy : 2000 + yy)
+        break
+      }
+      case "January":
+      case "Jan": {
+        const idx = MONTH_NAMES.indexOf(raw.slice(0, 3).toLowerCase())
+        if (idx < 0) return ""
+        month.push(idx + 1)
+        break
+      }
+      case "01":
+      case "1":
+        month.push(parseInt(raw, 10))
+        break
+      case "02":
+      case "2":
+      case "_2":
+        day.push(parseInt(raw.trim(), 10))
+        break
+      case "15":
+        hour.push(parseInt(raw, 10))
+        break
+      case "03":
+      case "3":
+        hour.push(parseInt(raw, 10))
+        break
+      case "04":
+      case "4":
+        minute.push(parseInt(raw, 10))
+        break
+      case "05":
+      case "5":
+        second.push(parseInt(raw, 10))
+        break
+      case "PM":
+      case "pm":
+        meridiem = raw.toUpperCase()
+        break
+      case "Z07:00":
+      case "-07:00":
+        offsetMinutes = parseUtcOffset(raw)
+        break
+      case "Z0700":
+      case "-0700":
+        offsetMinutes = parseUtcOffset(raw)
+        break
+      case "MST":
+        // 只有 UTC/GMT 能无歧义换算；其他缩写（CST 等）歧义太大，视为本地无区
+        if (/^(utc|gmt)$/i.test(raw)) offsetMinutes = 0
+        break
+      default:
+        break
     }
-  } catch (e) {
-    // Ignore parse errors
   }
 
-  return new Date().toISOString()
+  if (year.length === 0 || month.length === 0 || day.length === 0) return ""
+  let h = hour.length ? hour[0] : 0
+  if (meridiem === "PM" && h < 12) h += 12
+  if (meridiem === "AM" && h === 12) h = 0
+  const mi = minute.length ? minute[0] : 0
+  const sec = second.length ? second[0] : 0
+  const ms =
+    Date.UTC(year[0], month[0] - 1, day[0], h, mi, sec) -
+    (offsetMinutes ?? 0) * 60_000
+  const d = new Date(ms)
+  return isNaN(d.getTime()) ? "" : d.toISOString()
+}
+
+function parseUtcOffset(raw: string): number | null {
+  const m = raw.match(/^([+-])(\d{2}):?(\d{2})$/)
+  if (!m) return null
+  const sign = m[1] === "-" ? -1 : 1
+  return sign * (parseInt(m[2], 10) * 60 + parseInt(m[3], 10))
+}
+
+/** 显式时区标记（GMT/UTC/Z/±hh:mm）：只有这类输入才可交给 Date 解析 */
+function hasExplicitTimezone(s: string): boolean {
+  return /(?:GMT|UTC|Z|[+-]\d{2}:?\d{2})$/i.test(s.trim())
+}
+
+export function parseTime(timeStr: string, format: string): string {
+  // 空输入没有可推断的信息，不能伪造成「当前时刻」（F-380）
+  if (!timeStr || !timeStr.trim()) return ""
+
+  // 1) 用户配置的 Go layout 优先
+  if (format) {
+    const byLayout = parseWithGoLayout(timeStr, format)
+    if (byLayout) return byLayout
+  }
+
+  const s = timeStr.trim()
+
+  // 2) 内置 "YYYY-MM-DD HH:MM[:SS]"：无时区标记，按 UTC 解释（与 Go time.Parse
+  //    一致），避免同一远端页面在不同宿主 TZ 上得到不同 modified。
+  const isoMatch = s.match(
+    /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?/,
+  )
+  if (isoMatch) {
+    const [, year, month, day, hour, minute, second] = isoMatch
+    const d = new Date(
+      Date.UTC(
+        parseInt(year, 10),
+        parseInt(month, 10) - 1,
+        parseInt(day, 10),
+        parseInt(hour, 10),
+        parseInt(minute, 10),
+        second ? parseInt(second, 10) : 0,
+      ),
+    )
+    if (!isNaN(d.getTime())) return d.toISOString()
+  }
+
+  // 3) 带显式时区的通用格式（RFC1123 等）交给 Date；无时区的裸串一律不猜
+  if (hasExplicitTimezone(s)) {
+    const parsed = new Date(s)
+    if (!isNaN(parsed.getTime())) return parsed.toISOString()
+  }
+
+  // 4) 解析失败：返回空串，让上层看到「未知」而不是伪造的当前时间
+  return ""
 }

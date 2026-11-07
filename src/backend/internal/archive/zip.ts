@@ -137,25 +137,69 @@ export async function extractZipEntry(
     }
     const ds = new DecompressionStream("deflate-raw")
     const writer = ds.writable.getWriter()
-    writer.write(compressed)
-    writer.close()
+
+    /**
+     * F-113：写侧必须自己吞掉拒绝。
+     *
+     * 旧实现 `writer.write(compressed)` / `writer.close()` 既不 await 也不挂
+     * catch。zip-bomb 中止路径上 `reader.cancel()` 会按 Streams 规范 error 掉
+     * 可写侧，挂起的 write/close 以 AbortError 拒绝且无人处理 —— Node 15+
+     * 默认把 unhandled rejection 当未捕获异常，进程直接退出（一个请求打挂
+     * 整个服务）。这里把 write→close 串成一个 Promise 并立即挂 catch：
+     * 无论成功、被 cancel/abort、还是畸形 deflate 导致失败，都不会逃逸成
+     * unhandled rejection；调用方通过 reader.read() / 抛出的限额错误感知失败。
+     *
+     * 不能先 await 这个 Promise 再读：readable 侧不排空时，write 会因内部
+     * 队列反压永久挂起（死锁），所以必须并发读、最后统一 await。
+     */
+    const writerDone = (async () => {
+      try {
+        await writer.write(compressed)
+        await writer.close()
+      } catch {
+        // 预期内的失败（超限 cancel / malformed deflate）：已由读侧报告
+      }
+    })()
     const reader = ds.readable.getReader()
     const chunks: Uint8Array[] = []
     let total = 0
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      if (!value?.length) continue
-      total += value.byteLength
-      if (total > maxBytes) {
-        try {
-          await reader.cancel()
-        } catch {}
-        throw new Error(
-          `ZIP entry exceeds the ${maxBytes}-byte extraction limit: ${entry.name}`,
-        )
+    let completed = false
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        if (!value?.length) continue
+        total += value.byteLength
+        if (total > maxBytes) {
+          // 确定性释放：先中止读侧，再 abort 写侧，最后等写侧落定。
+          try {
+            await reader.cancel()
+          } catch {}
+          try {
+            await writer.abort()
+          } catch {}
+          await writerDone
+          throw new Error(
+            `ZIP entry exceeds the ${maxBytes}-byte extraction limit: ${entry.name}`,
+          )
+        }
+        chunks.push(value)
       }
-      chunks.push(value)
+      completed = true
+    } finally {
+      try {
+        reader.releaseLock()
+      } catch {}
+      if (!completed) {
+        // 读侧异常退出（畸形 deflate 等）：确保写侧也被 abort，否则挂起的
+        // write 永远不落定，finally 里的 await 会挂死。
+        try {
+          await writer.abort()
+        } catch {}
+      }
+      // 成功路径上写侧应已 close；失败路径上 write/close 的拒绝已被
+      // writerDone 内部吞掉，这里只等待其落定，保证资源确定性释放。
+      await writerDone
     }
     const out = new Uint8Array(total)
     let offset = 0

@@ -121,9 +121,8 @@ function sanitize(obj: any, depth = 0): any {
 
   // 字符串检查（避免在日志中输出长 token）
   if (typeof obj === "string") {
-    if (obj.length > 200) {
-      return obj.slice(0, 200) + "... [truncated]"
-    }
+    // L-11：先做模式脱敏再截断——旧实现先截 200 字符，JWT 的全部 claims
+    // （header.payload 前半）恰好落在前 200 字符内，明文进日志。
     // 检测类似 JWT 的字符串（格式：xxxxx.xxxxx.xxxxx）
     if (/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(obj)) {
       return "[JWT_TOKEN]"
@@ -131,6 +130,9 @@ function sanitize(obj: any, depth = 0): any {
     // 检测类似 API key 的长随机字符串
     if (/^[A-Za-z0-9_-]{32,}$/.test(obj)) {
       return "[API_KEY]"
+    }
+    if (obj.length > 200) {
+      return stripControl(obj.slice(0, 200)) + "... [truncated]"
     }
     return stripControl(obj)
   }

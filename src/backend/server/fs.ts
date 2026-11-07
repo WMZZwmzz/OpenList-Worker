@@ -11,7 +11,7 @@ import {
   putItem,
   getDriver,
 } from "../internal/op/storage"
-import { resolveShare } from "../internal/op/share"
+import { resolveShare, shareClientKey } from "../internal/op/share"
 import { resolvePath } from "../internal/model/db"
 import { getUserFromContext, requireAuthenticatedUser, AUTHED_USER_KEY } from "./middlewares"
 import {
@@ -34,6 +34,7 @@ import {
   getHeader,
   canWriteContentBypassUserPerms,
   isHidden,
+  isSafeHidePattern,
   canWrite as canWriteMeta,
 } from "../pkg/meta"
 import type { Meta } from "../pkg/meta"
@@ -45,6 +46,7 @@ import {
   needDownloadSign,
 } from "../pkg/sign"
 import { safeErrorMessage } from "../pkg/errs"
+import { clientIpFromContext } from "../pkg/client-ip"
 import {
   encodeDownloadPath,
   decodePathFully,
@@ -167,7 +169,14 @@ const getStorageRequestContext = (c: any, explicitUser?: any) => {
     }
   }
   if (!env && !waitUntil) return undefined
-  return { ...(waitUntil ? { waitUntil } : {}), env, user }
+  // F-405：客户端 IP 进 op 层，CDN 防盗链签名驱动（如 bunny_storage）按请求 IP
+  // 计算 token；unknown（IP 不可信）时 op 层会退回无 IP 签名。
+  return {
+    ...(waitUntil ? { waitUntil } : {}),
+    env,
+    user,
+    clientIp: clientIpFromContext(c),
+  }
 }
 
 // ---- 写操作权限校验 ----
@@ -243,6 +252,26 @@ async function deniedByMetaReadAcl(
 }
 
 /**
+ * 多路径版本的读 ACL 校验（F-009）。
+ *
+ * 安全不变量：copy/move 会**读取源内容再写到目标位置**，等价于一次下载；
+ * 源路径必须与 `/fs/list`、`/fs/get`、归档接口、raw `/sd` 受同一套读授权
+ * （密码 + read_users）。历史缺陷：三个搬运端点只构造目标侧写 ACL，
+ * 持 COPY/MOVE 位但不知道目录密码的用户可把受保护文件搬到可读目录后直接读取。
+ */
+async function deniedByAnyMetaReadAcl(
+  c: any,
+  user: any,
+  targetPaths: string[],
+  password: string,
+): Promise<boolean> {
+  for (const p of targetPaths) {
+    if (await deniedByMetaReadAcl(c, user, p, password)) return true
+  }
+  return false
+}
+
+/**
  * 归档条目相对路径的安全化。
  *
  * 安全不变量：ZIP 条目名是**不可信输入**，只能被当作「只能向下展开的相对路径」。
@@ -292,6 +321,21 @@ const shareErrorResponse = (c: any, error?: string) => {
   )
 }
 
+/**
+ * 解析分享路径（F-091）。
+ *
+ * 安全不变量：分享口令的暴破节流（8 次/10 分钟锁定）只在调用方传入
+ * `clientKey` 时生效（`resolveShare` 用 `trustedSource` 门控失败计数，
+ * 见 internal/op/share.ts）。历史缺陷：三个 `/api/fs/*` 分享浏览端点
+ * 都漏传第 4 参，`clientKey` 恒为 undefined → 永不计数、永不锁定，
+ * 而提取码通常只有 4~6 位，匿名端点可被无限速穷举。
+ *
+ * 统一从本包装函数进入，避免后续新增调用点再次静默丢失节流。
+ */
+function resolveShareForRequest(c: any, reqPath: string, password: string) {
+  return resolveShare(reqPath, password, c.env, shareClientKey(c))
+}
+
 // GET sub-directories of a path (used by FolderTree in metas/storages editors)
 fsRouter.post("/dirs", async (c) => {
   const body = await c.req.json().catch(() => ({}))
@@ -324,8 +368,15 @@ fsRouter.post("/dirs", async (c) => {
   }
   try {
     // Share path support for completeness
-    if (reqPath.startsWith("/@s")) {
-      const shareRes = await resolveShare(reqPath, body.password || "", c.env)
+    // F-017：用 isSharePath（"/@s" 或 "/@s/" 前缀）判定；startsWith("/@s")
+    // 更宽，会把 base_path 为 "/" 的用户名下 "@staging" 这类普通路径误送进
+    // 分享解析，导致该目录/文件永远 list/get 失败。
+    if (isSharePath(reqPath)) {
+      const shareRes = await resolveShareForRequest(
+        c,
+        reqPath,
+        body.password || "",
+      )
       if (!shareRes.ok) {
         return shareErrorResponse(c, shareRes.error)
       }
@@ -429,12 +480,16 @@ fsRouter.post("/list", async (c) => {
   }
   const paginateItems = <T>(items: T[]) => {
     const total = items.length
-    if (perPage <= 0) {
+    // audit-L-5：per_page 无上限时 per_page=1e9 一次返回全部条目（内存放大）。
+    // <=0 保持「不分页」语义，>1000 钳制到 1000。
+    const effectivePerPage =
+      perPage > 1000 ? 1000 : perPage > 0 ? perPage : 0
+    if (effectivePerPage <= 0) {
       return { content: items, total }
     }
     const pageNum = Math.max(1, page)
-    const start = (pageNum - 1) * perPage
-    const end = start + perPage
+    const start = (pageNum - 1) * effectivePerPage
+    const end = start + effectivePerPage
     return {
       content: items.slice(start, end),
       total,
@@ -443,8 +498,15 @@ fsRouter.post("/list", async (c) => {
 
   try {
     // Share path: /@s/{shareId}/...
-    if (reqPath.startsWith("/@s")) {
-      const shareRes = await resolveShare(reqPath, body.password || "", c.env)
+    // F-017：用 isSharePath（"/@s" 或 "/@s/" 前缀）判定；startsWith("/@s")
+    // 更宽，会把 base_path 为 "/" 的用户名下 "@staging" 这类普通路径误送进
+    // 分享解析，导致该目录/文件永远 list/get 失败。
+    if (isSharePath(reqPath)) {
+      const shareRes = await resolveShareForRequest(
+        c,
+        reqPath,
+        body.password || "",
+      )
       if (!shareRes.ok) {
         return shareErrorResponse(c, shareRes.error)
       }
@@ -733,8 +795,15 @@ fsRouter.post("/get", async (c) => {
   const reqPath = getActualPath(user, body.path || "/", { share: isShare })
   try {
     // Share path: /@s/{shareId}/...
-    if (reqPath.startsWith("/@s")) {
-      const shareRes = await resolveShare(reqPath, body.password || "", c.env)
+    // F-017：用 isSharePath（"/@s" 或 "/@s/" 前缀）判定；startsWith("/@s")
+    // 更宽，会把 base_path 为 "/" 的用户名下 "@staging" 这类普通路径误送进
+    // 分享解析，导致该目录/文件永远 list/get 失败。
+    if (isSharePath(reqPath)) {
+      const shareRes = await resolveShareForRequest(
+        c,
+        reqPath,
+        body.password || "",
+      )
       if (!shareRes.ok) {
         return shareErrorResponse(c, shareRes.error)
       }
@@ -802,7 +871,9 @@ fsRouter.post("/get", async (c) => {
           sign: item.sign || "",
           thumb: (item as any).thumb || "",
           type: item.type ?? 0,
-          raw_url: `/api/sd/${shareId}${subPath}`,
+          // F-016：subPath 是解码后的规范路径，前端把 raw_url 直接当 href/src
+          // 使用，未编码的 ? / # / % 会截断链接或让 raw.ts 的解码抛 URIError。
+          raw_url: `/api/sd/${encodeURIComponent(shareId)}${encodeDownloadPath(subPath)}`,
           readme: shareRes.share.readme || "",
           header: shareRes.share.header || "",
           provider,
@@ -1051,7 +1122,9 @@ fsRouter.post("/move", async (c) => {
   const user = await getUserFromContext(c)
   // 移动使用独立的 MOVE 权限位（此前误用 WRITE_CONTENT）。
   if (!canMove(user)) return permissionDenied(c)
-  const { src_dir, dst_dir, names } = await c.req.json().catch(() => ({}))
+  const { src_dir, dst_dir, names, password } = await c.req
+    .json()
+    .catch(() => ({}))
   if (!Array.isArray(names) || names.length === 0) {
     return c.json(
       {
@@ -1074,12 +1147,18 @@ fsRouter.post("/move", async (c) => {
   try {
     const actualSrcDir = getActualPath(user, src_dir || "/")
     const actualDstDir = getActualPath(user, dst_dir || "/")
-    const aclPaths = [
-      actualDstDir,
-      ...cleanNames.map((n) =>
-        `${actualSrcDir}/${n}`.replace(/\/{2,}/g, "/"),
-      ),
-    ]
+    // F-009：move 会先把源内容读出来再写走（等价于下载 + 删除），源路径必须
+    // 满足读 ACL（目录密码 / read_users）；请求体 password 与 /fs/list、
+    // /fs/get 的字段保持一致，缺省时受保护源一律拒绝（fail-closed）。
+    const srcPaths = cleanNames.map((n) =>
+      `${actualSrcDir}/${n}`.replace(/\/{2,}/g, "/"),
+    )
+    if (
+      await deniedByAnyMetaReadAcl(c, user, srcPaths, String(password || ""))
+    ) {
+      return permissionDenied(c)
+    }
+    const aclPaths = [actualDstDir, ...srcPaths]
     if (await deniedByMetaWriteAcl(c, user, aclPaths))
       return permissionDenied(c)
     await moveItems(actualSrcDir, actualDstDir, cleanNames, requestContext)
@@ -1093,7 +1172,9 @@ fsRouter.post("/copy", async (c) => {
   const user = await getUserFromContext(c)
   // 复制使用独立的 COPY 权限位（此前误用 WRITE_CONTENT）。
   if (!canCopy(user)) return permissionDenied(c)
-  const { src_dir, dst_dir, names } = await c.req.json().catch(() => ({}))
+  const { src_dir, dst_dir, names, password } = await c.req
+    .json()
+    .catch(() => ({}))
   if (!Array.isArray(names) || names.length === 0) {
     return c.json(
       {
@@ -1116,6 +1197,16 @@ fsRouter.post("/copy", async (c) => {
   try {
     const actualSrcDir = getActualPath(user, src_dir || "/")
     const actualDstDir = getActualPath(user, dst_dir || "/")
+    // F-009：copy 后的副本脱离 meta 覆盖即可无密码读取，因此源路径必须
+    // 与直连下载受同样的读 ACL 约束（密码 + read_users）。
+    const srcPaths = cleanNames.map((n) =>
+      `${actualSrcDir}/${n}`.replace(/\/{2,}/g, "/"),
+    )
+    if (
+      await deniedByAnyMetaReadAcl(c, user, srcPaths, String(password || ""))
+    ) {
+      return permissionDenied(c)
+    }
     const aclPaths = [
       actualDstDir,
       ...cleanNames.map((n) =>
@@ -1203,20 +1294,34 @@ fsRouter.put("/form", async (c) => {
   const reqPath = getActualPath(user, rawPath)
   if (await deniedByMetaWriteAcl(c, user, [reqPath])) return permissionDenied(c)
   const requestContext = getStorageRequestContext(c)
+  const maxUpload = getUploadSizeLimit(c, false)
+  // F-013：`c.req.formData()` 会把整个 multipart 请求体缓冲进内存，之后再判
+  // 文件大小等于没有上限（router.ts 的 jsonBodyGuard 明确跳过 multipart）。
+  // 解析前先按 Content-Length 预检（multipart 边界与分片头留 64KiB 余量），
+  // 超限直接 413，不再进入 formData()。
+  const declaredLength = parseInt(c.req.header("Content-Length") || "0", 10)
+  if (
+    Number.isFinite(declaredLength) &&
+    declaredLength > maxUpload + 64 * 1024
+  ) {
+    return tooLargeResponse(c, maxUpload)
+  }
   try {
     const form = await c.req.formData()
     const file = form.get("file")
     if (!file || typeof file === "string") {
-      return c.json({
-        code: 400,
-        message: "missing file in form data",
-        data: null,
-      })
+      return c.json(
+        {
+          code: 400,
+          message: "missing file in form data",
+          data: null,
+        },
+        400,
+      )
     }
     const buffer = Buffer.from(await (file as File).arrayBuffer())
     // multipart 的 Content-Length 只覆盖整个表单，仍需按文件实际字节复核
-    const max = getUploadSizeLimit(c, false)
-    if (buffer.length > max) return tooLargeResponse(c, max)
+    if (buffer.length > maxUpload) return tooLargeResponse(c, maxUpload)
     await putItem(reqPath, buffer, requestContext)
     return c.json({ code: 200, message: "success", data: null })
   } catch (e: any) {
@@ -1235,7 +1340,9 @@ fsRouter.post("/add_offline_download", async (c) => {
   const { path: rawPath, urls } = await c.req.json().catch(() => ({}))
   const reqPath = getActualPath(user, rawPath || "/")
   if (!urls || urls.length === 0) {
-    return c.json({ code: 400, message: "No URLs provided" })
+    // F-020：入参错误必须回 400；此前只写 body.code 而 HTTP 状态是 200，
+    // 依赖 response.ok 的客户端会把错误当成功。
+    return c.json({ code: 400, message: "No URLs provided" }, 400)
   }
 
   return c.json(
@@ -1438,8 +1545,29 @@ fsRouter.post("/regex_rename", async (c) => {
   }
   const dirPath = getActualPath(user, src_dir || "/")
   const requestContext = getStorageRequestContext(c)
+  // F-014：src_name_regex 是用户输入，直接 new RegExp 会让 `(a+)+$` 这类
+  // 灾难性回溯模式对目录里的每个文件名各跑一遍，单请求即可打满 CPU。
+  // 与 meta.hide 使用同一套 isSafeHidePattern 防护；非法正则也回 400（原本 500）。
+  if (!isSafeHidePattern(String(src_name_regex))) {
+    return c.json(
+      {
+        code: 400,
+        message: "src_name_regex is not allowed (unsafe or too complex)",
+        data: null,
+      },
+      400,
+    )
+  }
+  let srcRegex: RegExp
   try {
-    const srcRegex = new RegExp(src_name_regex)
+    srcRegex = new RegExp(src_name_regex)
+  } catch {
+    return c.json(
+      { code: 400, message: "src_name_regex is not a valid regex", data: null },
+      400,
+    )
+  }
+  try {
     const { content } = await listItems(dirPath, requestContext)
     for (const item of content) {
       if (!item.is_dir && srcRegex.test(item.name)) {
@@ -1462,12 +1590,18 @@ fsRouter.post("/regex_rename", async (c) => {
 fsRouter.post("/recursive_move", async (c) => {
   const user = await getUserFromContext(c)
   if (!canMove(user)) return permissionDenied(c)
-  const { src_dir, dst_dir, conflict_policy } = await c.req
+  const { src_dir, dst_dir, conflict_policy, password } = await c.req
     .json()
     .catch(() => ({}))
   const srcPath = getActualPath(user, src_dir || "/")
   const dstPath = getActualPath(user, dst_dir || "/")
   const policy = conflict_policy || "overwrite"
+  // F-009：递归枚举本身就是在读源目录，且逐个 move 相当于逐个下载；
+  // 源目录与每个被搬运的文件都必须满足读 ACL（密码 / read_users）。
+  const srcPassword = String(password || "")
+  if (await deniedByMetaReadAcl(c, user, srcPath, srcPassword)) {
+    return permissionDenied(c)
+  }
   const requestContext = getStorageRequestContext(c)
   try {
     // 预取目标目录现有文件名（用于 cancel/skip 冲突策略）
@@ -1499,12 +1633,11 @@ fsRouter.post("/recursive_move", async (c) => {
             if (policy === "skip") continue
           }
           if (policy !== "overwrite") existing.add(item.name)
-          if (
-            await deniedByMetaWriteAcl(c, user, [
-              dstPath,
-              `${dir}/${item.name}`.replace(/\/{2,}/g, "/"),
-            ])
-          )
+          const itemPath = `${dir}/${item.name}`.replace(/\/{2,}/g, "/")
+          if (await deniedByMetaReadAcl(c, user, itemPath, srcPassword)) {
+            return permissionDenied(c)
+          }
+          if (await deniedByMetaWriteAcl(c, user, [dstPath, itemPath]))
             return permissionDenied(c)
           await moveItems(dir, dstPath, [item.name], requestContext)
           count++
@@ -1747,7 +1880,10 @@ fsRouter.post("/multipart/init", async (c) => {
   const rawChunk = parseInt(c.req.header("X-Chunk-Size") || "0", 10)
   const md5 = c.req.header("X-File-Md5") || ""
 
-  if (!rawPath.trim() || size <= 0) {
+  // F-116：X-File-Size 为非数字时 parseInt 得 NaN，`NaN <= 0` 与 `NaN > max`
+  // 都是 false，校验全部放行，最后 new Array(NaN) 抛 RangeError 变 500，
+  // 而此前驱动侧上传会话已创建。这里显式要求有限正整数。
+  if (!rawPath.trim() || !Number.isFinite(size) || size <= 0) {
     return c.json(
       { code: 400, message: "Missing File-Path / X-File-Size header", data: null },
       400,
@@ -1777,7 +1913,11 @@ fsRouter.post("/multipart/init", async (c) => {
       return c.json({ code: 200, message: "success", data: null })
     }
 
-    const chunkSize = clampChunkSize(rawChunk)
+    // F-019：init 返回的 chunk_size 必须与 chunk 端点的单片上限一致。
+    // 此前只钳到 CHUNK_MAX(64MB)，而 chunk 端点按 MAX_UPPART（默认 16MB）
+    // 复核实际字节数——客户端按返回的 chunk_size 切片，非末片必然 413。
+    const partLimit = Math.max(1, getUploadSizeLimit(c, true))
+    const chunkSize = Math.min(clampChunkSize(rawChunk), partLimit)
     const totalChunks = Math.max(1, Math.ceil(size / chunkSize))
 
     // 断点续传：同 owner + path+size 的未完成会话直接复用（按用户隔离）
@@ -1914,6 +2054,19 @@ fsRouter.post("/multipart/complete", async (c) => {
   }
   if (session.state === "completed") {
     return c.json({ code: 200, message: "success", data: mpSnapshot(session) })
+  }
+  // F-195：缺片时通知驱动「完成」会把残缺文件标记为成功，会话随即被删除，
+  // 无法补救。服务端是唯一掌握 received 状态的一方，这里必须校验收齐
+  // （0 字节文件也至少有 1 个分片，见 init 的 total_chunks）。
+  if (session.received.size !== session.total_chunks) {
+    return c.json(
+      {
+        code: 400,
+        message: `upload incomplete: received ${session.received.size}/${session.total_chunks} chunks`,
+        data: mpSnapshot(session),
+      },
+      400,
+    )
   }
 
   const requestContext = getStorageRequestContext(c)
@@ -2193,6 +2346,56 @@ fsRouter.post("/archive/meta", async (c) => {
   }
 })
 
+/**
+ * F-015：把 zip 文件条目合成为当前层级（innerPath）的目录/文件列表。
+ * parseZip 只返回文件条目（跳过目录条目），因此必须按「相对路径是否还有更深
+ * 层级」合成目录项：根级同样输出首段目录，深层目录不能标成 is_dir:false。
+ */
+export function buildArchiveListing(
+  entries: { name: string; size: number; modified?: string }[],
+  innerPath = "",
+): {
+  name: string
+  size: number
+  is_dir: boolean
+  modified: string
+  type: number
+}[] {
+  const prefix = innerPath ? innerPath.replace(/^\/+|\/+$/g, "") + "/" : ""
+  const rows = new Map<
+    string,
+    {
+      name: string
+      size: number
+      is_dir: boolean
+      modified: string
+      type: number
+    }
+  >()
+  for (const e of entries) {
+    if (prefix && !e.name.startsWith(prefix)) continue
+    const rel = prefix ? e.name.slice(prefix.length) : e.name
+    const segments = rel.split("/").filter(Boolean)
+    if (!segments.length) continue
+    const name = segments[0]
+    const modified = e.modified || new Date().toISOString()
+    if (segments.length > 1) {
+      if (!rows.has(name))
+        rows.set(name, { name, size: 0, is_dir: true, modified, type: 1 })
+      continue
+    }
+    if (!rows.has(name))
+      rows.set(name, {
+        name,
+        size: e.size,
+        is_dir: false,
+        modified,
+        type: calcFileTypeSafe(name, false),
+      })
+  }
+  return [...rows.values()]
+}
+
 fsRouter.post("/archive/list", async (c) => {
   const user = await getUserFromContext(c)
   if (!user || user.disabled) return c.json({ code: 401, message: "Unauthorized", data: null }, 401)
@@ -2227,29 +2430,7 @@ fsRouter.post("/archive/list", async (c) => {
     }
     const bytes = await fetchArchiveBytes(c, user, path)
     const archive = parseZip(bytes)
-    const prefix = innerPath ? innerPath.replace(/^\/+|\/+$/g, "") + "/" : ""
-    const items = archive.entries
-      .filter((e) => {
-        if (!prefix) return !e.name.includes("/")
-        return e.name.startsWith(prefix) && e.name !== prefix.slice(0, -1)
-      })
-      .map((e) => {
-        const rel = prefix ? e.name.slice(prefix.length) : e.name
-        return {
-          name: rel.split("/")[0],
-          size: e.size,
-          is_dir: false,
-          modified: e.modified || new Date().toISOString(),
-          type: calcFileTypeSafe(rel.split("/")[0], false),
-        }
-      })
-    // 去重（扁平列表）
-    const seen = new Set<string>()
-    const content = items.filter((it) => {
-      if (seen.has(it.name)) return false
-      seen.add(it.name)
-      return true
-    })
+    const content = buildArchiveListing(archive.entries, innerPath)
     return c.json({
       code: 200,
       message: "success",

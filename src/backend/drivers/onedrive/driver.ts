@@ -3,7 +3,35 @@ import { sortFileItems } from "../../internal/driver/sort"
 import { onedriveHostMap, Addition } from "./meta"
 import { fileToObj } from "./types"
 
-import { refreshToken, requestApi, getFiles, getFile, getDrive } from "./util"
+import {
+  refreshTokenOnce,
+  requestApi,
+  getFiles,
+  getFile,
+  getDrive,
+  getDirectUploadInfo,
+  buildUrl,
+  chunkSizeBytes,
+} from "./util"
+
+/**
+ * F-314：addition 里的布尔字段可能是字符串（parseAddition 只做 JSON.parse）。
+ * 构造函数若用 `!!` 强转，`"false"` / `"0"` 会变成 true，且 init() 里专为
+ * 字符串准备的归一化分支永远不可达。这里在入口处就按字符串语义归一化。
+ */
+export function toBool(
+  value: unknown,
+  fallback: boolean,
+): boolean {
+  if (typeof value === "boolean") return value
+  if (typeof value === "number") return value !== 0
+  if (typeof value === "string") {
+    const v = value.trim().toLowerCase()
+    if (v === "true" || v === "1") return true
+    if (v === "false" || v === "0" || v === "") return false
+  }
+  return fallback
+}
 
 export class Onedrive implements StorageDriver {
   // Properties mapped from Addition
@@ -36,9 +64,9 @@ export class Onedrive implements StorageDriver {
         this.root_folder_path = String(addition.root_folder_path)
       if (addition.region !== undefined) this.region = String(addition.region)
       if (addition.is_sharepoint !== undefined)
-        this.is_sharepoint = !!addition.is_sharepoint
+        this.is_sharepoint = toBool(addition.is_sharepoint, false)
       if (addition.use_online_api !== undefined)
-        this.use_online_api = !!addition.use_online_api
+        this.use_online_api = toBool(addition.use_online_api, true)
       if (addition.api_url_address !== undefined)
         this.api_url_address = String(addition.api_url_address)
       if (addition.client_id !== undefined)
@@ -56,9 +84,9 @@ export class Onedrive implements StorageDriver {
       if (addition.custom_host !== undefined)
         this.custom_host = String(addition.custom_host)
       if (addition.disable_disk_usage !== undefined)
-        this.disable_disk_usage = !!addition.disable_disk_usage
+        this.disable_disk_usage = toBool(addition.disable_disk_usage, false)
       if (addition.enable_direct_upload !== undefined)
-        this.enable_direct_upload = !!addition.enable_direct_upload
+        this.enable_direct_upload = toBool(addition.enable_direct_upload, false)
       if (addition.order_by !== undefined)
         this.order_by = String(addition.order_by)
       if (addition.order_direction !== undefined)
@@ -93,7 +121,7 @@ export class Onedrive implements StorageDriver {
       this.chunk_size = 5
     }
     if (this.refresh_token) {
-      await refreshToken(this)
+      await refreshTokenOnce(this)
     }
   }
 
@@ -109,38 +137,10 @@ export class Onedrive implements StorageDriver {
     const apiBase = this.is_sharepoint
       ? `${hostMap.api}/v1.0/sites/${this.site_id}`
       : `${hostMap.api}/v1.0/me`
-
-    const normalized = reqPath.replace(/\\/g, "/")
-    if (!normalized || normalized === "/") {
-      if (suffix) {
-        return `${apiBase}/drive/root/${suffix}`
-      }
-      return `${apiBase}/drive/root`
-    }
-    let trimmed = normalized.startsWith("/") ? normalized.slice(1) : normalized
-    if (trimmed.endsWith("/")) {
-      trimmed = trimmed.slice(0, -1)
-    }
-    if (!trimmed || trimmed === "") {
-      if (suffix) {
-        return `${apiBase}/drive/root/${suffix}`
-      }
-      return `${apiBase}/drive/root`
-    }
-    const encoded = trimmed
-      .split("/")
-      .map((p) => {
-        try {
-          return encodeURIComponent(decodeURIComponent(p))
-        } catch {
-          return encodeURIComponent(p)
-        }
-      })
-      .join("/")
-    if (suffix) {
-      return `${apiBase}/drive/root:/${encoded}:/${suffix}`
-    }
-    return `${apiBase}/drive/root:/${encoded}:`
+    // F-312：段已是 resolvePath 解码后的字面文件名，不能再 decodeURIComponent
+    // （会把畸形转义路径中的 `b%20c` 解码成 `b c` 指向另一个对象），
+    // 直接复用 list/get 使用的 buildUrl 保持完全一致。
+    return buildUrl(apiBase, reqPath, suffix)
   }
 
   async list(virtualPath: string, physicalPath: string): Promise<FileItem[]> {
@@ -282,6 +282,47 @@ export class Onedrive implements StorageDriver {
     await requestApi(this, url, "POST", data)
   }
 
+  /**
+   * 上传单个分块并校验响应。Graph 要求按序上传：只有上一块被接受后才能前进，
+   * 因此任何失败都必须抛出，否则会话永远不会提交，而 put() 会以“成功”返回。
+   * 5xx / 429 / 408 按官方建议做有限次退避重试；404（会话过期）、416 等直接失败。
+   */
+  private async uploadChunk(
+    uploadUrl: string,
+    chunk: Buffer,
+    start: number,
+    total: number,
+  ): Promise<void> {
+    const byteSize = chunk.length
+    const maxAttempts = 3
+    let lastError: Error | null = null
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const res = await fetch(uploadUrl, {
+        method: "PUT",
+        headers: {
+          "Content-Length": String(byteSize),
+          "Content-Range": `bytes ${start}-${start + byteSize - 1}/${total}`,
+        },
+        body: chunk as any,
+      })
+      if (res.status === 200 || res.status === 201 || res.status === 202) return
+      let detail = ""
+      try {
+        detail = await res.text()
+      } catch {}
+      lastError = new Error(
+        `[OneDrive] chunk upload failed: HTTP ${res.status}${detail ? `: ${detail.slice(0, 500)}` : ""}`,
+      )
+      const retryable =
+        res.status >= 500 || res.status === 429 || res.status === 408
+      if (!retryable || attempt === maxAttempts) break
+      await new Promise((resolve) =>
+        setTimeout(resolve, Math.min(1000 * 2 ** (attempt - 1), 8000)),
+      )
+    }
+    throw lastError || new Error("[OneDrive] chunk upload failed")
+  }
+
   async put(
     virtualPath: string,
     physicalPath: string,
@@ -298,9 +339,12 @@ export class Onedrive implements StorageDriver {
         item: { "@microsoft.graph.conflictBehavior": "rename" },
       }
       const res: any = await requestApi(this, url, "POST", metadata)
-      const uploadUrl = res.uploadUrl
+      const uploadUrl = res?.uploadUrl
+      if (!uploadUrl) {
+        throw new Error("failed to get upload URL from response")
+      }
 
-      const DEFAULT = this.chunk_size * 1024 * 1024
+      const DEFAULT = chunkSizeBytes(this.chunk_size)
       let finish = 0
       const size = content.length
 
@@ -309,16 +353,30 @@ export class Onedrive implements StorageDriver {
         const byteSize = Math.min(left, DEFAULT)
         const chunk = content.slice(finish, finish + byteSize)
 
-        await fetch(uploadUrl, {
-          method: "PUT",
-          headers: {
-            "Content-Length": String(byteSize),
-            "Content-Range": `bytes ${finish}-${finish + byteSize - 1}/${size}`,
-          },
-          body: chunk,
-        })
+        await this.uploadChunk(uploadUrl, chunk, finish, size)
         finish += byteSize
       }
     }
+  }
+
+  /**
+   * F-317：enable_direct_upload 之前只被解析/归一化却没有任何消费方，
+   * /fs/get_direct_upload_info 对 OneDrive 永远返回 data:null。这里补上
+   * 直传凭证签发（与 onedrive_app 对齐），让该配置真正生效。
+   */
+  async getDirectUploadInfo(
+    dstDir: string,
+    fileName?: string,
+  ): Promise<{ UploadURL: string; ChunkSize: number; Method: string }> {
+    if (!this.enable_direct_upload) {
+      throw new Error("Direct upload is not enabled")
+    }
+    const parts = String(dstDir || "")
+      .split("/")
+      .filter(Boolean)
+    const name = fileName || parts.pop() || ""
+    const parent = parts.join("/")
+    const target = parent ? `/${parent}/${name}` : `/${name}`
+    return getDirectUploadInfo(this, target)
   }
 }

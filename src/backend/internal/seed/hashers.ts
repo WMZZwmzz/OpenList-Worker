@@ -12,7 +12,14 @@
 export interface IHasher {
   init(): IHasher
   update(data: Uint8Array): IHasher
-  digest(outputType?: "hex" | "binary"): string | Uint8Array
+  /**
+   * 计算摘要。签名与 hash-wasm 的 IHasher 同形（重载）：
+   * `digest("hex")` 返回十六进制字符串，`digest("binary")` 返回 Uint8Array。
+   * 这样调用方（hash.ts / codec.ts）从 hash-wasm 切到本实现时无需改调用
+   * 形态，也不需要类型断言。
+   */
+  digest(outputType: "binary"): Uint8Array
+  digest(outputType?: "hex"): string
 }
 
 function rol(x: number, n: number): number {
@@ -192,6 +199,8 @@ class MD5Hasher implements IHasher {
     return out
   }
 
+  digest(outputType: "binary"): Uint8Array
+  digest(outputType?: "hex"): string
   digest(outputType: "hex" | "binary" = "hex"): string | Uint8Array {
     const bytes = this.digestBytes()
     return outputType === "binary" ? bytes : bytesToHex(bytes)
@@ -305,6 +314,8 @@ class SHA1Hasher implements IHasher {
     return out
   }
 
+  digest(outputType: "binary"): Uint8Array
+  digest(outputType?: "hex"): string
   digest(outputType: "hex" | "binary" = "hex"): string | Uint8Array {
     const bytes = this.digestBytes()
     return outputType === "binary" ? bytes : bytesToHex(bytes)
@@ -431,6 +442,8 @@ class SHA256Hasher implements IHasher {
     return out
   }
 
+  digest(outputType: "binary"): Uint8Array
+  digest(outputType?: "hex"): string
   digest(outputType: "hex" | "binary" = "hex"): string | Uint8Array {
     const bytes = this.digestBytes()
     return outputType === "binary" ? bytes : bytesToHex(bytes)

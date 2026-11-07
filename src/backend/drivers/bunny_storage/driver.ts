@@ -47,10 +47,40 @@ export class BunnyStorageDriver implements StorageDriver {
   }
 
   async init(): Promise<void> {
-    normalizeBaseURL(this.addition.endpoint, bunnyDefaultEndpoint)
+    // F-404：必须把归一化结果写回，否则「只填域名」的 cdn_base_url 会通过
+    // 校验却在每次 get() 里 new URL("myzone.b-cdn.net") 抛 Invalid URL。
+    this.addition.endpoint = normalizeBaseURL(
+      this.addition.endpoint,
+      bunnyDefaultEndpoint,
+    )
     if (this.addition.cdn_base_url) {
-      normalizeBaseURL(this.addition.cdn_base_url, "")
+      this.addition.cdn_base_url = normalizeBaseURL(
+        this.addition.cdn_base_url,
+        "",
+      )
     }
+  }
+
+  /**
+   * 由虚拟路径与物理路径推导存储的挂载路径（F-409）。
+   *
+   * 驱动接口拿不到 storage.mount_path，但 get() 同时收到含挂载前缀的
+   * virtualPath 和不含前缀的 physicalPath，两者相减即挂载路径。推导不出时
+   * 返回空串（不剥离任何前缀，保持原有行为）。
+   */
+  private mountPathFor(virtualPath: string, physicalPath: string): string {
+    const v =
+      "/" + String(virtualPath || "").split("/").filter(Boolean).join("/")
+    const clean = cleanObjectPath(physicalPath)
+    const root = cleanObjectPath(this.addition.root_folder_path || "/")
+    let rel = clean
+    if (root !== "/") {
+      if (clean === root) rel = "/"
+      else if (clean.startsWith(root + "/")) rel = clean.slice(root.length)
+    }
+    if (rel === "/") return v
+    if (v.endsWith(rel)) return v.slice(0, v.length - rel.length) || "/"
+    return ""
   }
 
   private toFileItem(parentPath: string, item: BunnyObject): FileItem {
@@ -92,7 +122,11 @@ export class BunnyStorageDriver implements StorageDriver {
     return sortFileItems(result, "name", "asc")
   }
 
-  async get(virtualPath: string, physicalPath: string): Promise<FileItem> {
+  async get(
+    virtualPath: string,
+    physicalPath: string,
+    clientIP = "",
+  ): Promise<FileItem> {
     const clean = cleanObjectPath(physicalPath)
     const name = clean.split("/").filter(Boolean).pop() || "root"
     if (clean === "/") {
@@ -120,9 +154,16 @@ export class BunnyStorageDriver implements StorageDriver {
     let rawHeaders: Record<string, string> = {}
     if (!found.IsDirectory) {
       if (this.addition.cdn_base_url) {
-        rawUrl = cdnURL(this.addition, clean)
+        // F-409：cdn_base_url 自带的挂载前缀先剥离，再拼对象路径
+        rawUrl = cdnURL(
+          this.addition,
+          clean,
+          this.mountPathFor(virtualPath, physicalPath),
+        )
         if (this.addition.cdn_token_key) {
-          rawUrl = await signCDNURL(this.addition, rawUrl)
+          // F-405：cdn_token_include_ip 开启时把客户端 IP 拼进签名串；
+          // clientIP 由调用方（raw.ts / op 层）透传，缺省时退回旧行为。
+          rawUrl = await signCDNURL(this.addition, rawUrl, clientIP)
         }
       } else {
         rawUrl = storageURL(this.addition, clean, false)
@@ -189,12 +230,29 @@ export class BunnyStorageDriver implements StorageDriver {
     names: string[],
   ): Promise<void> {
     const clean = cleanObjectPath(physicalPath)
-    // Determine if it is a directory by probing with a trailing slash
-    const res = await fetch(storageURL(this.addition, clean, true), {
+    // Bunny 以尾斜杠区分目录语义（目录删除会递归清空内容），文件删除绝不能带尾斜杠。
+    // 驱动接口拿不到 is_dir，先按「目录列表」探测：返回 JSON 数组即为目录。
+    const isDir = await this.probeDirectory(clean)
+    const res = await fetch(storageURL(this.addition, clean, isDir), {
       method: "DELETE",
       headers: { AccessKey: this.addition.access_key },
     })
     await handleBunnyError(res)
+  }
+
+  /** 用带尾斜杠的目录列表请求探测路径是否为目录 */
+  private async probeDirectory(clean: string): Promise<boolean> {
+    if (clean === "/") return true
+    try {
+      const res = await fetch(storageURL(this.addition, clean, true), {
+        headers: { AccessKey: this.addition.access_key },
+      })
+      if (!res.ok) return false
+      const body = await res.json()
+      return Array.isArray(body)
+    } catch {
+      return false
+    }
   }
 
   async put(

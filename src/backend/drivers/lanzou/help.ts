@@ -31,21 +31,25 @@ export function mustParseTime(str: string): string {
 
   const match = trimmed.match(timeSplitReg)
   if (match) {
-    const val = parseFloat(match[1]) || 0
     const unit = match[2]
+    // 「半小时前」之类没有数字前缀：按 0.5 处理，而不是当成 0（F-161）
+    const parsed = parseFloat(match[1])
+    const val = Number.isFinite(parsed) ? parsed : unit.startsWith("半") ? 0.5 : 0
 
+    // 顺序敏感（F-161）：「昨天」「前天」都包含「天」，必须先于「天」判断；
+    // 「分」也必须先于「小时」，否则「半小时前」会被当成 0 小时。
     if (unit.includes("秒前")) {
       return new Date(now - val * 1000).toISOString()
-    } else if (unit.includes("分") || unit.includes("分钟前")) {
-      return new Date(now - val * 60000).toISOString()
-    } else if (unit.includes("小时前") || unit.includes("小时")) {
-      return new Date(now - val * 3600000).toISOString()
-    } else if (unit.includes("天前") || unit.includes("天")) {
-      return new Date(now - val * DAY_MS).toISOString()
     } else if (unit.includes("昨天")) {
       return new Date(now - DAY_MS).toISOString()
     } else if (unit.includes("前天")) {
       return new Date(now - DAY_MS * 2).toISOString()
+    } else if (unit.includes("分")) {
+      return new Date(now - val * 60000).toISOString()
+    } else if (unit.includes("小时")) {
+      return new Date(now - val * 3600000).toISOString()
+    } else if (unit.includes("天")) {
+      return new Date(now - val * DAY_MS).toISOString()
     }
   }
 
@@ -78,49 +82,62 @@ export function sizeStrToInt64(sizeStr: string): number {
 }
 
 /**
- * 移除 HTML 注释与单行注释
+ * 移除 JS 注释（字符串字面量感知）。
+ *
+ * F-160：旧实现逐字符扫描、没有字符串字面量意识——页面里
+ * `<iframe src="https://xxx.lanzou.com/fn?abc">` 中的 `//` 会被当成单行
+ * 注释起点，自 `https:` 起整行被删掉，后续 iframe / fn 链接提取全部失效。
+ * 这里维护单引号/双引号/反引号/转义状态，位于字符串内部时不再识别注释。
  */
-export function removeNotes(html: string): string {
-  return html.replace(/<!--[\s\S]*?-->|[^:]\/\/.*|\/\*[\s\S]*?\*\//g, (b) => {
-    if (b.slice(1, 3) === "//") {
-      return b.slice(0, 1)
-    }
-    return "\n"
-  })
-}
-
-/**
- * 移除 JS 注释
- */
-export function removeJSComment(data: string): string {
+function stripComments(data: string): string {
   let result = ""
-  let inComment = false
-  let inSingleLineComment = false
+  let inBlockComment = false
+  let inLineComment = false
+  let quote: "" | "'" | '"' | "`" = ""
 
   for (let i = 0; i < data.length; i++) {
     const v = data[i]
 
-    if (inSingleLineComment && (v === "\n" || v === "\r")) {
-      inSingleLineComment = false
+    if (inLineComment) {
+      if (v === "\n" || v === "\r") {
+        inLineComment = false
+        result += v
+      }
+      continue
+    }
+    if (inBlockComment) {
+      if (v === "*" && i + 1 < data.length && data[i + 1] === "/") {
+        inBlockComment = false
+        i++
+      }
+      continue
+    }
+    if (quote) {
       result += v
+      if (v === "\\") {
+        // 保留转义序列的下一个字符，避免 \" 被误判为字符串结束
+        if (i + 1 < data.length) {
+          result += data[i + 1]
+          i++
+        }
+        continue
+      }
+      if (v === quote) quote = ""
       continue
     }
-    if (inComment && v === "*" && i + 1 < data.length && data[i + 1] === "/") {
-      inComment = false
-      i++
-      continue
-    }
-    if (inComment || inSingleLineComment) {
+    if (v === "'" || v === '"' || v === "`") {
+      quote = v
+      result += v
       continue
     }
     if (v === "/" && i + 1 < data.length) {
       const nextChar = data[i + 1]
       if (nextChar === "*") {
-        inComment = true
+        inBlockComment = true
         i++
         continue
       } else if (nextChar === "/") {
-        inSingleLineComment = true
+        inLineComment = true
         i++
         continue
       }
@@ -129,6 +146,20 @@ export function removeJSComment(data: string): string {
   }
 
   return result
+}
+
+/**
+ * 移除 HTML 注释与 JS 注释
+ */
+export function removeNotes(html: string): string {
+  return stripComments(html.replace(/<!--[\s\S]*?-->/g, "\n"))
+}
+
+/**
+ * 移除 JS 注释（保留字符串字面量中的 `//`，见 F-160）
+ */
+export function removeJSComment(data: string): string {
+  return stripComments(data)
 }
 
 function unbox(hexStr: string): string {
@@ -157,6 +188,17 @@ function hexXor(hex1: string, hex2: string): string {
     res += xor.toString(16).padStart(2, "0")
   }
   return res
+}
+
+/**
+ * 判断响应是否为阿里云盾 acw_sc__v2 WAF 挑战页。
+ *
+ * F-163：旧实现只做 `body.includes("acw_sc__v2")` 裸子串判断，任何提到该
+ * 名字的正常响应（脚本、帮助文本）都会被当成挑战页去求解并抛错。真正的
+ * 挑战页一定带有 `arg1='<HEX>'` 参数，必须两者同时成立。
+ */
+export function isAcwScV2Challenge(html: string): boolean {
+  return html.includes("acw_sc__v2") && findAcwScV2Reg.test(html)
 }
 
 /**
@@ -274,14 +316,32 @@ function jsonToMap(data: string, html: string): Record<string, string> {
   return param
 }
 
-function formToMap(formData: string): Record<string, string> {
-  const param: Record<string, string> = {}
+/** decodeURIComponent 的安全版本：非法 % 序列原样返回而不是抛 URIError（F-162） */
+function safeDecodeURIComponent(value: string): string {
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return value
+  }
+}
+
+function formToMap(formData: string): Record<string, string> {  const param: Record<string, string> = {}
   const pairs = formData.split("&")
   for (const pair of pairs) {
-    const [k, v] = pair.split("=")
-    if (k) param[decodeURIComponent(k)] = decodeURIComponent(v || "")
+    // F-162：值本身可能含 "="（base64 padding），只能按**第一个** = 截断
+    const eq = pair.indexOf("=")
+    const rawKey = eq === -1 ? pair : pair.slice(0, eq)
+    const rawValue = eq === -1 ? "" : pair.slice(eq + 1)
+    if (!rawKey) continue
+    // F-162：非法 % 序列不能炸掉整个 get()
+    param[safeDecodeURIComponent(rawKey)] = safeDecodeURIComponent(rawValue)
   }
   return param
+}
+
+/** 仅用于单测：暴露 formToMap（F-162） */
+export function formToMapForTest(formData: string): Record<string, string> {
+  return formToMap(formData)
 }
 
 /**

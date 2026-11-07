@@ -401,8 +401,31 @@ export function entityToRow(table: DdlTableName, entity: any): {
   return { columns, values }
 }
 
-/** SQL 列类型 → 方言类型。 */
-function sqlType(col: ColumnDef, dialect: "sqlite" | "mysql"): string {
+/**
+ * MySQL 方言下「参与主键 / 唯一索引的字符串列」的类型。
+ *
+ * MySQL 不允许 TEXT/BLOB 列在**不带前缀长度**时作为 PRIMARY KEY 或 UNIQUE
+ * （ERROR 1170: BLOB/TEXT column used in key specification without a key length）。
+ * 旧实现把 string/json/date 一律映射成 TEXT 再直接追加 PRIMARY KEY / UNIQUE，
+ * 生成的 `x_setting_items(\`key\` TEXT PRIMARY KEY)`、`x_users(\`username\` TEXT
+ * NOT NULL UNIQUE)`、`x_sharing_dbs(\`id\` TEXT PRIMARY KEY)` 等在**全新 MySQL
+ * 库**上逐条失败，导致 mysql 驱动的 ensureSchema 永远抛错、所有读写不可用
+ * （只有 Go 后端已建好表的共享库因 CREATE TABLE IF NOT EXISTS 变成 no-op 才幸免）。
+ *
+ * 长度取 191 而不是 255：utf8mb4 下 191 字符 = 764 字节，低于 InnoDB 传统
+ * 767 字节索引前缀上限，兼容仍未使用 DYNAMIC/COMPRESSED 行格式的旧部署；
+ * 这也是各 MySQL 生态迁移工具对「字符串主键」的通用取值。
+ *
+ * 普通（非键）字符串列仍保留 TEXT，避免无谓收紧容量。
+ */
+const MYSQL_KEY_VARCHAR_LENGTH = 191
+
+/** SQL 列类型 → 方言类型。`keyColumn` 表示该列参与主键/唯一索引。 */
+function sqlType(
+  col: ColumnDef,
+  dialect: "sqlite" | "mysql",
+  keyColumn = false,
+): string {
   switch (col.type) {
     case "number":
       return dialect === "mysql" ? "BIGINT" : "INTEGER"
@@ -411,6 +434,11 @@ function sqlType(col: ColumnDef, dialect: "sqlite" | "mysql"): string {
     case "string":
     case "json":
     case "date":
+      // MySQL 的 TEXT 不能做键（ERROR 1170），键列必须是有长度上限的 VARCHAR。
+      // SQLite 对 TEXT 主键/唯一索引没有该限制，保持原样。
+      if (dialect === "mysql" && keyColumn) {
+        return `VARCHAR(${MYSQL_KEY_VARCHAR_LENGTH})`
+      }
       return "TEXT"
     default:
       return "TEXT"
@@ -432,7 +460,8 @@ function buildTableDdl(
 ): string {
   const parts: string[] = []
   for (const col of def.columns) {
-    let line = `${quote(col.name)} ${sqlType(col, dialect)}`
+    // 键列（主键或唯一索引）在 MySQL 下必须是有长度的 VARCHAR，见 sqlType。
+    let line = `${quote(col.name)} ${sqlType(col, dialect, Boolean(col.pk || col.unique))}`
     if (col.pk) {
       line += " PRIMARY KEY"
     } else if (!col.nullable) {
@@ -536,7 +565,16 @@ export function buildSingleFlightDdl(
     dialect === "mysql"
       ? `CREATE TABLE IF NOT EXISTS ${table} (` +
         [
-          `${quote("key")} VARCHAR(512) PRIMARY KEY`,
+          // F-082：去重键由调用方拼入**用户可控的完整虚拟路径**
+          // （internal/op/storage.ts 的 fsSingleflightKey：`fs.list:<id>:<rev>:<path>`），
+          // 深层嵌套 / 超长文件名的键会超过 512 字符。strict mode 下 INSERT IGNORE
+          // 把「Data too long」降级为截断插入，随后按完整键回读必然 miss →
+          // coordination-error → 跨实例去重静默失效（截断的 running 残留行也永不
+          // 被清理）。768 字符 = utf8mb4 下 3072 字节，是 InnoDB（DYNAMIC 行格式）
+          // 的索引上限；与上方 `kv` 表 VARCHAR(512)（2048 字节）共用同一兼容假设，
+          // 不引入新的部署要求。彻底的修复（键生成处对超长路径做确定性哈希，
+          // internal/op/storage.ts）在 store 层之外，此处只放宽容量上限。
+          `${quote("key")} VARCHAR(768) PRIMARY KEY`,
           `${quote("owner")} VARCHAR(128) NOT NULL`,
           `${quote("state")} VARCHAR(16) NOT NULL`,
           `${quote("started_at")} BIGINT NOT NULL`,

@@ -39,9 +39,26 @@ export class ClientTeambition {
     }
     const resp = await fetch(`${this.baseUrl}${pathname}${qs}`, options)
     if (resp.status === 204 || resp.status === 201) return {} as T
-    const data = await resp.json().catch(() => ({}))
+    const text = await resp.text().catch(() => "")
+    let data: any = {}
+    if (text) {
+      try {
+        data = JSON.parse(text)
+      } catch {
+        // F-449：cookie 过期时 GET 会跟随重定向到登录页（HTML），
+        // 之前的 resp.json().catch(() => ({})) 会把它当成成功返回空对象。
+        throw new Error(
+          `[Teambition] non-JSON response (HTTP ${resp.status})`,
+        )
+      }
+    }
     if ((data as TbErrResp).name || (data as TbErrResp).message) {
       throw new Error(`[Teambition] ${(data as TbErrResp).message || (data as TbErrResp).name}`)
+    }
+    // F-449：之前从不检查状态码，403/500 的错误体只要不含 name/message
+    // 就被当作成功（写操作假成功、列目录静默返回空）。
+    if (!resp.ok) {
+      throw new Error(`[Teambition] HTTP ${resp.status}`)
     }
     return data as T
   }

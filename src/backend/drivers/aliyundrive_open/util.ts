@@ -8,6 +8,15 @@ import { md5 } from "../../pkg/crypto"
 
 const ALI_OPEN_API = "https://openapi.aliyundrive.com/adrive/v1.0"
 
+/** 日志里只输出中转 API 的 host，避免打印带 refresh_token 的完整 URL */
+function safeHost(url: string): string {
+  try {
+    return new URL(url).host
+  } catch {
+    return "<invalid-url>"
+  }
+}
+
 // ============================================================
 // AliyunOpenClient - 阿里云盘 OAuth2 OpenAPI 客户端
 // 优先通过在线 API 中转（GET + query params），
@@ -19,11 +28,19 @@ export class AliyunOpenClient {
   private refreshTokenVal: string = ""
   public driveId: string = ""
   private tokenExpiresAt: number = 0
+  /** 在途刷新 Promise（F-345：同一 isolate 内并发请求只刷新一次） */
+  private refreshPromise: Promise<void> | null = null
+  /** 轮换后的 refresh_token 回写钩子（F-345：由存储层持久化） */
+  private onTokenUpdate?: (refreshToken: string) => Promise<void> | void
 
-  constructor(addition: AliyundriveOpenAddition) {
+  constructor(
+    addition: AliyundriveOpenAddition,
+    onTokenUpdate?: (refreshToken: string) => Promise<void> | void,
+  ) {
     this.addition = addition
     this.refreshTokenVal = addition.refresh_token || ""
     this.driveId = addition.drive_id || ""
+    this.onTokenUpdate = onTokenUpdate
   }
 
   public async init(): Promise<void> {
@@ -83,15 +100,38 @@ export class AliyunOpenClient {
     }
   }
 
+  /**
+   * 刷新 access_token。F-345：并发去重——同一 isolate 内同时到达的刷新请求
+   * 共享同一个在途 Promise，避免轮换型 refresh_token 被并发消费。
+   */
   public async refreshAccessToken(): Promise<void> {
+    if (!this.refreshPromise) {
+      this.refreshPromise = this.doRefreshAccessToken().finally(() => {
+        this.refreshPromise = null
+      })
+    }
+    return this.refreshPromise
+  }
+
+  private async doRefreshAccessToken(): Promise<void> {
     if (!this.refreshTokenVal || !this.refreshTokenVal.trim()) {
       return
     }
     const token = this.refreshTokenVal.trim()
 
     // 策略1: 通过在线 API 中转（GET + query params）
+    // F-342：只有在显式允许（use_online_api !== false）且未配置自建应用凭据时
+    // 才把账号 refresh_token 发给第三方中转。配置了 client_id/client_secret 的
+    // 直连模式默认不再外发；use_online_api=true 可显式恢复中转。
+    const hasDirectCredentials = !!(
+      (this.addition.client_id || "").trim() &&
+      (this.addition.client_secret || "").trim()
+    )
+    const useOnlineApi =
+      this.addition.use_online_api === true ||
+      (this.addition.use_online_api !== false && !hasDirectCredentials)
     const onlineApis: string[] = []
-    if (this.addition.api_url_address && this.addition.api_url_address.trim()) {
+    if (useOnlineApi && this.addition.api_url_address && this.addition.api_url_address.trim()) {
       const customApi = this.addition.api_url_address.trim()
       // FIX(H-2): api_url_address 是管理员可配置字段，会把用户 refresh_token
       // 发给该 URL。必须先做 SSRF 校验，否则可被配置成内网/元数据地址导致
@@ -105,14 +145,16 @@ export class AliyunOpenClient {
         )
       }
     }
-    onlineApis.push(
-      "https://api.oplist.org/alicloud/renewapi",
-      "https://api.oplist.org/ali_open/token",
-      "https://api.oplist.org/aliyundrive/token",
-      "https://api.alist.nn.ci/alist/ali_open/token",
-      "https://api.alist.nn.ci/aliyundrive/token",
-      "https://api-sam.oplist.org/aliyundrive/token",
-    )
+    if (useOnlineApi) {
+      onlineApis.push(
+        "https://api.oplist.org/alicloud/renewapi",
+        "https://api.oplist.org/ali_open/token",
+        "https://api.oplist.org/aliyundrive/token",
+        "https://api.alist.nn.ci/alist/ali_open/token",
+        "https://api.alist.nn.ci/aliyundrive/token",
+        "https://api-sam.oplist.org/aliyundrive/token",
+      )
+    }
 
     const driverTxt =
       this.addition.alipan_type === "alipanTV" ? "alicloud_tv" : "alicloud_qr"
@@ -138,18 +180,22 @@ export class AliyunOpenClient {
         const newAccess: string =
           data.access_token || data.data?.access_token || ""
         if (!newAccess) {
+          // F-352：响应体含 refresh_token，绝不能整体打进日志/错误消息
           throw new Error(
-            `Empty access_token from online API: ${JSON.stringify(data)}`,
+            `Empty access_token from online API (keys: ${Object.keys(data || {}).join(",")})`,
           )
         }
         this.accessToken = newAccess
-        if (newToken) this.refreshTokenVal = newToken
+        if (newToken) {
+          this.refreshTokenVal = newToken
+          await this.persistRefreshToken(newToken)
+        }
         this.tokenExpiresAt =
           Date.now() + (data.expires_in || 7200) * 1000 - 60000
         return // Success!
       } catch (err: any) {
         console.warn(
-          `[AliyundriveOpen] Online API '${apiUrl}' failed: ${err.message}`,
+          `[AliyundriveOpen] Online API '${safeHost(apiUrl)}' failed: ${err.message}`,
         )
       }
     }
@@ -182,10 +228,16 @@ export class AliyunOpenClient {
       }
       const data: AliyunTokenResp = await res.json()
       if (!data.access_token) {
-        throw new Error(`Invalid response: ${JSON.stringify(data)}`)
+        // F-352：响应可能含 refresh_token，只输出键名
+        throw new Error(
+          `Invalid response (keys: ${Object.keys(data || {}).join(",")})`,
+        )
       }
       this.accessToken = data.access_token
-      if (data.refresh_token) this.refreshTokenVal = data.refresh_token
+      if (data.refresh_token) {
+        this.refreshTokenVal = data.refresh_token
+        await this.persistRefreshToken(data.refresh_token)
+      }
       this.tokenExpiresAt =
         Date.now() + (data.expires_in || 7200) * 1000 - 60000
       return // Success!
@@ -199,6 +251,18 @@ export class AliyunOpenClient {
         "2) api_url_address is accessible, " +
         "3) If using direct OAuth, client_id and client_secret are correct.",
     )
+  }
+
+  /** F-345：把轮换后的 refresh_token 回写存储层（回调失败不影响本次刷新） */
+  private async persistRefreshToken(refreshToken: string): Promise<void> {
+    try {
+      await this.onTokenUpdate?.(refreshToken)
+    } catch (e: any) {
+      console.warn(
+        "[AliyundriveOpen] failed to persist refresh_token:",
+        e?.message || e,
+      )
+    }
   }
 
   private async ensureToken(): Promise<void> {
@@ -287,10 +351,14 @@ export class AliyunOpenClient {
         resp = await this.openApiRequest<any>("/openFile/list", body)
       } catch (err: any) {
         if (err.message?.includes("UserNotAllowedAccessDrive")) {
+          // F-350：跨 drive 的 file_id 不通用。只有根目录（"root" 是 drive
+          // 无关别名）才能换盘重试；非根目录重试注定失败，且会掩盖原始错误。
+          if (parentFileId !== "root") throw err
           console.warn(
             `[AliyundriveOpen] UserNotAllowedAccessDrive for drive ${this.driveId}, auto re-resolving drive_id...`,
           )
           await this.resolveDriveId(true)
+          if (!this.driveId) throw err
           body.drive_id = this.driveId
           resp = await this.openApiRequest<any>("/openFile/list", body)
         } else {
@@ -384,7 +452,14 @@ export class AliyunOpenClient {
       part_info_list: [{ part_number: 1 }],
     })
     const uploadUrl = createResp.part_info_list?.[0]?.upload_url
-    if (!uploadUrl) return
+    if (!uploadUrl) {
+      // F-343：create 已成功但没有上传地址时不能静默返回，否则调用方会
+      // 报告上传成功而内容从未写入（数据丢失）。
+      throw new Error(
+        `[AliyundriveOpen] /openFile/create returned no upload_url ` +
+          `(file_id=${createResp.file_id || "-"}, exist=${String(createResp.exist)})`,
+      )
+    }
     const putRes = await fetch(uploadUrl, {
       method: "PUT",
       body: content as any,

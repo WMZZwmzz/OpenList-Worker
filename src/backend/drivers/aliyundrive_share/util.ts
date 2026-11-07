@@ -51,7 +51,10 @@ export class AliyundriveShareApiClient {
     await this.getShareToken()
   }
 
-  async getFiles(parentId = "root"): Promise<AliyundriveShareItem[]> {
+  async getFiles(
+    parentId = "root",
+    retried = false,
+  ): Promise<AliyundriveShareItem[]> {
     if (!this.shareToken) {
       await this.getShareToken()
     }
@@ -91,8 +94,15 @@ export class AliyundriveShareApiClient {
         json.code === "ShareLinkTokenInvalid" ||
         json.code === "AccessTokenInvalid"
       ) {
+        // F-429：刷新后只重试一次；新令牌仍被拒时直接抛错，绝不无限递归。
+        if (retried) {
+          throw new Error(
+            json.message ||
+              `Aliyundrive Share token refresh did not help (${json.code})`,
+          )
+        }
         await this.getShareToken()
-        return this.getFiles(parentId)
+        return this.getFiles(parentId, true)
       }
       if (json.code) {
         throw new Error(json.message || `Aliyundrive list error (${json.code})`)
@@ -110,7 +120,7 @@ export class AliyundriveShareApiClient {
     return items
   }
 
-  async getDownloadUrl(fileId: string): Promise<string> {
+  async getDownloadUrl(fileId: string, retried = false): Promise<string> {
     if (!this.shareToken) {
       await this.getShareToken()
     }
@@ -141,8 +151,15 @@ export class AliyundriveShareApiClient {
 
     const json = (await res.json()) as any
     if (json.code === "ShareLinkTokenInvalid") {
+      // F-429：只重试一次，避免刷新成功但令牌仍被拒时的无界递归
+      if (retried) {
+        throw new Error(
+          json.message ||
+            "Aliyundrive Share download URL token refresh did not help",
+        )
+      }
       await this.getShareToken()
-      return this.getDownloadUrl(fileId)
+      return this.getDownloadUrl(fileId, true)
     }
 
     const downloadUrl = json.download_url || json.url

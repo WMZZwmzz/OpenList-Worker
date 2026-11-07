@@ -8,7 +8,7 @@ import {
   __setStoreBackendLoaderForTest,
 } from "../internal/model/db"
 import { getOrInitUsers, verifyUserPassword, hashPasswordSHA256 } from "./auth"
-import { isHex64 } from "../pkg/password"
+import { isHex64, isPbkdf2PasswordFormat } from "../pkg/password"
 import { userRouter } from "./user"
 
 const env: any = {}
@@ -122,13 +122,16 @@ test("Initialization: an empty admin password stays empty (uninitialized), not a
   )
 })
 
-test("Security(F-11): ADMIN_PASS still forces an explicit reset (to salted double-SHA256)", async () => {
+test("Security(F-11): ADMIN_PASS still forces an explicit reset (to S-03 PBKDF2 format)", async () => {
   await seed([adminUser("pbkdf2:100000:somesalt:deadbeef")])
   const envWithPass: any = { ...env, ADMIN_PASS: "operator-chosen" }
   await getOrInitUsers(envWithPass)
   const admin = await currentAdmin(envWithPass)
-  assert.ok(isHex64(admin.password), "reset must store a 64-hex SHA-256 value")
-  assert.ok(admin.salt, "reset must assign a per-user salt (Go two-step hash)")
+  assert.ok(
+    isPbkdf2PasswordFormat(admin.password),
+    "reset must store the S-03 PBKDF2 format",
+  )
+  assert.ok(admin.salt, "reset must assign a per-user salt (kept for Go export)")
   assert.equal(
     await verifyUserPassword(admin, "operator-chosen"),
     true,
@@ -169,7 +172,10 @@ test("user/create never stores an empty-password hash; generated password works 
 
   const db: any = await getDb(env)
   const created = db.users.find((u: any) => u.username === "newuser")
-  assert.ok(isHex64(created.password), "stored value must be a 64-hex hash")
+  assert.ok(
+    isPbkdf2PasswordFormat(created.password),
+    "stored value must be the S-03 PBKDF2 format",
+  )
   assert.ok(created.salt, "stored user must carry a per-user salt")
   // 空口令永远不能登录：旧实现会存下「空字符串的双层哈希」，verify('') 为 true。
   assert.equal(

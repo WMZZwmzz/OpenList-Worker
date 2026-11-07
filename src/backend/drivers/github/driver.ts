@@ -4,13 +4,15 @@ import {
   StorageDriver,
 } from "../../internal/driver/base"
 import { sortFileItems } from "../../internal/driver/sort"
-import { GithubAddition, GithubTreeObjReq, GithubTreeResp } from "./types"
+import { GithubAddition, GithubObject, GithubTreeObjReq, GithubTreeResp } from "./types"
 import {
   basename,
   cleanPath,
   dirname,
   getPathCommonAncestor,
   GithubApiClient,
+  isChildPath,
+  isNotFoundError,
   joinPath,
   renderCommitMessage,
 } from "./util"
@@ -19,6 +21,7 @@ export class GithubDriver implements StorageDriver {
   private addition: GithubAddition
   private client: GithubApiClient
   private isOnBranch: boolean = false
+  private isEmptyRepo: boolean = false
   private commitLock: Promise<void> = Promise.resolve()
 
   constructor(addition: GithubAddition) {
@@ -54,8 +57,6 @@ export class GithubDriver implements StorageDriver {
     rootTreeSha: string,
   ): Promise<void> {
     const branch = this.addition.ref!
-    const headCommitSha = await this.client.getBranchHead(branch)
-
     const committer =
       this.addition.committer_name && this.addition.committer_email
         ? {
@@ -71,6 +72,23 @@ export class GithubDriver implements StorageDriver {
             email: this.addition.author_email,
           }
         : undefined
+
+    // F-204：空仓库的首次提交没有 parent，且分支引用还不存在（PATCH 无法创建）
+    if (this.isEmptyRepo) {
+      const firstCommitSha = await this.client.createCommit(
+        message,
+        rootTreeSha,
+        null,
+        committer,
+        author,
+      )
+      await this.client.createRef(branch, firstCommitSha)
+      this.isEmptyRepo = false
+      this.isOnBranch = true
+      return
+    }
+
+    const headCommitSha = await this.client.getBranchHead(branch)
 
     const newCommitSha = await this.client.createCommit(
       message,
@@ -106,20 +124,107 @@ export class GithubDriver implements StorageDriver {
     if (!this.addition.ref || !this.addition.ref.trim()) {
       const repo = await this.client.getRepo()
       this.addition.ref = repo.default_branch
+    }
+
+    try {
+      await this.client.getBranchHead(this.addition.ref)
       this.isOnBranch = true
-    } else {
-      try {
-        await this.client.getBranchHead(this.addition.ref)
+    } catch (e) {
+      // F-205：只有 404 才可能是「ref 不是分支」；401/403/429/5xx/网络错误
+      // 必须原样抛出，否则写入口会以误导性的 "cannot write to non-branch
+      // reference" 失败，真实原因被丢弃。
+      if (!isNotFoundError(e)) throw e
+      // F-204：空仓库没有任何分支/提交，getBranchHead 必然 404。
+      // 用 /branches 是否为空区分「空仓库」与「写错 ref」。
+      const branches = await this.client.listBranches().catch(() => null)
+      if (branches && branches.length === 0) {
+        this.isEmptyRepo = true
         this.isOnBranch = true
-      } catch {
+      } else {
         this.isOnBranch = false
       }
     }
   }
 
-  async list(_virtualPath: string, physicalPath: string): Promise<FileItem[]> {
+  /** 空仓库根目录的 404 "This repository is empty"（F-204） */
+  private isEmptyRepoError(e: unknown): boolean {
+    if (!isNotFoundError(e)) return false
+    const msg = e instanceof Error ? e.message : String(e ?? "")
+    return /empty/i.test(msg)
+  }
+
+  /**
+   * 读取父目录；空仓库的根目录按空目录处理（无 base_tree，F-204）。
+   */
+  private async getParentDir(parentPath: string): Promise<GithubObject> {
+    try {
+      const parent = await this.client.getContents(
+        parentPath,
+        this.addition.ref,
+      )
+      if (!parent.entries && parent.type !== "dir") {
+        throw new Error(`${parentPath} is not a folder`)
+      }
+      return parent
+    } catch (e) {
+      if (this.isEmptyRepo && parentPath === "/" && isNotFoundError(e)) {
+        return {
+          type: "dir",
+          size: 0,
+          name: "",
+          path: "/",
+          sha: "",
+          url: "",
+          git_url: "",
+          html_url: "",
+          download_url: null,
+          entries: [],
+        }
+      }
+      throw e
+    }
+  }
+
+  /**
+   * 私有仓库没有 download_url 时的服务端流式回退（F-203）。
+   * raw.ts 在 raw_url 为空且驱动实现 createReadStream 时走这里。
+   */
+  async createReadStream(
+    physicalPath: string,
+    options?: { start?: number; end?: number },
+  ): Promise<ReadableStream<Uint8Array>> {
     const p = cleanPath(physicalPath)
     const obj = await this.client.getContents(p, this.addition.ref)
+    if (obj.type === "dir" || obj.entries) {
+      throw new Error(`${physicalPath} is not a file`)
+    }
+    const range =
+      options?.start !== undefined && options?.end !== undefined
+        ? { start: options.start, end: options.end }
+        : undefined
+    const res = await this.client.getBlobRaw(obj.sha, range)
+    if (!res.ok || !res.body) {
+      throw new Error(`GitHub blob fetch failed: HTTP ${res.status}`)
+    }
+    if (!range || res.status === 206) return res.body
+    // 上游忽略 Range（返回 200 全量）时在本地裁剪
+    return sliceStream(res.body, range)
+  }
+
+  async list(_virtualPath: string, physicalPath: string): Promise<FileItem[]> {
+    const p = cleanPath(physicalPath)
+    if (this.isEmptyRepo && p === "/") return []
+    let obj: GithubObject
+    try {
+      obj = await this.client.getContents(p, this.addition.ref)
+    } catch (e) {
+      if (p === "/" && this.isEmptyRepoError(e)) {
+        this.isEmptyRepo = true
+        this.isOnBranch = true
+        return []
+      }
+      throw e
+    }
 
     if (!obj.entries && obj.type !== "dir") {
       throw new Error(`${physicalPath} is not a folder`)
@@ -170,7 +275,25 @@ export class GithubDriver implements StorageDriver {
 
   async get(_virtualPath: string, physicalPath: string): Promise<FileItem> {
     const p = cleanPath(physicalPath)
-    const obj = await this.client.getContents(p, this.addition.ref)
+    let obj: GithubObject
+    try {
+      obj = await this.client.getContents(p, this.addition.ref)
+    } catch (e) {
+      if (p === "/" && this.isEmptyRepoError(e)) {
+        this.isEmptyRepo = true
+        this.isOnBranch = true
+        return {
+          name: "root",
+          size: 0,
+          is_dir: true,
+          modified: new Date(0).toISOString(),
+          sign: "",
+          type: 1,
+          raw_url: "",
+        }
+      }
+      throw e
+    }
 
     if (obj.type === "submodule") {
       throw new Error("cannot download a submodule")
@@ -178,16 +301,25 @@ export class GithubDriver implements StorageDriver {
 
     const isDir = obj.type === "dir" || !!obj.entries
     const name = obj.name || basename(p) || "root"
+    const rawUrl = this.formatDownloadUrl(obj.download_url)
 
-    return {
+    const item: FileItem = {
       name,
       size: obj.size || 0,
       is_dir: isDir,
       modified: new Date(0).toISOString(),
       sign: "",
       type: calcFileType(name, isDir),
-      raw_url: this.formatDownloadUrl(obj.download_url),
+      raw_url: rawUrl,
     }
+    if (!isDir && !rawUrl) {
+      // F-203：私有仓库的 contents API 返回 download_url=null。这里给出具体
+      // 原因（raw.ts 会把它拼进 404 文案），并已实现 createReadStream 回退。
+      item.raw_url_error = this.client.hasToken
+        ? "GitHub contents API 未返回 download_url（私有仓库），已回退为服务端流式下载。"
+        : "GitHub contents API 未返回 download_url（私有仓库需要配置 token）。"
+    }
+    return item
   }
 
   async mkdir(_virtualPath: string, physicalPath: string): Promise<void> {
@@ -200,13 +332,7 @@ export class GithubDriver implements StorageDriver {
     const dirName = basename(p)
 
     await this.acquireLock(async () => {
-      const parent = await this.client.getContents(
-        parentPath,
-        this.addition.ref,
-      )
-      if (!parent.entries && parent.type !== "dir") {
-        throw new Error(`${parentPath} is not a folder`)
-      }
+      const parent = await this.getParentDir(parentPath)
 
       // Create new tree with .gitkeep inside sub directory
       const subDirSha = await this.client.newTree("", [
@@ -230,7 +356,9 @@ export class GithubDriver implements StorageDriver {
       // If parent only had .gitkeep, remove .gitkeep
       if (
         parent.entries?.length === 1 &&
-        parent.entries[0].name === ".gitkeep"
+        parent.entries[0].name === ".gitkeep" &&
+        // F-207：写入对象本身是 .gitkeep 时不能同时追加删除条目
+        dirName !== ".gitkeep"
       ) {
         newTreeEntries.push({
           path: ".gitkeep",
@@ -240,14 +368,17 @@ export class GithubDriver implements StorageDriver {
         })
       }
 
-      const newSha = await this.client.newTree(parent.sha, newTreeEntries)
-      const rootSha = await this.client.renewParentTrees(
-        parentPath,
-        parent.sha,
-        newSha,
-        "/",
-        this.addition.ref,
-      )
+      const newSha = await this.client.newTree(parent.sha || null, newTreeEntries)
+      // 空仓库根目录没有可续写的父树
+      const rootSha = parent.sha
+        ? await this.client.renewParentTrees(
+            parentPath,
+            parent.sha,
+            newSha,
+            "/",
+            this.addition.ref,
+          )
+        : newSha
 
       const commitMessage = renderCommitMessage(
         this.addition.mkdir_commit_message,
@@ -280,13 +411,7 @@ export class GithubDriver implements StorageDriver {
 
     await this.acquireLock(async () => {
       const blobSha = await this.client.putBlob(content)
-      const parent = await this.client.getContents(
-        parentPath,
-        this.addition.ref,
-      )
-      if (!parent.entries && parent.type !== "dir") {
-        throw new Error(`${parentPath} is not a folder`)
-      }
+      const parent = await this.getParentDir(parentPath)
 
       const newTreeEntries: GithubTreeObjReq[] = [
         {
@@ -300,7 +425,9 @@ export class GithubDriver implements StorageDriver {
       // If parent had only .gitkeep, remove .gitkeep
       if (
         parent.entries?.length === 1 &&
-        parent.entries[0].name === ".gitkeep"
+        parent.entries[0].name === ".gitkeep" &&
+        // F-207：上传的文件本身就叫 .gitkeep 时两条同 path 条目语义相反
+        fileName !== ".gitkeep"
       ) {
         newTreeEntries.push({
           path: ".gitkeep",
@@ -310,14 +437,17 @@ export class GithubDriver implements StorageDriver {
         })
       }
 
-      const newSha = await this.client.newTree(parent.sha, newTreeEntries)
-      const rootSha = await this.client.renewParentTrees(
-        parentPath,
-        parent.sha,
-        newSha,
-        "/",
-        this.addition.ref,
-      )
+      const newSha = await this.client.newTree(parent.sha || null, newTreeEntries)
+      // 空仓库根目录没有可续写的父树
+      const rootSha = parent.sha
+        ? await this.client.renewParentTrees(
+            parentPath,
+            parent.sha,
+            newSha,
+            "/",
+            this.addition.ref,
+          )
+        : newSha
 
       const commitMessage = renderCommitMessage(
         this.addition.put_commit_message,
@@ -440,7 +570,8 @@ export class GithubDriver implements StorageDriver {
       ]
 
       // If emptying directory, add .gitkeep so folder remains valid
-      if (tree.tree.length === 1) {
+      // F-207：删除的对象本身是 .gitkeep 时不能再追加同 path 的新增条目
+      if (tree.tree.length === 1 && objName !== ".gitkeep") {
         treeEntries.push({
           path: ".gitkeep",
           mode: "100644",
@@ -488,7 +619,7 @@ export class GithubDriver implements StorageDriver {
     const srcPath = cleanPath(srcPhys)
     const dstPath = cleanPath(dstDir)
 
-    if (dstPath.startsWith(srcPath)) {
+    if (isChildPath(srcPath, dstPath)) {
       throw new Error("cannot move parent dir to child")
     }
 
@@ -497,7 +628,7 @@ export class GithubDriver implements StorageDriver {
       const srcParentPath = dirname(srcPath)
       const srcObjName = basename(srcPath)
 
-      if (dstPath.startsWith(srcParentPath)) {
+      if (dstPath === srcParentPath || isChildPath(srcParentPath, dstPath)) {
         // Case 1: moving to sibling subdirectory (e.g. /aa/1 -> /aa/bb/)
         const { dstOldSha, dstNewSha, ancestorOldSha, srcParentTree } =
           await this.copyWithoutRenewTree(srcPath, dstPath)
@@ -545,7 +676,7 @@ export class GithubDriver implements StorageDriver {
           "/",
           this.addition.ref,
         )
-      } else if (srcPath.startsWith(dstPath)) {
+      } else if (isChildPath(dstPath, srcPath)) {
         // Case 2: moving to ancestor directory (e.g. /aa/bb/1 -> /aa/)
         const { tree: srcParentTree, dirSha: srcParentOldSha } =
           await this.client.getTreeDirectly(srcParentPath, this.addition.ref)
@@ -565,7 +696,7 @@ export class GithubDriver implements StorageDriver {
             sha: null,
           },
         ]
-        if (srcParentTree.tree.length === 1) {
+        if (srcParentTree.tree.length === 1 && src.path !== ".gitkeep") {
           delSrcTree.push({
             path: ".gitkeep",
             mode: "100644",
@@ -641,7 +772,7 @@ export class GithubDriver implements StorageDriver {
             sha: null,
           },
         ]
-        if (srcParentTree.tree.length === 1) {
+        if (srcParentTree.tree.length === 1 && src.path !== ".gitkeep") {
           delSrcTree.push({
             path: ".gitkeep",
             mode: "100644",
@@ -743,7 +874,7 @@ export class GithubDriver implements StorageDriver {
     const srcPath = cleanPath(srcPhys)
     const dstPath = cleanPath(dstDir)
 
-    if (dstPath.startsWith(srcPath)) {
+    if (isChildPath(srcPath, dstPath)) {
       throw new Error("cannot copy parent dir to child")
     }
 
@@ -816,7 +947,12 @@ export class GithubDriver implements StorageDriver {
     ]
 
     // If destination only had .gitkeep, remove .gitkeep
-    if (dst.entries?.length === 1 && dst.entries[0].name === ".gitkeep") {
+    // F-207：复制对象本身是 .gitkeep 时不能同时追加删除条目
+    if (
+      dst.entries?.length === 1 &&
+      dst.entries[0].name === ".gitkeep" &&
+      src.path !== ".gitkeep"
+    ) {
       newTreeEntries.push({
         path: ".gitkeep",
         mode: "100644",
@@ -836,3 +972,46 @@ export class GithubDriver implements StorageDriver {
     }
   }
 }
+
+/** 上游忽略 Range 时按 [start, end] 裁剪流（F-203） */
+function sliceStream(
+  body: ReadableStream<Uint8Array>,
+  range: { start: number; end: number },
+): ReadableStream<Uint8Array> {
+  const reader = body.getReader()
+  let offset = 0
+  let finished = false
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (finished) return
+      try {
+        const { done, value } = await reader.read()
+        if (done) {
+          finished = true
+          controller.close()
+          return
+        }
+        const chunkStart = offset
+        offset += value.byteLength
+        if (offset > range.start) {
+          const from = Math.max(0, range.start - chunkStart)
+          const to = Math.min(value.byteLength, range.end + 1 - chunkStart)
+          if (to > from) controller.enqueue(value.subarray(from, to))
+        }
+        if (offset > range.end) {
+          finished = true
+          controller.close()
+          await reader.cancel().catch(() => {})
+        }
+      } catch (e) {
+        finished = true
+        controller.error(e)
+      }
+    },
+    cancel(reason) {
+      finished = true
+      return reader.cancel(reason)
+    },
+  })
+}
+

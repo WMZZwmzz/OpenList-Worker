@@ -1,4 +1,5 @@
 import CryptoJS from "crypto-js"
+import { randomHex } from "../rand"
 import { WebdavAddition, WebdavFile, WebdavLinkResult } from "./types"
 
 export function fixSlash(s: string): string {
@@ -32,6 +33,51 @@ export function pathEscape(p: string): string {
 }
 
 /**
+ * 释放未被消费的响应体，避免连接一直挂到 GC（Cloudflare Workers 下未消费的
+ * body 会占住子请求/连接配额）。cancel 失败不影响主流程。
+ */
+async function discardBody(resp: Response): Promise<void> {
+  try {
+    await resp.body?.cancel()
+  } catch {
+    // ignore: body 可能已被消费或已关闭
+  }
+}
+
+/**
+ * F-239：multistatus 里的文本值必须做 XML 实体解码。正则抽取的 displayname /
+ * href 原样保留 `&amp;`，会得到 `a&amp;b.txt` 这种名字，后续所有路径操作都
+ * 打到不存在的远端路径（stat/MOVE/DELETE 全 404）。
+ *
+ * 单遍回调查表，避免 `&amp;lt;` 这类输入被二次解码。
+ */
+export function decodeXmlEntities(str: string): string {
+  const named: Record<string, string> = {
+    amp: "&",
+    lt: "<",
+    gt: ">",
+    quot: '"',
+    apos: "'",
+  }
+  return str.replace(
+    /&(amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);/g,
+    (match, entity: string) => {
+      if (entity[0] !== "#") return named[entity] ?? match
+      const code =
+        entity[1] === "x" || entity[1] === "X"
+          ? parseInt(entity.slice(2), 16)
+          : parseInt(entity.slice(1), 10)
+      if (!Number.isFinite(code) || code < 0 || code > 0x10ffff) return match
+      try {
+        return String.fromCodePoint(code)
+      } catch {
+        return match
+      }
+    },
+  )
+}
+
+/**
  * Robust WebDAV XML Multistatus parser.
  * Handles diverse namespace prefixes (d:, D:, a:, xmlns="DAV:") and case variations.
  */
@@ -56,7 +102,7 @@ export function parseMultistatusXml(
         respBlock,
       )
     if (!hrefMatch) continue
-    const rawHref = hrefMatch[1].trim()
+    const rawHref = decodeXmlEntities(hrefMatch[1].trim())
     let decodedHref = rawHref
     try {
       decodedHref = decodeURIComponent(rawHref)
@@ -105,11 +151,22 @@ export function parseMultistatusXml(
       /<(?:[a-zA-Z0-9_-]+:)?displayname\b[^>]*>([\s\S]*?)<\/(?:[a-zA-Z0-9_-]+:)?displayname>/i.exec(
         propContent,
       )
-    let displayName = dnMatch ? dnMatch[1].trim() : ""
+    let displayName = dnMatch ? decodeXmlEntities(dnMatch[1]).trim() : ""
 
     // Derive name from href if displayname is missing or is pure path
     const cleanHref = decodedHref.replace(/\/+$/, "")
     const hrefBaseName = cleanHref ? cleanHref.split("/").pop() || "" : ""
+    // F-241：注释承诺「displayname 缺失或是纯路径时回退 href basename」，
+    // 原实现只做了缺失回退。有的服务器把 displayname 写成完整路径
+    //（/dav/file.txt），直接当 name 会拼出 /dav/dav/file.txt 的双重前缀。
+    if (
+      displayName &&
+      (displayName === decodedHref ||
+        displayName.replace(/\/+$/, "") === cleanHref ||
+        displayName.includes("/"))
+    ) {
+      displayName = ""
+    }
     const name = displayName || hrefBaseName
 
     // Extract content length (size)
@@ -165,12 +222,14 @@ export function parseMultistatusXml(
     const normTarget = targetPath.replace(/\/+$/, "").toLowerCase()
     const normHref = cleanHref.toLowerCase()
 
-    if (
-      !selfItem &&
-      (normHref === normTarget ||
-        normHref.endsWith(normTarget) ||
-        (normTarget === "" && normHref === ""))
-    ) {
+    // F-240：normTarget 为空（targetPath 为 "/"）时 `endsWith("")` 恒真，会把
+    // 首个 response 无条件当成目录自身吞掉。空 target 只匹配空 href。
+    const isSelf =
+      normTarget === ""
+        ? normHref === ""
+        : normHref === normTarget || normHref.endsWith(normTarget)
+
+    if (!selfItem && isSelf) {
       selfItem = file
     } else {
       items.push(file)
@@ -191,17 +250,16 @@ interface DigestParts {
   algorithm?: string
 }
 
-function parseDigestChallenge(header: string): DigestParts {
+export function parseDigestChallenge(header: string): DigestParts {
   const parts: DigestParts = {}
-  const matchParts = header.replace(/^digest\s+/i, "").split(/,\s*/)
+  // F-238：auth-param 必须按 RFC 2617 语法解析——引号内的逗号不是分隔符
+  //（realm="My Realm, Admin"），键名不区分大小写（Realm=/QOP= 同样有效）。
+  const matchParts = splitAuthParams(header.replace(/^digest\s+/i, ""))
   for (const part of matchParts) {
     const eqIdx = part.indexOf("=")
     if (eqIdx !== -1) {
-      const key = part.slice(0, eqIdx).trim()
-      const val = part
-        .slice(eqIdx + 1)
-        .trim()
-        .replace(/^"|"$/g, "")
+      const key = part.slice(0, eqIdx).trim().toLowerCase()
+      const val = unquoteAuthValue(part.slice(eqIdx + 1).trim())
       if (key === "realm") parts.realm = val
       else if (key === "nonce") parts.nonce = val
       else if (key === "qop") parts.qop = val
@@ -212,7 +270,87 @@ function parseDigestChallenge(header: string): DigestParts {
   return parts
 }
 
-function computeDigestAuth(
+/** 按逗号切分，但跳过双引号内的逗号（支持反斜杠转义） */
+function splitAuthParams(input: string): string[] {
+  const out: string[] = []
+  let current = ""
+  let inQuotes = false
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i]
+    if (ch === "\\" && inQuotes && i + 1 < input.length) {
+      current += ch + input[i + 1]
+      i++
+      continue
+    }
+    if (ch === '"') {
+      inQuotes = !inQuotes
+      current += ch
+      continue
+    }
+    if (ch === "," && !inQuotes) {
+      out.push(current)
+      current = ""
+      continue
+    }
+    current += ch
+  }
+  out.push(current)
+  return out
+}
+
+function unquoteAuthValue(value: string): string {
+  if (value.startsWith('"') && value.endsWith('"') && value.length >= 2) {
+    return value.slice(1, -1).replace(/\\(.)/g, "$1")
+  }
+  return value
+}
+
+/**
+ * F-237：RFC 7616 的 SHA-256 / SHA-512（及其 -sess 变体）必须真正参与计算。
+ * 原实现只处理 MD5 系列，其它算法把 ha1 留空后仍用 MD5 计算 response，
+ * 对只提供 SHA-256 Digest 的服务器必然 401（存储整体不可用）。
+ */
+function resolveDigestHash(algorithm: string): {
+  hash: (input: string) => string
+  sess: boolean
+} {
+  const alg = algorithm.toUpperCase()
+  const sess = alg.endsWith("-SESS")
+  const base = sess ? alg.slice(0, -"-SESS".length) : alg
+  switch (base) {
+    case "MD5":
+      return { hash: (v) => CryptoJS.MD5(v).toString(), sess }
+    case "SHA-256":
+      return { hash: (v) => CryptoJS.SHA256(v).toString(), sess }
+    case "SHA-512":
+      return { hash: (v) => CryptoJS.SHA512(v).toString(), sess }
+    default:
+      // 不支持的算法必须响亮失败，不能再用空 ha1 发一次注定 401 的请求。
+      throw new Error(
+        `[WebDAV] Unsupported Digest algorithm "${algorithm}"; ` +
+          `use Basic auth or a server offering MD5 / SHA-256 / SHA-512 Digest`,
+      )
+  }
+}
+
+/**
+ * F-238：qop 是服务端提供的可选项列表，客户端应选一个自己实现的值。
+ * 只实现了 `auth`（没有 body 可算 auth-int），列表里没有 auth 就明确报错，
+ * 而不是声明 qop=auth-int 却发一个空 ha2。
+ */
+function selectDigestQop(raw?: string): "" | "auth" {
+  const options = (raw || "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean)
+  if (!options.length) return ""
+  if (options.includes("auth")) return "auth"
+  throw new Error(
+    `[WebDAV] Unsupported Digest qop "${raw}" (only "auth" is implemented)`,
+  )
+}
+
+export function computeDigestAuth(
   parts: DigestParts,
   username: string,
   password: string,
@@ -221,33 +359,25 @@ function computeDigestAuth(
   nc: number = 1,
 ): string {
   const ncStr = nc.toString(16).padStart(8, "0")
-  const cnonce = Math.random().toString(36).substring(2, 18)
+  // S-04：Digest 认证的 cnonce 必须用 CSPRNG（原 Math.random）。
+  const cnonce = randomHex(16)
   const realm = parts.realm || ""
   const nonce = parts.nonce || ""
   const algorithm = (parts.algorithm || "MD5").toUpperCase()
-  const qop = parts.qop || ""
+  const qop = selectDigestQop(parts.qop)
+  const { hash, sess } = resolveDigestHash(algorithm)
 
-  let ha1 = ""
-  if (algorithm === "MD5" || algorithm === "") {
-    ha1 = CryptoJS.MD5(`${username}:${realm}:${password}`).toString()
-  } else if (algorithm === "MD5-SESS") {
-    const inner = CryptoJS.MD5(`${username}:${realm}:${password}`).toString()
-    ha1 = CryptoJS.MD5(`${inner}:${nonce}:${cnonce}`).toString()
+  let ha1 = hash(`${username}:${realm}:${password}`)
+  if (sess) {
+    ha1 = hash(`${ha1}:${nonce}:${cnonce}`)
   }
 
-  let ha2 = ""
-  if (qop === "auth" || qop === "") {
-    ha2 = CryptoJS.MD5(`${method}:${uri}`).toString()
-  }
+  // ha2 对 qop=auth 与 RFC 2069（无 qop）都是 H(method:uri)
+  const ha2 = hash(`${method}:${uri}`)
 
-  let response = ""
-  if (!qop) {
-    response = CryptoJS.MD5(`${ha1}:${nonce}:${ha2}`).toString()
-  } else {
-    response = CryptoJS.MD5(
-      `${ha1}:${nonce}:${ncStr}:${cnonce}:${qop}:${ha2}`,
-    ).toString()
-  }
+  const response = qop
+    ? hash(`${ha1}:${nonce}:${ncStr}:${cnonce}:${qop}:${ha2}`)
+    : hash(`${ha1}:${nonce}:${ha2}`)
 
   let authHeader = `Digest username="${username}", realm="${realm}", nonce="${nonce}", uri="${uri}", response="${response}"`
   if (algorithm) {
@@ -391,7 +521,10 @@ xmlns:u="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-util
     }
   }
 
-  if (!rtFa && !fedAuth) {
+  // F-242：重定向补取分支要求两个 cookie 齐全（`!rtFa || !fedAuth`），
+  // 最终检查也必须同样苛刻——只拿到一个就返回 `rtFa=; FedAuth=xxx` 这种
+  // 半套凭据，SharePoint 会一直 401 且没有重试路径，存储持续不可用。
+  if (!rtFa || !fedAuth) {
     throw new Error(
       "SharePoint auth failed: rtFa / FedAuth cookies not returned",
     )
@@ -433,6 +566,24 @@ export class WebdavClient {
     const cleanPath = remotePath.replace(/^\/+/, "")
     if (!cleanPath) return this.address
     return `${this.address}/${pathEscape(cleanPath)}`
+  }
+
+  /**
+   * self 判定用的路径必须包含服务器看到的完整 URL 路径（含 address 的
+   * base path）。之前传的是虚拟 remotePath，根目录时它是 "/"，归一为空串后
+   * `endsWith("")` 恒真，会把首个 response 当成目录自身吞掉（F-240）。
+   */
+  private selfTargetPath(remotePath: string): string {
+    try {
+      const url = new URL(this.buildUrl(remotePath))
+      try {
+        return decodeURIComponent(url.pathname)
+      } catch {
+        return url.pathname
+      }
+    } catch {
+      return remotePath
+    }
   }
 
   private getAuthHeaders(method: string, uri: string): Record<string, string> {
@@ -548,7 +699,7 @@ export class WebdavClient {
     }
 
     const xml = await resp.text()
-    const { items } = parseMultistatusXml(xml, remotePath)
+    const { items } = parseMultistatusXml(xml, this.selfTargetPath(remotePath))
     return items
   }
 
@@ -589,7 +740,10 @@ export class WebdavClient {
     }
 
     const xml = await resp.text()
-    const { self, items } = parseMultistatusXml(xml, remotePath)
+    const { self, items } = parseMultistatusXml(
+      xml,
+      this.selfTargetPath(remotePath),
+    )
     const result = self || items[0]
     if (!result) {
       throw new Error(`Object not found in PROPFIND response: ${remotePath}`)
@@ -641,24 +795,7 @@ export class WebdavClient {
     newPath: string,
     overwrite: boolean = true,
   ): Promise<void> {
-    const destUrl = this.buildUrl(newPath)
-    const resp = await this.request("MOVE", oldPath, {
-      headers: {
-        Destination: destUrl,
-        Overwrite: overwrite ? "T" : "F",
-      },
-    })
-    if (resp.status === 201 || resp.status === 204) {
-      return
-    }
-    if (resp.status === 409) {
-      const parentDir = newPath.substring(0, newPath.lastIndexOf("/"))
-      if (parentDir) {
-        await this.mkdirAll(parentDir)
-        return this.move(oldPath, newPath, overwrite)
-      }
-    }
-    throw new Error(`WebDAV MOVE failed with status ${resp.status}`)
+    await this.transferWithParentRetry("MOVE", oldPath, newPath, overwrite)
   }
 
   /**
@@ -669,24 +806,51 @@ export class WebdavClient {
     newPath: string,
     overwrite: boolean = true,
   ): Promise<void> {
-    const destUrl = this.buildUrl(newPath)
-    const resp = await this.request("COPY", oldPath, {
-      headers: {
-        Destination: destUrl,
-        Overwrite: overwrite ? "T" : "F",
-      },
-    })
-    if (resp.status === 201 || resp.status === 204) {
-      return
-    }
-    if (resp.status === 409) {
-      const parentDir = newPath.substring(0, newPath.lastIndexOf("/"))
-      if (parentDir) {
-        await this.mkdirAll(parentDir)
-        return this.copy(oldPath, newPath, overwrite)
+    await this.transferWithParentRetry("COPY", oldPath, newPath, overwrite)
+  }
+
+  /**
+   * MOVE/COPY 共用的「父目录缺失（409）→ mkdirAll → 重试一次」流程。
+   *
+   * F-236：原实现是 409 时 `return this.move(...)` 的无界递归——服务器持续
+   * 返回 409（目标进自身子树、源被锁等）而 MKCOL 正常时，每轮 2 个请求无限
+   * 循环，直接打爆 Workers 的子请求配额 / 挂死 Node 请求。这里改成显式计数：
+   * 只补建一次父目录，第二次仍是 409 就抛错，与同文件 put() 的有界重试一致。
+   */
+  private async transferWithParentRetry(
+    method: "MOVE" | "COPY",
+    oldPath: string,
+    newPath: string,
+    overwrite: boolean,
+  ): Promise<void> {
+    const maxAttempts = 2
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const destUrl = this.buildUrl(newPath)
+      const resp = await this.request(method, oldPath, {
+        headers: {
+          Destination: destUrl,
+          Overwrite: overwrite ? "T" : "F",
+        },
+      })
+      if (resp.status === 201 || resp.status === 204) {
+        await discardBody(resp)
+        return
       }
+
+      if (resp.status === 409 && attempt < maxAttempts) {
+        const parentDir = newPath.substring(0, newPath.lastIndexOf("/"))
+        if (parentDir) {
+          await discardBody(resp)
+          await this.mkdirAll(parentDir)
+          continue
+        }
+      }
+
+      await discardBody(resp)
+      throw new Error(`WebDAV ${method} failed with status ${resp.status}`)
     }
-    throw new Error(`WebDAV COPY failed with status ${resp.status}`)
+    // maxAttempts 循环必然以 return 或 throw 结束，这里只是类型收窄。
+    throw new Error(`WebDAV ${method} failed: retry budget exhausted`)
   }
 
   /**

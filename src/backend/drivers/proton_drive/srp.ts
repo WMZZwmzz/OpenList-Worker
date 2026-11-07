@@ -1,64 +1,49 @@
-// Proton SRP-6a authentication (Secure Remote Password)
-// Ported from ProtonMail webclient / go-srp semantics.
+// Proton SRP-6a client (auth v3/v4).
 //
-// Proton uses RFC 5054 3072-bit group with a few Proton-specific twists:
-//  - g is fixed to 2
-//  - the client proof uses XOR(H(N), H(g)) as the leading hash block
-//  - authVersion >= 2 introduces the multiplier k = H(N | PAD(g))
-//  - authVersion >= 2 derives x from a bcrypt-hashed password (not raw password)
+// This is a faithful port of @protontech/crypto (src/srp/srp.ts + passwords.ts +
+// utils/modulus.ts) and ProtonMail/pm-srp. Proton made three drastic changes on
+// top of "textbook" SRP-6a, and every one of them changes the wire values:
 //
-// NOTE: This is a faithful port of the public protocol. The bcrypt salt
-// encoding is Proton-specific and should be validated end-to-end against a
-// real account before production rollout.
+//  1. Every SRP integer is serialized LITTLE-ENDIAN. `N`, `A`, `B`, `S`, `u`
+//     and the bcrypt-derived `x` are all converted with
+//     littleEndianArrayToBigInteger(arr) = uint8ArrayToBigInt(arr.reverse()).
+//  2. The hash function is not SHA-256 but `expandHash` = SHA-512(input || [0])
+//     || SHA-512(input || [1]) || ... || SHA-512(input || [3]) => 256 bytes.
+//     It is used for k, u, the bcrypt password expansion and both proofs.
+//  3. The client proof is `H(A | B | S)` (three segments, no RFC 5054 prefix)
+//     and the server also returns a proof `H(A | M | S)` that must be checked.
+//
+// The modulus is delivered by /auth/v4/info as a PGP *cleartext signed*
+// message; it must be verified against Proton's built-in SRP modulus key
+// before it is used.
 
 import bcrypt from "bcryptjs"
+import * as openpgp from "openpgp"
 
-// RFC 5054 3072-bit group prime (N). We receive it from the server in
-// /auth/info, so this fallback is only used defensively.
-const RFC5054_3072_HEX =
-  "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1" +
-  "29024E088A67CC74020BBEA63B139B22514A08798E3404DD" +
-  "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245" +
-  "E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED" +
-  "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3D" +
-  "C2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F" +
-  "83655D23DCA3AD961C62F356208552BB9ED529077096966D" +
-  "670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B" +
-  "E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9" +
-  "DE2BCBF6955817183995497CEA956AE515D2261898FA0510" +
-  "15728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64" +
-  "ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7" +
-  "ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6B" +
-  "F12FFA06D98A0864D87602733EC86A64521F2B18177B200C" +
-  "BBE117577A615D6C770988C0BAD946E208E24FA074E5AB31" +
-  "43DB5BFCE0FD108E4B82D120A93AD2CAFFFFFFFFFFFFFFFF"
+/** Proton's SRP modulus signing key (public, baked into every official client). */
+export const SRP_MODULUS_KEY = `-----BEGIN PGP PUBLIC KEY BLOCK-----
 
-const G = 2n
+xjMEXAHLgxYJKwYBBAHaRw8BAQdAFurWXXwjTemqjD7CXjXVyKf0of7n9Ctm
+L8v9enkzggHNEnByb3RvbkBzcnAubW9kdWx1c8J3BBAWCgApBQJcAcuDBgsJ
+BwgDAgkQNQWFxOlRjyYEFQgKAgMWAgECGQECGwMCHgEAAPGRAP9sauJsW12U
+MnTQUZpsbJb53d0Wv55mZIIiJL2XulpWPQD/V6NglBd96lZKBmInSXX/kXat
+Sv+y0io+LR8i2+jV+AbOOARcAcuDEgorBgEEAZdVAQUBAQdAeJHUz1c9+KfE
+kSIgcBRE3WuXC4oj5a2/U3oASExGDW4DAQgHwmEEGBYIABMFAlwBy4MJEDUF
+hcTpUY8mAhsMAAD/XQD8DxNI6E78meodQI+wLsrKLeHn32iLvUqJbVDhfWSU
+WO4BAMcm1u02t4VKw++ttECPt+HUgPUq5pqQWe5Q2cW4TMsE
+=Y4Mw
+-----END PGP PUBLIC KEY BLOCK-----`
+
+export const SRP_LEN = 2048 / 8 // 256 bytes: fixed modulus / ephemeral size
+export const SRP_BCRYPT_PREFIX = "$2y$10$"
+
+// bcrypt uses its own base64 alphabet.
+const BCRYPT_CHARS =
+  "./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 
 // ---------- byte helpers ----------
 
-function bytesToBigInt(bytes: Uint8Array): bigint {
-  let hex = "0x"
-  for (const b of bytes) hex += b.toString(16).padStart(2, "0")
-  return BigInt(hex)
-}
-
-function bigIntToBytes(value: bigint, length?: number): Uint8Array {
-  let hex = value.toString(16)
-  if (hex.length % 2 !== 0) hex = "0" + hex
-  const bytes = new Uint8Array(hex.length / 2)
-  for (let i = 0; i < bytes.length; i++) {
-    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16)
-  }
-  if (length !== undefined && bytes.length < length) {
-    const padded = new Uint8Array(length)
-    padded.set(bytes, length - bytes.length)
-    return padded
-  }
-  return bytes
-}
-
-function concatBytes(...arrays: Uint8Array[]): Uint8Array {
+export function concatBytes(...arrays: Uint8Array[]): Uint8Array {
   const total = arrays.reduce((n, a) => n + a.length, 0)
   const out = new Uint8Array(total)
   let off = 0
@@ -69,46 +54,44 @@ function concatBytes(...arrays: Uint8Array[]): Uint8Array {
   return out
 }
 
-function xorBytes(a: Uint8Array, b: Uint8Array): Uint8Array {
-  const len = Math.max(a.length, b.length)
-  const out = new Uint8Array(len)
-  for (let i = 0; i < len; i++) {
-    out[i] = (a[i] || 0) ^ (b[i] || 0)
-  }
-  return out
-}
-
-async function sha256(...parts: Uint8Array[]): Promise<Uint8Array> {
-  const data = parts.length === 1 ? parts[0] : concatBytes(...parts)
-  const digest = await crypto.subtle.digest("SHA-256", data as BufferSource)
-  return new Uint8Array(digest)
-}
-
-function fromBase64(s: string): Uint8Array {
-  const bin = atob(s)
+export function fromBase64(s: string): Uint8Array {
+  const bin = atob(s.replace(/\s+/g, ""))
   const out = new Uint8Array(bin.length)
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i)
   return out
 }
 
-function toBase64(bytes: Uint8Array): string {
+export function toBase64(bytes: Uint8Array): string {
   let bin = ""
   for (const b of bytes) bin += String.fromCharCode(b)
   return btoa(bin)
 }
 
-/** Strip a leading 0x00 byte (RFC 5054 primes are often padded). */
-function trimLeadingZero(bytes: Uint8Array): Uint8Array {
-  if (bytes.length > 1 && bytes[0] === 0) return bytes.slice(1)
-  return bytes
+/** Parse a byte array as a little-endian unsigned integer (Proton convention). */
+export function littleEndianToBigInt(bytes: Uint8Array): bigint {
+  let hex = "0x"
+  for (let i = bytes.length - 1; i >= 0; i--) {
+    hex += bytes[i].toString(16).padStart(2, "0")
+  }
+  return BigInt(hex)
 }
 
-// ---------- modular arithmetic (BigInt) ----------
+/** Serialize an unsigned integer into `length` little-endian bytes. */
+export function bigIntToLittleEndian(value: bigint, length: number): Uint8Array {
+  const out = new Uint8Array(length)
+  let v = value
+  for (let i = 0; i < length; i++) {
+    out[i] = Number(v & 0xffn)
+    v >>= 8n
+  }
+  if (v !== 0n) throw new Error("integer does not fit in output length")
+  return out
+}
 
-function modPow(base: bigint, exp: bigint, mod: bigint): bigint {
+export function modPow(base: bigint, exp: bigint, mod: bigint): bigint {
   if (mod === 1n) return 0n
   let result = 1n
-  let b = base % mod
+  let b = ((base % mod) + mod) % mod
   let e = exp
   while (e > 0n) {
     if (e & 1n) result = (result * b) % mod
@@ -118,154 +101,306 @@ function modPow(base: bigint, exp: bigint, mod: bigint): bigint {
   return result
 }
 
-// ---------- bcrypt password hashing (Proton-specific) ----------
+function mod(a: bigint, m: bigint): bigint {
+  const r = a % m
+  return r < 0n ? r + m : r
+}
 
-// bcrypt uses its own base64 alphabet (order differs from standard base64).
-const BCRYPT_CHARS =
-  "./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+async function sha512(data: Uint8Array): Promise<Uint8Array> {
+  return new Uint8Array(
+    await crypto.subtle.digest("SHA-512", data as unknown as BufferSource),
+  )
+}
 
-function bytesToBcryptBase64(bytes: Uint8Array): string {
+async function md5(data: Uint8Array): Promise<Uint8Array> {
+  // Only used by legacy auth versions (v0/v1/v2) for the bcrypt salt.
+  const { createHash } = await import("node:crypto")
+  return new Uint8Array(createHash("md5").update(Buffer.from(data)).digest())
+}
+
+/** Proton's hash: 4 x SHA-512(input || counter), 256 bytes total. */
+export async function expandHash(input: Uint8Array): Promise<Uint8Array> {
+  const parts: Uint8Array[] = []
+  for (let i = 0; i < 4; i++) {
+    parts.push(await sha512(concatBytes(input, new Uint8Array([i]))))
+  }
+  return concatBytes(...parts)
+}
+
+/** bcrypt-base64 encoding of the first `maxBytes` bytes (Proton salt format). */
+export function bcryptEncodeBase64(bytes: Uint8Array, maxBytes = 16): string {
   let out = ""
   let bits = 0
   let acc = 0
-  for (const b of bytes) {
-    acc = (acc << 8) | b
+  const len = Math.min(maxBytes, bytes.length)
+  for (let i = 0; i < len; i++) {
+    acc = (acc << 8) | bytes[i]
     bits += 8
     while (bits >= 6) {
       bits -= 6
       out += BCRYPT_CHARS[(acc >> bits) & 0x3f]
     }
   }
-  if (bits > 0) {
-    out += BCRYPT_CHARS[(acc << (6 - bits)) & 0x3f]
-  }
+  if (bits > 0) out += BCRYPT_CHARS[(acc << (6 - bits)) & 0x3f]
   return out
 }
 
-/**
- * Derive the "hashed password" used as SRP private key input (x).
- * authVersion >= 2: Proton bcrypt-hashes the password with the auth salt
- * (cost 10) and uses the raw bcrypt digest (last 23 bytes of the bcrypt
- * output) as the hashed password.
- * authVersion < 2: the raw password is used directly.
- */
-function hashPassword(
-  authVersion: number,
+function binaryStringToBytes(s: string): Uint8Array {
+  const out = new Uint8Array(s.length)
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i) & 0xff
+  return out
+}
+
+function utf8(s: string): Uint8Array {
+  return new TextEncoder().encode(s)
+}
+
+function cleanUsername(name = ""): string {
+  return name.replace(/[.\-_]/g, "").toLowerCase()
+}
+
+// ---------- password hashing ----------
+
+async function formatHash(
   password: string,
-  salt: Uint8Array,
-): Uint8Array {
-  if (authVersion < 2) {
-    return new TextEncoder().encode(password)
-  }
-
-  // Build a bcrypt salt string ($2a$10$<22-char salt>) from the 16-byte salt.
-  const saltChars = bytesToBcryptBase64(salt).padEnd(22, ".")
-  const fullSalt = `$2a$10$${saltChars}`
-  const fullHash = bcrypt.hashSync(password, fullSalt)
-  // fullHash = $2a$10$<22 salt><31 hash>; the raw bcrypt digest is the last
-  // 31 bcrypt-base64 chars = 184 bits = 23 bytes.
-  const hashPart = fullHash.slice(fullSalt.length)
-  const hashBytes = bcryptBase64ToBytes(hashPart)
-  return hashBytes
+  bcryptSalt: string,
+  modulus: Uint8Array,
+): Promise<Uint8Array> {
+  // NOTE: the *whole* 60-character "$2y$10$..." string is hashed, not the
+  // 23-byte digest.
+  const unexpanded = bcrypt.hashSync(password, SRP_BCRYPT_PREFIX + bcryptSalt)
+  return expandHash(concatBytes(binaryStringToBytes(unexpanded), modulus))
 }
 
-function bcryptBase64ToBytes(s: string): Uint8Array {
-  const out: number[] = []
-  let acc = 0
-  let bits = 0
-  for (const ch of s) {
-    const v = BCRYPT_CHARS.indexOf(ch)
-    if (v < 0) continue
-    acc = (acc << 6) | v
-    bits += 6
-    if (bits >= 8) {
-      bits -= 8
-      out.push((acc >> bits) & 0xff)
-    }
-  }
-  return new Uint8Array(out)
+async function hashPasswordLegacy(
+  password: string,
+  username: string,
+  modulus: Uint8Array,
+): Promise<Uint8Array> {
+  const saltHex = Array.from(await md5(utf8(username.toLowerCase())))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("")
+  return formatHash(password, saltHex, modulus)
 }
 
-// ---------- public API ----------
+/**
+ * Derive the SRP "hashed password" (x) for the given auth version.
+ *
+ * - v3/v4: bcrypt(password, "$2y$10$" + b64(salt_bytes || "proton")[0:16]),
+ *          then expandHash(bcrypt_ascii || modulus).
+ * - v2:    bcrypt salt = md5(cleanUsername(username)) hex.
+ * - v1:    bcrypt salt = md5(username) hex.
+ * - v0:    password is pre-hashed with SHA-512 + base64, then v1.
+ *
+ * `salt` is the raw salt bytes (already base64-decoded) for v3+.
+ */
+export async function hashPassword(
+  version: number,
+  password: string,
+  salt: Uint8Array | string,
+  username = "",
+  modulus: Uint8Array = new Uint8Array(SRP_LEN),
+): Promise<Uint8Array> {
+  if (version >= 3) {
+    const saltBytes =
+      typeof salt === "string" ? binaryStringToBytes(salt) : salt
+    const saltBinary = concatBytes(saltBytes, utf8("proton"))
+    const bcryptSalt = bcryptEncodeBase64(saltBinary, 16)
+    return formatHash(password, bcryptSalt, modulus)
+  }
+  if (version === 2) {
+    return hashPasswordLegacy(password, cleanUsername(username), modulus)
+  }
+  if (version === 1) {
+    return hashPasswordLegacy(password, username, modulus)
+  }
+  if (version === 0) {
+    const digest = await sha512(utf8(username.toLowerCase() + password))
+    const prehashed = toBase64(digest)
+    return hashPasswordLegacy(prehashed, username, modulus)
+  }
+  throw new Error("unsupported auth version")
+}
+
+// ---------- modulus verification ----------
+
+/**
+ * Verify a PGP cleartext-signed SRP modulus and return its 256 raw bytes.
+ * Throws if the signature is not valid for `armoredPublicKey`.
+ */
+export async function verifyCleartextModulus(
+  modulusCleartext: string,
+  armoredPublicKey: string,
+): Promise<Uint8Array> {
+  // Reject smuggled content after the signature block (go-srp does the same).
+  const endMarker = "-----END PGP SIGNATURE-----"
+  const endIndex = modulusCleartext.indexOf(endMarker)
+  if (endIndex < 0) throw new Error("SRP modulus is not a signed message")
+  if (modulusCleartext.slice(endIndex + endMarker.length).trim() !== "") {
+    throw new Error("unexpected data after the SRP modulus signature")
+  }
+  const publicKey = await openpgp.readKey({ armoredKey: armoredPublicKey })
+  const cleartext = await openpgp.readCleartextMessage({
+    cleartextMessage: modulusCleartext,
+  })
+  const { signatures } = await openpgp.verify({
+    message: cleartext,
+    verificationKeys: [publicKey],
+  })
+  if (!signatures.length) throw new Error("SRP modulus is not signed")
+  for (const signature of signatures) {
+    await signature.verified // rejects when the signature is invalid
+  }
+  const text = (cleartext.getText() || "").replace(/\s+/g, "")
+  if (!text) throw new Error("SRP modulus is empty")
+  return fromBase64(text)
+}
+
+/**
+ * Verify the modulus from /auth/v4/info against Proton's built-in SRP key.
+ * This is a hard requirement of the protocol: an unverified modulus lets the
+ * server pick a group the client does not validate.
+ */
+export async function verifyAndGetModulus(modulus: string): Promise<Uint8Array> {
+  try {
+    return await verifyCleartextModulus(modulus, SRP_MODULUS_KEY)
+  } catch (e: any) {
+    throw new Error(`unable to verify SRP modulus: ${e?.message || e}`)
+  }
+}
+
+// ---------- SRP-6a ----------
 
 export interface SRPAuthInfo {
-  Modulus: string // base64
-  ServerEphemeral: string // base64
+  /** PGP cleartext-signed modulus (NOT raw base64) */
+  Modulus: string
+  ServerEphemeral: string // base64, little-endian integer
   Salt: string // base64
   Version: number
   SRPSession: string
+  Username?: string
 }
 
 export interface SRPClientProof {
   ClientEphemeral: string // base64
   ClientProof: string // base64
   SRPSession: string
+  /** H(A | M | S) — must match the server's ServerProof. */
+  ExpectedServerProof: string // base64
 }
 
+export interface SRPProofOptions {
+  /** Deterministic 256-byte client secret (tests only). */
+  clientSecret?: Uint8Array
+  /** Override the modulus bytes (tests only, skips PGP verification). */
+  modulusBytes?: Uint8Array
+}
+
+const MAX_VALUE_ITERATIONS = 1000
+
+/**
+ * Compute the client SRP-6a proofs for Proton's auth v3/v4 handshake.
+ */
 export async function computeSRPClientProof(
   username: string,
   password: string,
   info: SRPAuthInfo,
+  options: SRPProofOptions = {},
 ): Promise<SRPClientProof> {
   const version = info.Version ?? 4
+  const modulusBytes = options.modulusBytes ?? (await verifyAndGetModulus(info.Modulus))
+  if (modulusBytes.length !== SRP_LEN) {
+    throw new Error("SRP modulus has incorrect size")
+  }
 
-  // Server-provided values
-  const modulusBytes = trimLeadingZero(fromBase64(info.Modulus))
-  const N = bytesToBigInt(modulusBytes)
-  const B = bytesToBigInt(fromBase64(info.ServerEphemeral))
+  const N = littleEndianToBigInt(modulusBytes)
+  const serverEphemeralBytes = fromBase64(info.ServerEphemeral)
+  const B = littleEndianToBigInt(serverEphemeralBytes)
+  if (B === 0n) throw new Error("SRP server ephemeral is out of bounds")
+
   const saltBytes = fromBase64(info.Salt)
+  const hashedPassword = await hashPassword(
+    version,
+    password,
+    saltBytes,
+    info.Username || username,
+    modulusBytes,
+  )
+  const x = littleEndianToBigInt(hashedPassword)
 
-  // Proton throws when B is a multiple of N (invalid server ephemeral)
-  if (B % N === 0n) {
-    throw new Error("invalid server ephemeral (B % N == 0)")
+  const generator = 2n
+  const k = littleEndianToBigInt(
+    await expandHash(
+      concatBytes(bigIntToLittleEndian(generator, SRP_LEN), modulusBytes),
+    ),
+  )
+
+  // g^x mod N and k*g^x mod N
+  const gx = modPow(generator, x, N)
+  const kgx = mod(gx * mod(k, N), N)
+  const base = mod(B - kgx, N)
+
+  const prove = async (secretBytes: Uint8Array) => {
+    const a = littleEndianToBigInt(secretBytes)
+    const A = modPow(generator, a, N)
+    if (A === 0n) return null
+    const aLe = bigIntToLittleEndian(A, SRP_LEN)
+    const u = littleEndianToBigInt(
+      await expandHash(concatBytes(aLe, serverEphemeralBytes)),
+    )
+    if (u === 0n) return null
+    // S = (B - k*g^x) ^ (u*x + a) mod N, exponent reduced mod N-1
+    const S = modPow(base, mod(u * x + a, N - 1n), N)
+    const sLe = bigIntToLittleEndian(S, SRP_LEN)
+    const clientProof = await expandHash(
+      concatBytes(aLe, serverEphemeralBytes, sLe),
+    )
+    // Server must answer with H(A | M | S).
+    const expectedServerProof = await expandHash(
+      concatBytes(aLe, clientProof, sLe),
+    )
+    return {
+      clientEphemeral: aLe,
+      clientProof,
+      expectedServerProof,
+    }
   }
 
-  // Hash password (bcrypt for v>=2, raw otherwise)
-  const hashedPassword = hashPassword(version, password, saltBytes)
-  const xHash = await sha256(saltBytes, hashedPassword)
-  const x = bytesToBigInt(xHash)
-
-  // Random client secret (256-bit)
-  const clientSecretBytes = crypto.getRandomValues(new Uint8Array(32))
-  const a = bytesToBigInt(clientSecretBytes)
-
-  // A = g^a mod N
-  const A = modPow(G, a, N)
-  const ABytes = bigIntToBytes(A, modulusBytes.length)
-
-  // k = H(N | PAD(g)) for v>=2, else 0
-  let k = 0n
-  if (version >= 2) {
-    const gBytes = bigIntToBytes(G, modulusBytes.length)
-    const kHash = await sha256(modulusBytes, gBytes)
-    k = bytesToBigInt(kHash)
+  if (options.clientSecret) {
+    if (options.clientSecret.length !== SRP_LEN) {
+      throw new Error("client secret must be 256 bytes")
+    }
+    const proofs = await prove(options.clientSecret)
+    if (!proofs) throw new Error("invalid client secret")
+    return {
+      ClientEphemeral: toBase64(proofs.clientEphemeral),
+      ClientProof: toBase64(proofs.clientProof),
+      SRPSession: info.SRPSession,
+      ExpectedServerProof: toBase64(proofs.expectedServerProof),
+    }
   }
 
-  // u = H(A | B)
-  const BBytes = bigIntToBytes(B, modulusBytes.length)
-  const uHash = await sha256(ABytes, BBytes)
-  const u = bytesToBigInt(uHash)
-
-  // S = (B - k * g^x) ^ (a + u*x) mod N
-  const gx = modPow(G, x, N)
-  let base = (B - (k * gx) % N) % N
-  if (base < 0n) base += N
-  const exp = a + u * x
-  const S = modPow(base, exp, N)
-  const SBytes = bigIntToBytes(S, modulusBytes.length)
-
-  // Client proof = H( H(N) XOR H(g) | H(username) | salt | A | B | S )
-  const hN = await sha256(modulusBytes)
-  const hG = await sha256(bigIntToBytes(G))
-  const hU = await sha256(new TextEncoder().encode(username))
-  const leading = xorBytes(hN, hG)
-  const proof = await sha256(leading, hU, saltBytes, ABytes, BBytes, SBytes)
-
-  return {
-    ClientEphemeral: toBase64(ABytes),
-    ClientProof: toBase64(proof),
-    SRPSession: info.SRPSession,
+  for (let i = 0; i < MAX_VALUE_ITERATIONS; i++) {
+    const random = crypto.getRandomValues(new Uint8Array(SRP_LEN))
+    const proofs = await prove(random)
+    if (proofs) {
+      return {
+        ClientEphemeral: toBase64(proofs.clientEphemeral),
+        ClientProof: toBase64(proofs.clientProof),
+        SRPSession: info.SRPSession,
+        ExpectedServerProof: toBase64(proofs.expectedServerProof),
+      }
+    }
   }
+  throw new Error("could not find safe SRP parameters")
 }
 
-export { toBase64, fromBase64, bytesToBigInt, bigIntToBytes, modPow, hashPassword }
+/** Constant-time comparison of two base64 proof strings. */
+export function proofsEqual(a: string, b: string): boolean {
+  if (!a || !b || a.length !== b.length) return false
+  let diff = 0
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
+  return diff === 0
+}
+
+export { cleanUsername }

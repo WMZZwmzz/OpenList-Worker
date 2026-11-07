@@ -2,6 +2,7 @@ import { StorageDriver, FileItem } from "../../internal/driver/base"
 import { sortFileItems } from "../../internal/driver/sort"
 import { Addition } from "./meta"
 import { fileToObj } from "./types"
+import { chunkSizeBytes } from "../onedrive/util"
 import {
   accessToken,
   requestApi,
@@ -11,6 +12,22 @@ import {
   getMetaUrl,
   getDirectUploadInfo,
 } from "./util"
+
+/**
+ * F-355：addition 里布尔字段可能是字符串（parseAddition 只做 JSON.parse）。
+ * 构造函数用 `!!` 强转会把 "false"/"0" 变成 true，且 init() 里为字符串写的
+ * 归一化分支从此不可达。这里在入口处就按字符串语义归一化。
+ */
+function toBool(value: unknown, fallback: boolean): boolean {
+  if (typeof value === "boolean") return value
+  if (typeof value === "number") return value !== 0
+  if (typeof value === "string") {
+    const v = value.trim().toLowerCase()
+    if (v === "true" || v === "1") return true
+    if (v === "false" || v === "0" || v === "") return false
+  }
+  return fallback
+}
 
 export class OnedriveAPP implements StorageDriver {
   root_folder_path: string = "/"
@@ -49,9 +66,9 @@ export class OnedriveAPP implements StorageDriver {
       if (addition.custom_host !== undefined)
         this.custom_host = String(addition.custom_host)
       if (addition.disable_disk_usage !== undefined)
-        this.disable_disk_usage = !!addition.disable_disk_usage
+        this.disable_disk_usage = toBool(addition.disable_disk_usage, false)
       if (addition.enable_direct_upload !== undefined)
-        this.enable_direct_upload = !!addition.enable_direct_upload
+        this.enable_direct_upload = toBool(addition.enable_direct_upload, false)
       if (addition.order_by !== undefined)
         this.order_by = String(addition.order_by)
       if (addition.order_direction !== undefined)
@@ -221,6 +238,47 @@ export class OnedriveAPP implements StorageDriver {
     await requestApi(this, url, "POST", data)
   }
 
+  /**
+   * 上传单个分块并校验响应。Graph 要求按序上传：只有上一块被接受后才能前进，
+   * 因此任何失败都必须抛出，否则会话永远不会提交，而 put() 会以“成功”返回。
+   * 5xx / 429 / 408 按官方建议做有限次退避重试；404（会话过期）、416 等直接失败。
+   */
+  private async uploadChunk(
+    uploadUrl: string,
+    chunk: Buffer,
+    start: number,
+    total: number,
+  ): Promise<void> {
+    const byteSize = chunk.length
+    const maxAttempts = 3
+    let lastError: Error | null = null
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const res = await fetch(uploadUrl, {
+        method: "PUT",
+        headers: {
+          "Content-Length": String(byteSize),
+          "Content-Range": `bytes ${start}-${start + byteSize - 1}/${total}`,
+        },
+        body: chunk as any,
+      })
+      if (res.status === 200 || res.status === 201 || res.status === 202) return
+      let detail = ""
+      try {
+        detail = await res.text()
+      } catch {}
+      lastError = new Error(
+        `[OneDriveApp] chunk upload failed: HTTP ${res.status}${detail ? `: ${detail.slice(0, 500)}` : ""}`,
+      )
+      const retryable =
+        res.status >= 500 || res.status === 429 || res.status === 408
+      if (!retryable || attempt === maxAttempts) break
+      await new Promise((resolve) =>
+        setTimeout(resolve, Math.min(1000 * 2 ** (attempt - 1), 8000)),
+      )
+    }
+    throw lastError || new Error("[OneDriveApp] chunk upload failed")
+  }
+
   async put(
     virtualPath: string,
     physicalPath: string,
@@ -235,9 +293,12 @@ export class OnedriveAPP implements StorageDriver {
         item: { "@microsoft.graph.conflictBehavior": "rename" },
       }
       const res: any = await requestApi(this, url, "POST", metadata)
-      const uploadUrl = res.uploadUrl
+      const uploadUrl = res?.uploadUrl
+      if (!uploadUrl) {
+        throw new Error("failed to get upload URL from response")
+      }
 
-      const DEFAULT = this.chunk_size * 1024 * 1024
+      const DEFAULT = chunkSizeBytes(this.chunk_size)
       let finish = 0
       const size = content.length
 
@@ -246,14 +307,7 @@ export class OnedriveAPP implements StorageDriver {
         const byteSize = Math.min(left, DEFAULT)
         const chunk = content.slice(finish, finish + byteSize)
 
-        await fetch(uploadUrl, {
-          method: "PUT",
-          headers: {
-            "Content-Length": String(byteSize),
-            "Content-Range": `bytes ${finish}-${finish + byteSize - 1}/${size}`,
-          },
-          body: chunk,
-        })
+        await this.uploadChunk(uploadUrl, chunk, finish, size)
         finish += byteSize
       }
     }

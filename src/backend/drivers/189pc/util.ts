@@ -1,5 +1,7 @@
 // 189PC utility functions
-import { createHash, createHmac } from "crypto"
+// F-346：不再静态依赖 node 的 "crypto"（ESA 边缘构建会替换为抛错 shim），
+// 签名/摘要统一走 drivers/189/crypto.ts 的纯 JS 实现。
+import { hmacSha1Hex, md5Hex } from "../189/crypto"
 import { Cloud189PCAddition } from "./types"
 import {
   AppID,
@@ -52,11 +54,9 @@ export class Cloud189PCClient {
     // Sort params and create signature string
     const keys = Object.keys(params).sort()
     const signStr = keys.map((k) => `${k}=${params[k]}`).join("&")
-    
-    // HMAC-SHA1 signature
-    const hmac = createHmac("sha1", this.sessionSecret)
-    hmac.update(signStr)
-    return hmac.digest("hex").toUpperCase()
+
+    // HMAC-SHA1 signature（纯 JS，跨运行时）
+    return hmacSha1Hex(signStr, this.sessionSecret).toUpperCase()
   }
 
   async request(
@@ -161,10 +161,6 @@ export class Cloud189PCClient {
   }
 }
 
-export function calcMD5(buffer: Buffer): string {
-  return createHash("md5").update(buffer).digest("hex").toUpperCase()
-}
-
-export function calcSHA1(buffer: Buffer): string {
-  return createHash("sha1").update(buffer).digest("hex").toUpperCase()
+export function calcMD5(buffer: Buffer | Uint8Array): string {
+  return md5Hex(buffer).toUpperCase()
 }

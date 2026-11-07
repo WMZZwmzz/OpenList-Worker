@@ -25,6 +25,7 @@ import { sortFileItems } from "../../internal/driver/sort"
 import { getEnvCtx } from "../../internal/model/db"
 import { S3Driver, normalizeS3Addition } from "../s3/driver"
 import {
+  encodeKeyPath,
   getBaseName,
   getDirName,
   getKey,
@@ -115,6 +116,10 @@ export function normalizeR2Addition(a: any): R2Addition {
     norm.root_folder_path = "/" + norm.root_folder_path
   }
   norm.placeholder = (norm.placeholder || "").trim()
+  // F-191：custom_host 必须与 normalizeS3Addition 一样 trim。带首尾空格时
+  // customHostUrl 的 scheme 判定失败，整串被当成 host 拼进 URL（非法直链，
+  // 表现为 raw.ts 的 "SSRF blocked"，与真实原因无关）。
+  norm.custom_host = (norm.custom_host || "").trim()
   norm.sign_url_expire = Number(norm.sign_url_expire) || 4
   norm.order_by = norm.order_by || "name"
   norm.order_direction = norm.order_direction || "asc"
@@ -205,6 +210,11 @@ export class R2Driver implements StorageDriver {
           region: a.region || "auto",
           // R2 的 ListObjectsV2 覆盖完整（v1 亦可用，v2 更省一轮 marker）
           list_object_version: "v2",
+          // F-187：R2Addition 没有 enable_direct_upload 字段（R2 表单也不暴露），
+          // 若原样透传，S3Driver.getDirectUploadInfo 第一行就抛 "Direct upload
+          // is not enabled"。而是否能直传已由 r2CanSignDirectUpload() / api 分支
+          // 判定，这里 S3 只是执行者，必须显式打开开关。
+          enable_direct_upload: true,
           // 目录占位与 root_folder_path 语义与 S3 完全一致
         }),
         "Cloudflare R2",
@@ -320,6 +330,35 @@ export class R2Driver implements StorageDriver {
     return { objects, dirs }
   }
 
+  /**
+   * 无 delimiter 的全量列举：收集前缀下所有层级的 key（跟随 cursor 翻页）。
+   *
+   * F-185：listPrefix() 带 delimiter:"/"，只返回直接子文件，子目录落在
+   * delimitedPrefixes 里。copy/rename/move/remove 的目录分支必须用本方法，
+   * 否则嵌套子目录的内容既不复制也不删除（目标缺数据、源留孤儿、删除不彻底）。
+   */
+  private async listAllObjects(prefixKey: string): Promise<R2ObjectLike[]> {
+    const bucket = this.bucket()
+    const prefix = prefixKey ? getKey(prefixKey, true) : ""
+    const objects: R2ObjectLike[] = []
+    let cursor: string | undefined
+
+    for (;;) {
+      const page: any = await bucket.list({
+        prefix,
+        ...(cursor ? { cursor } : {}),
+      })
+      for (const obj of page?.objects || []) {
+        if (obj?.key) objects.push(obj)
+      }
+      if (!page?.truncated) break
+      if (!page?.cursor || page.cursor === cursor) break
+      cursor = page.cursor
+    }
+
+    return objects
+  }
+
   /** 该 key 下是否存在对象（判断「目录」是否存在） */
   private async probePrefix(key: string): Promise<boolean> {
     const bucket = this.bucket()
@@ -343,10 +382,12 @@ export class R2Driver implements StorageDriver {
       scheme = hostSplit[0]
       host = hostSplit[1].replace(/\/+$/, "")
     }
-    let pathPart = `/${getKey(key, false)}`
-    if (a.remove_bucket && a.bucket && pathPart.startsWith(`/${a.bucket}`)) {
-      pathPart = pathPart.substring(`/${a.bucket}`.length) || "/"
-    }
+    // F-188：binding 模式的 key 就是桶内对象名，可含 # / ? / 空格 / 裸 %，
+    // 不编码的话浏览器按 WHATWG 解析会在 fragment/query 处截断（打错对象）
+    // 或让边缘节点因非法百分号转义返回 400。逐段 RFC3986 编码，保留 "/"。
+    // F-190：remove_bucket 只对「路径含桶名前缀」的 S3 path-style 链路有意义；
+    // binding 模式路径永远以桶内 key 开头，剥第一段只会剥掉真实目录名，故不做剥离。
+    const pathPart = `/${encodeKeyPath(getKey(key, false))}`
     return `${scheme}://${host}${pathPart}`
   }
 
@@ -546,8 +587,12 @@ export class R2Driver implements StorageDriver {
     const bucket = this.bucket()
     const obj = await bucket.get(srcKey)
     if (!obj) throw new Error(`[R2] object not found: ${srcKey}`)
-    const body = await obj.arrayBuffer()
-    await bucket.put(dstKey, body, {
+    // F-189：直接流式转发 body，不再 arrayBuffer() 全量缓冲（Workers isolate
+    // 内存上限 128MB，单个 ~100MB 对象在缓冲阶段就会 OOM）。put 的值类型本身
+    // 就包含 ReadableStream；只有极老运行时没有 body 时才退回数组缓冲。
+    const value: ReadableStream | ArrayBuffer =
+      obj.body ?? (await obj.arrayBuffer())
+    await bucket.put(dstKey, value, {
       httpMetadata: { contentType: obj.httpMetadata?.contentType || undefined },
     })
   }
@@ -559,16 +604,21 @@ export class R2Driver implements StorageDriver {
     const bucket = this.bucket()
     const srcPrefix = getKey(srcKey, true)
     const dstPrefix = getKey(dstKey, true)
-    const { objects } = await this.listPrefix(srcKey)
+    // F-185：无 delimiter 列举全部层级的对象（listPrefix 只看第一层）
+    const objects = await this.listAllObjects(srcKey)
     for (const obj of objects) {
       const rel = obj.key.startsWith(srcPrefix)
         ? obj.key.substring(srcPrefix.length)
         : getBaseName(obj.key)
       if (!rel) continue
+      const dstObjectKey = dstPrefix + rel
+      if (dstObjectKey === obj.key) continue
       const fresh = await bucket.get(obj.key)
       if (!fresh) continue
-      const body = await fresh.arrayBuffer()
-      await bucket.put(dstPrefix + rel, body, {
+      // F-189：流式转发（同 copyObject），避免大对象驻留内存。
+      const value: ReadableStream | ArrayBuffer =
+        fresh.body ?? (await fresh.arrayBuffer())
+      await bucket.put(dstObjectKey, value, {
         httpMetadata: {
           contentType: fresh.httpMetadata?.contentType || undefined,
         },
@@ -598,7 +648,8 @@ export class R2Driver implements StorageDriver {
 
   private async removeDirRecursive(dirKey: string): Promise<void> {
     const bucket = this.bucket()
-    const { objects } = await this.listPrefix(dirKey)
+    // F-185：无 delimiter 列举，嵌套子目录里的对象一并删除
+    const objects = await this.listAllObjects(dirKey)
     const keys = objects.map((o) => o.key)
     // R2 delete 支持批量数组（单次上限 1000）
     for (let i = 0; i < keys.length; i += 1000) {

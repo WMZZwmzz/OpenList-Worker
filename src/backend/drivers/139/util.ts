@@ -1,4 +1,5 @@
 import CryptoJS from "crypto-js"
+import { randomAlnum } from "../rand"
 import {
   Yun139Addition,
   QueryRoutePolicyResp,
@@ -15,11 +16,15 @@ import {
 export function encodeURIComponentCustom(str: string): string {
   let r = encodeURIComponent(str)
   r = r.replace(/\+/g, "%20")
-  r = r.replace(/!/g, "%21")
-  r = r.replace(/'/g, "%27")
-  r = r.replace(/\(/g, "%28")
-  r = r.replace(/\)/g, "%29")
-  r = r.replace(/\*/g, "%2A")
+  // 与 Go 参考实现（alist drivers/139/util.go）方向一致：url.QueryEscape 之后把
+  // %21/%27/%28/%29/%2A 反替换回 !'()* 字面量。encodeURIComponent 本身就不编码
+  // 这 5 个字符，因此下面几条在标准运行时是 no-op；若某运行时对其编码则还原，
+  // 保证签名用的编码串与 Go/mcloud 服务端完全一致。
+  r = r.replace(/%21/g, "!")
+  r = r.replace(/%27/g, "'")
+  r = r.replace(/%28/g, "(")
+  r = r.replace(/%29/g, ")")
+  r = r.replace(/%2A/gi, "*")
   return r
 }
 
@@ -37,12 +42,11 @@ export function calSign(body: string, ts: string, randStr: string): string {
 }
 
 export function randomString(len: number): string {
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-  let res = ""
-  for (let i = 0; i < len; i++) {
-    res += chars.charAt(Math.floor(Math.random() * chars.length))
-  }
-  return res
+  // S-04 同类清单：randomString 参与 calSign 签名，改用 CSPRNG。
+  return randomAlnum(
+    len,
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+  )
 }
 
 export function formatTime(d: Date): string {
@@ -110,6 +114,8 @@ export class Yun139ApiClient {
   public groupHost = YUN139_DEFAULT_HOST
   public account = ""
   private onAuthorizationRefresh?: (authorization: string) => Promise<void>
+  /** 进行中的令牌刷新（singleflight），避免并发请求重复刷新 */
+  private refreshInFlight: Promise<void> | null = null
 
   constructor(
     addition: Yun139Addition,
@@ -388,33 +394,88 @@ export class Yun139ApiClient {
    * before each API request because Worker driver instances may stay cached.
    */
   private async refreshAuthorizationIfNeeded(): Promise<void> {
+    const plan = this.getRefreshPlan()
+    if (!plan) return
+
+    // 令牌只是"进入刷新窗口"，未必真的过期：任何暂时性失败都不应让存储瘫痪。
+    const stillValid = plan.expiresAt > Date.now()
+    if (!plan.userDomainId) {
+      if (stillValid) {
+        console.warn(
+          "[139] user_domain_id 未配置，无法提前刷新；继续使用仍在有效期内的令牌",
+        )
+        return
+      }
+      throw new Error(
+        "139 Cloud token is near expiry; configure user_domain_id to use the PC refreshToken API",
+      )
+    }
+
+    // 驱动实例被 driverCache 跨请求共享：并发请求会同时进入刷新窗口，
+    // 用 in-flight promise 单飞，避免重复刷新（refresh_token 轮换时后到者必败）
+    // 以及并发回调对持久化配置的读-改-写互相覆盖。
+    if (!this.refreshInFlight) {
+      this.refreshInFlight = this.performAuthorizationRefresh(plan).finally(
+        () => {
+          this.refreshInFlight = null
+        },
+      )
+    }
+    try {
+      await this.refreshInFlight
+    } catch (e) {
+      if (stillValid) {
+        console.warn(
+          "[139] token refresh failed; continuing with the still-valid token:",
+          e,
+        )
+        return
+      }
+      throw e
+    }
+  }
+
+  /** 解析当前令牌是否处于刷新窗口；返回 null 表示无需刷新 */
+  private getRefreshPlan(): {
+    auth: string
+    pieces: string[]
+    expiresAt: number
+    userDomainId: string
+  } | null {
     const auth = this.getAuthString()
     let decoded: string
     try {
       decoded = CryptoJS.enc.Base64.parse(auth).toString(CryptoJS.enc.Utf8)
     } catch {
       // Keep the previous behavior for non-standard authorization values.
-      return
+      return null
     }
 
     const pieces = decoded.split(":")
-    if (pieces.length < 3) return
+    if (pieces.length < 3) return null
 
     const token = pieces.slice(2).join(":")
     const tokenFields = token.split("|")
     const expiresAt = Number(tokenFields[3])
-    if (!Number.isFinite(expiresAt) || expiresAt <= 0) return
+    if (!Number.isFinite(expiresAt) || expiresAt <= 0) return null
 
     const refreshWindowMs = 15 * 24 * 60 * 60 * 1000
-    if (expiresAt - Date.now() > refreshWindowMs) return
+    if (expiresAt - Date.now() > refreshWindowMs) return null
 
-    const userDomainId = (this.addition.user_domain_id || "").trim()
-    if (!userDomainId) {
-      throw new Error(
-        "139 Cloud token is near expiry; configure user_domain_id to use the PC refreshToken API",
-      )
+    return {
+      auth,
+      pieces,
+      expiresAt,
+      userDomainId: (this.addition.user_domain_id || "").trim(),
     }
+  }
 
+  private async performAuthorizationRefresh(plan: {
+    auth: string
+    pieces: string[]
+    userDomainId: string
+  }): Promise<void> {
+    const { auth, pieces, userDomainId } = plan
     const authHeader = `Basic ${auth}`
 
     // Match the minimal header set from the successful PowerShell request.
@@ -623,28 +684,55 @@ export class Yun139ApiClient {
       updateTime?: string
     }>
   }> {
-    const res = await this.request<Yun139DiskResp>(
-      "/orchestration/personalCloud/catalog/v1.0/getDisk",
-      {
-        catalogID: catalogId || "",
-        sortDirection: 1,
-        filterType: 0,
-        catalogSortType: 0,
-        contentSortType: 0,
-        startNumber: 1,
-        endNumber: 5000,
-        commonAccountInfo: {
-          account: this.account,
-          accountType: 1,
+    // legacy getDisk 是分页接口：像 Go 参考实现一样按 limit=100 循环，
+    // 用响应里的 nodeCount 判定终止，避免大目录被单次窗口静默截断。
+    const limit = 100
+    const allFiles: Yun139FileItem[] = []
+    const allFolders: Array<{
+      catalogID: string
+      catalogName: string
+      updateTime?: string
+    }> = []
+    let start = 0
+    // 兜底上限：nodeCount 缺失/异常时也绝不无限翻页
+    for (let page = 0; page < 500; page++) {
+      const res = await this.request<Yun139DiskResp>(
+        "/orchestration/personalCloud/catalog/v1.0/getDisk",
+        {
+          catalogID: catalogId || "",
+          sortDirection: 1,
+          filterType: 0,
+          catalogSortType: 0,
+          contentSortType: 0,
+          startNumber: start + 1,
+          endNumber: start + limit,
+          commonAccountInfo: {
+            account: this.account,
+            accountType: 1,
+          },
         },
-      },
-    )
+      )
 
-    const diskResult = res.data?.getDiskResult
-    return {
-      files: diskResult?.fileList || [],
-      folders: diskResult?.catalogList || [],
+      const diskResult = res.data?.getDiskResult
+      // getDisk 的文件数组字段是 contentList（fileList 是历史误写，恒 undefined）
+      const pageFiles = diskResult?.contentList || diskResult?.fileList || []
+      const pageFolders = diskResult?.catalogList || []
+      allFiles.push(...pageFiles)
+      allFolders.push(...pageFolders)
+
+      const pageCount = pageFiles.length + pageFolders.length
+      if (pageCount === 0) break
+      const nodeCount = Number(diskResult?.nodeCount)
+      if (Number.isFinite(nodeCount) && nodeCount > 0) {
+        if (start + limit >= nodeCount) break
+      } else if (pageCount < limit) {
+        // 服务端没有 nodeCount：只能按"本页未填满"判定到底
+        break
+      }
+      start += limit
     }
+
+    return { files: allFiles, folders: allFolders }
   }
 
   async getDownloadUrl(contentIdOrFileId: string): Promise<string> {
@@ -749,13 +837,32 @@ export class Yun139ApiClient {
     )
   }
 
-  async rename(id: string, newName: string): Promise<void> {
+  async rename(id: string, newName: string, isDir = true): Promise<void> {
     if (this.isPersonalNew()) {
       await this.request("/file/update", {
         fileId: id,
         name: newName,
         description: "",
       })
+      return
+    }
+
+    // legacy 账号的目录与文件属于不同的 id 命名空间，必须走不同端点
+    // （Go 参考实现 driver.go Rename 的 MetaPersonal 分支）：
+    // 目录 → updateCatalogInfo{catalogID,catalogName}，
+    // 文件 → updateContentInfo{contentID,contentName}。
+    if (!isDir) {
+      await this.request(
+        "/orchestration/personalCloud/content/v1.0/updateContentInfo",
+        {
+          contentID: id,
+          contentName: newName,
+          commonAccountInfo: {
+            account: this.account,
+            accountType: 1,
+          },
+        },
+      )
       return
     }
 

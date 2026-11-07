@@ -23,7 +23,7 @@ import { doDriver } from "./driver/do"
 import { mysqlDriver } from "./driver/mysql"
 import { memoryDriver } from "./driver/memory"
 import { mapFormat } from "./format/map"
-import { keyFormat } from "./format/key"
+import { keyFormat, keyFormatListCompletenessProven } from "./format/key"
 import { sqlFormat } from "./format/sql"
 import {
   DB_CIPHER_VALUES,
@@ -128,9 +128,12 @@ export function readCipher(env?: any): DbCipher {
   const raw = readEnv("DB_CIPHER", DEFAULT_DB_CIPHER, env)
   const { cipher, known } = resolveDbCipher(raw)
   if (!known) {
-    console.warn(
-      `[DB] Unknown DB_CIPHER "${raw}"; falling back to "${DEFAULT_DB_CIPHER}". ` +
-        `Valid values: ${DB_CIPHER_VALUES.join(", ")}.`,
+    // S-01：无法识别的 DB_CIPHER 必须 fail-closed，绝不降级——静默降级会造出
+    // 「以为开了加密、实际明文落盘」的部署。直接抛错让启动失败，给出可行动提示。
+    throw new Error(
+      `[DB] Unknown DB_CIPHER "${raw}". ` +
+        `Valid values: ${DB_CIPHER_VALUES.join(", ")}. ` +
+        `Refusing to start with an unrecognized cipher (it may silently store credentials in plaintext).`,
     )
   }
   if (cipher !== "none" && WEAK_DB_CIPHERS.includes(cipher)) {
@@ -158,16 +161,22 @@ export function readCipher(env?: any): DbCipher {
  * 且会给出「写入成功」的假象。因此在此类环境中永不使用内存后端。
  *
  * 判定依据全部为运行时特征（不依赖用户配置），命中任一即成立：
- *  1. EdgeOne：请求上下文标记、KV/Blob 相关绑定、EdgeOne 专属全局变量
+ *  1. EdgeOne：KV/Blob 相关绑定、EdgeOne 专属全局变量、SCF 平台环境变量
  *  2. Cloudflare Workers：WebSocketPair / caches.default / CF 绑定
  *  3. 阿里云 ESA：ESA 全局对象与绑定
- *  4. 通用：注入型请求上下文（__requestOrigin / __requestContext）
+ *
+ * **刻意不看 `__requestOrigin`**（F-077）：index.ts 的全局中间件对**每个平台的
+ * 每个请求**都注入它，它是「请求已经过入口中间件」的标记，不是平台信号。历史
+ * 实现把它当 serverless 证据，导致自托管 Node 上凡是经请求上下文的调用都被判为
+ * serverless —— DB_DRIVER=memory 在其唯一设计目标平台上抛「only valid on a local
+ * Node runtime」，auto 的本地内存回退也永不可达。`__requestContext` /
+ * `__makersContext` 仍保留：它们只在 EdgeOne Makers 运行时注入。
  */
 export function isServerlessRuntime(env?: any): boolean {
   const g = globalThis as any
   try {
-    // ── 通用：请求上下文由平台注入 ──
-    if (env?.__requestOrigin || env?.__requestContext || env?.__makersContext) {
+    // ── 通用：EdgeOne Makers 注入的请求上下文（不是 index.ts 的 origin 标记） ──
+    if (env?.__requestContext || env?.__makersContext) {
       return true
     }
 
@@ -489,7 +498,9 @@ async function autoPickDriver(
   env: any,
   requested: string,
 ): Promise<Driver | null> {
-  const key = `${requested}:${isServerlessRuntime(env) ? "sl" : "local"}:${envFingerprint(env)}`
+  // F-081：键里同样不能用 env 对象身份（每请求新建 → 永不命中，诊断路径会
+  // 每个请求重跑一次 auto 探测，KV 代理模式下等于每请求一次 HTTP 往返）。
+  const key = `${requested}:${isServerlessRuntime(env) ? "sl" : "local"}:${bindingSignature(env)}`
   if (autoPickCache?.key === key) return autoPickCache.driver
 
   let driver: Driver | null = null
@@ -711,27 +722,50 @@ let cachedFormat: FormatAdapter | null = null
 let cachedConfig: string | null = null
 
 /**
- * env 对象的稳定身份编号。
+ * 绑定存在性指纹（F-081）。
  *
- * 为什么需要：auto 模式下驱动探测结果取决于「该 env 里有哪些绑定」。
- * 若仅以 driverName:formatName 做缓存键，同一个进程内先后出现两个不同
- * env（一个有 Blob、一个只有 KV）时会串味。这里给每个 env 对象分配一个
- * 稳定的自增 ID（WeakMap，不阻止 GC），把「是否同一个 env」纳入缓存键。
+ * 历史实现的缓存键包含「env 对象身份」（envFingerprint）。生产运行时 env 是
+ * **每请求新建**的（`1 env = 1 请求`），于是缓存永不命中：每个 API 请求都重新
+ * resolveDriver（→ isAvailable → init），KV 代理部署下每请求多一次指向自身的
+ * HTTP 探测，叠加延迟并消耗子请求配额。
  *
- * 代价极低：同一 env 对象多次调用恒得同一 ID；不同对象则重探测一次。
+ * 驱动解析结果只取决于「这个 env 里有哪些绑定 / 哪些凭据」，与对象身份无关。
+ * 因此改用绑定存在性指纹：同一部署的不同 env 对象得到同一签名 → 缓存命中；
+ * 一个进程里真的出现两套不同绑定的部署时签名不同 → 各自解析，不会串味。
  */
-const envIds = new WeakMap<object, number>()
-let envIdSeq = 0
-function envFingerprint(env?: any): string {
-  if (env && (typeof env === "object" || typeof env === "function")) {
-    let id = envIds.get(env as object)
-    if (id === undefined) {
-      id = ++envIdSeq
-      envIds.set(env as object, id)
-    }
-    return String(id)
-  }
-  return "none"
+function bindingSignature(env?: any): string {
+  const g = typeof globalThis !== "undefined" ? (globalThis as any) : {}
+  const p = typeof process !== "undefined" ? process.env || {} : {}
+  const has = (...values: any[]) => (values.some(Boolean) ? "1" : "0")
+  return [
+    // d1（DB / OPENLIST_DB）
+    has(env?.DB, g?.DB, env?.OPENLIST_DB, g?.OPENLIST_DB),
+    // kv binding（KV）
+    has(env?.KV, g?.KV),
+    // cfkv（REST 凭据）
+    has(
+      env?.CF_ACCOUNT,
+      env?.CLOUDFLARE_ACCOUNT_ID,
+      env?.CF_KV_UUID,
+      env?.CLOUDFLARE_KV_NAMESPACE_ID,
+      env?.CF_API_KEY,
+      env?.CLOUDFLARE_API_TOKEN,
+      p.CF_ACCOUNT,
+      p.CLOUDFLARE_ACCOUNT_ID,
+      p.CF_KV_UUID,
+      p.CLOUDFLARE_KV_NAMESPACE_ID,
+      p.CF_API_KEY,
+      p.CLOUDFLARE_API_TOKEN,
+    ),
+    // blob（EdgeOne SDK / ESA binding）
+    has(env?.EDGEONE_BLOB, g?.EDGEONE_BLOB, env?.ESA_BLOB, g?.ESA_BLOB),
+    // do（DO）
+    has(env?.DO, g?.DO),
+    // mysql
+    has(env?.MYSQL_URLS, env?.MYSQL_HOST, p.MYSQL_URLS, p.MYSQL_HOST),
+    // kv 代理（EO_KV_URLS；__requestOrigin 仅作为「代理可用」的地址来源）
+    has(env?.EO_KV_URLS, env?.__requestOrigin),
+  ].join("")
 }
 
 /**
@@ -744,11 +778,12 @@ export async function getStorageBackend(
   const formatName = readFormat(env)
   // 缓存键必须包含「影响探测结果的环境特征」。
   // 仅用 driverName:formatName 是不够的：当 DB_DRIVER=auto 时，不同 env
-  // 可能探测出不同驱动（如本地 env 回退 memory、serverless env 报错，
-  // 或一个 env 有 Blob 绑定、另一个只有 KV），共用缓存会返回错误结果。
-  // 因此额外纳入「运行时类型 + env 身份」。
+  // 可能探测出不同驱动（如一个 env 有 Blob 绑定、另一个只有 KV）。
+  // 因此额外纳入「运行时类型 + 绑定存在性指纹」。
+  //
+  // F-081：**不能**用 env 对象身份做键 —— 生产环境 env 每请求新建，缓存永不命中。
   const runtimeTag = isServerlessRuntime(env) ? "sl" : "local"
-  const config = `${driverName}:${formatName}:${runtimeTag}:${envFingerprint(env)}`
+  const config = `${driverName}:${formatName}:${runtimeTag}:${bindingSignature(env)}`
 
   if (cachedDriver && cachedFormat && cachedConfig === config) {
     return { driver: cachedDriver, format: cachedFormat }
@@ -790,6 +825,11 @@ export async function getStoreBackend(env?: any): Promise<StoreBackend> {
     isConfigured: (e?: any) => driver.isAvailable(e),
     init: (e?: any) => driver.init(e),
     health: (e?: any) => driver.health(e),
+    // QS-1：只有 key 格式 + 最终一致驱动才会「键列表可能部分漏报」；其余
+    // （map 单键读取、sql 逐表 SELECT、d1/do/mysql/memory 的强一致 list）都是
+    // 完整视野，可证明。db.ts 用它决定是否把内存库标记为 dbTrusted。
+    loadCompletenessProven: () =>
+      format.name === "key" ? keyFormatListCompletenessProven(driver) : true,
   }
 }
 
@@ -899,8 +939,14 @@ function isPersistentStatus(status: any): boolean {
   const hasDriver = driver !== "none" && driver !== ""
   const isMemory = driver === "memory"
   const hasConfigError = Boolean(status?.configError)
-  // health 失败时 getStoreStatus 会带 available:false
-  const driverHealthy = status?.available !== false
+  // F-078：health 失败时 status 的形状并不统一 —— kv/blob 会带 `available:false`，
+  // 而 d1/do/mysql/cfkv（以及 getStoreStatus 的 health 异常兜底）只返回
+  // `connected:false`。历史上只判 `available`，于是这四个驱动「绑定在、后端连不上」
+  // （MySQL 宕机、D1 报错、CF token 失效）会被判成健康可持久化，全局 503 拦截与
+  // env_check/init_status 的「就绪」全部失效。
+  // 两个字段都为 false 才算不健康；任何一个是 false 即视为不健康。
+  const driverHealthy =
+    status?.available !== false && status?.connected !== false
   return hasDriver && !isMemory && !hasConfigError && driverHealthy
 }
 

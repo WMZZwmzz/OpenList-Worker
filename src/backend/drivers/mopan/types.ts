@@ -8,6 +8,8 @@ export interface MoPanAddition {
   order_direction?: "asc" | "desc"
   device_info?: string
   upload_thread?: string
+  /** onAuthUpdate 持久化的访问令牌（F-248：构建驱动时优先复用） */
+  token?: string
 }
 
 export interface DeviceInfo {

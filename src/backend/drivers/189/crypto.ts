@@ -257,13 +257,20 @@ export function md5Base64(data: Uint8Array | string): string {
 }
 
 /**
- * 生成 189 专用的 UUID 格式随机字符串
+ * 生成 189 专用的 UUID 格式随机字符串。
+ *
+ * F-138：旧实现用 `Math.random()`（xorshift128+，非密码安全），而该函数
+ * 的产物在 uploadRequest 里同时充当 AES-128-ECB 密钥与 HMAC-SHA1 签名密钥。
+ * 改用 CSPRNG（crypto.getRandomValues，Workers/Node18+/ESA 均可用）。
  */
 export function randomUUID189(
   pattern: string = "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx",
 ): string {
+  const randomBytes = new Uint8Array(pattern.length)
+  crypto.getRandomValues(randomBytes)
+  let idx = 0
   return pattern.replace(/[xy]/g, (c) => {
-    const r = (Math.random() * 16) | 0
+    const r = randomBytes[idx++] & 0x0f
     const v = c === "x" ? r : (r & 0x3) | 0x8
     return v.toString(16)
   })
@@ -273,10 +280,11 @@ export function randomUUID189(
  * 生成 189 URL 查询缓存随机数
  */
 export function randomNoCache(): string {
-  return (
-    "0." +
-    Math.floor(Math.random() * 1e17)
-      .toString()
-      .padStart(17, "0")
-  )
+  // S-04 统一 CSPRNG：虽然只是缓存穿透用途，统一用 Web Crypto 消除全仓
+  // Math.random 残留（输出保持「0. + 17 位数字」的既有格式）。
+  const bytes = crypto.getRandomValues(new Uint8Array(8))
+  const hi = ((bytes[0] << 24) | (bytes[1] << 16) | (bytes[2] << 8) | bytes[3]) >>> 0
+  const lo = ((bytes[4] << 24) | (bytes[5] << 16) | (bytes[6] << 8) | bytes[7]) >>> 0
+  const n = (hi % 100000) * 1e12 + (lo % 1e12)
+  return "0." + Math.floor(n).toString().padStart(17, "0")
 }

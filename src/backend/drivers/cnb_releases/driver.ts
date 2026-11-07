@@ -26,7 +26,8 @@ export class DriverCnbReleases implements StorageDriver {
       const releases = await this.client.listReleases()
       return releases.map((r) => ({
         name: this.client.releaseName(r),
-        size: r.assets.reduce((s, a) => s + a.size, 0),
+        // assets 可能为 null/省略（Go 侧 nil 切片），不能直接 reduce
+        size: (r.assets || []).reduce((s, a) => s + a.size, 0),
         is_dir: true,
         modified: r.updated_at || r.created_at || new Date().toISOString(),
         sign: r.id,
@@ -37,7 +38,7 @@ export class DriverCnbReleases implements StorageDriver {
     // release 目录：先按名称解析出 ID
     const release = await this.client.findRelease(clean.split("/")[0])
     if (!release) return []
-    return release.assets.map((a) => ({
+    return (release.assets || []).map((a) => ({
       name: a.name,
       size: a.size,
       is_dir: false,
@@ -50,25 +51,25 @@ export class DriverCnbReleases implements StorageDriver {
 
   async get(_virtualPath: string, physicalPath: string): Promise<FileItem> {
     const parts = physicalPath.split("/").filter(Boolean)
-    const name = parts[parts.length - 1] || "root"
     const clean = parts.join("/")
 
     // release 目录
     if (parts.length === 1) {
       const release = await this.client.findRelease(parts[0])
-      if (release) {
-        return {
-          name: this.client.releaseName(release),
-          size: release.assets.reduce((s, a) => s + a.size, 0),
-          is_dir: true,
-          modified:
-            release.updated_at ||
-            release.created_at ||
-            new Date().toISOString(),
-          sign: release.id,
-          type: 1,
-          raw_url: "",
-        }
+      if (!release) {
+        throw new Error(`[CNB Releases] release not found: ${parts[0]}`)
+      }
+      return {
+        name: this.client.releaseName(release),
+        size: (release.assets || []).reduce((s, a) => s + a.size, 0),
+        is_dir: true,
+        modified:
+          release.updated_at ||
+          release.created_at ||
+          new Date().toISOString(),
+        sign: release.id,
+        type: 1,
+        raw_url: "",
       }
     }
     // asset 文件
@@ -87,16 +88,9 @@ export class DriverCnbReleases implements StorageDriver {
           raw_url: this.client.assetDownloadUrl(asset),
         }
       }
+      throw new Error(`[CNB Releases] asset not found: ${clean}`)
     }
-    return {
-      name,
-      size: 0,
-      is_dir: false,
-      modified: new Date().toISOString(),
-      sign: "",
-      type: calcFileType(name, false),
-      raw_url: "",
-    }
+    throw new Error(`[CNB Releases] object not found: ${physicalPath}`)
   }
 
   async mkdir(_virtualPath: string, physicalPath: string): Promise<void> {

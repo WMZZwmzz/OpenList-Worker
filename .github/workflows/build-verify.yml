@@ -70,7 +70,22 @@ jobs:
           cache: pnpm
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        # --ignore-scripts 与 .npmrc 的 ignore-scripts=true 双保险（S-05）：
+        # 依赖投毒的 postinstall 在 CI 上同样不该执行。
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      # SCA 门禁（2026-10-31 深度安全审查报告 S-06）：当前仓库此前完全没有
+      # 依赖漏洞扫描步骤。high 及以上漏洞直接让构建失败。已接受的基线
+      # （pnpm.auditConfig.ignoreGhsas，2026-11-07 核准）：
+      #   - undici ×7 / ws / @fastify/busboy：全部经 miniflare/wrangler（本地
+      #     dev 工具链）引入，不进入部署产物；升级受上游锁定约束。
+      #   - GHSA-g2v6-rqmx-r4w6（@vue/server-renderer）：经 @embedpdf（前端
+      #     PDF 查看器组件）引入，前端 dist 由上游预构建，本仓库不打包它。
+      #   - GHSA-mrhx-c7xc-m3w5（zod）：仅用于已认证 admin 请求体的校验，
+      #     修复版 4.6.6 是破坏性大版本迁移，暂缓并记录在此。
+      # 新出现的 high/critical 不在名单内即失败；移出名单需同步删除条目。
+      - name: Dependency audit gate
+        run: pnpm audit --audit-level=high --prod
 
       - name: Fetch official frontend dist
         run: node scripts/fetch-frontend.mjs

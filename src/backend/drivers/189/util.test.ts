@@ -676,3 +676,120 @@ test("189Cloud retries init without MD5 when the API security check blacklists i
   assert.match(initParams[0], /^[0-9a-f]+$/)
   assert.match(initParams[1], /^[0-9a-f]+$/)
 })
+
+test("189Cloud multipart sliceMd5 matches the upstream protocol (uppercase parts, lowercase digest)", async () => {
+  const { createHash } = await import("node:crypto")
+  const md5 = (data: string | Buffer) =>
+    createHash("md5").update(data).digest("hex")
+
+  const driver = new Cloud189Driver({ username: "", password: "" })
+  const client: any = (driver as any).client
+  const calls: Array<{ uri: string; form: Record<string, string> }> = []
+  client.getSessionKey = async () => "session-key"
+  client.uploadRequest = async (uri: string, form: Record<string, string>) => {
+    calls.push({ uri, form })
+    if (uri === "/person/initMultiUpload") {
+      return {
+        code: "SUCCESS",
+        data: { uploadFileId: "upload-id", fileDataExists: 0 },
+      }
+    }
+    if (uri === "/person/getMultiUploadUrls") {
+      const partNumber = form.partInfo.split("-")[0]
+      return {
+        code: "SUCCESS",
+        uploadUrls: {
+          [`partNumber_${partNumber}`]: {
+            requestURL: `https://cdn.example/upload-part-${partNumber}`,
+            requestHeader: "",
+          },
+        },
+      }
+    }
+    if (uri === "/person/commitMultiUploadFile") {
+      return { code: "SUCCESS" }
+    }
+    throw new Error(`unexpected upload API: ${uri}`)
+  }
+  globalThis.fetch = (async () =>
+    new Response("", { status: 200 })) as typeof fetch
+
+  const fileMd5 = md5("whole-file")
+  const info = await (driver as any).createUploadSession(
+    "/",
+    "/",
+    "movie.bin",
+    20 * 1024 * 1024,
+    fileMd5,
+  )
+  assert.equal(info.partCount, 2)
+
+  const part1 = await (driver as any).uploadPart(
+    info.session,
+    1,
+    Buffer.from("part-one"),
+  )
+  const part2 = await (driver as any).uploadPart(
+    info.session,
+    2,
+    Buffer.from("part-two"),
+  )
+  await (driver as any).completeUploadSession(info.session, [
+    part1.partMd5,
+    part2.partMd5,
+  ])
+
+  const initCall = calls.find((c) => c.uri === "/person/initMultiUpload")
+  const commitCall = calls.find(
+    (c) => c.uri === "/person/commitMultiUploadFile",
+  )
+  assert.ok(initCall && commitCall)
+  // 上游：大写分片 MD5 拼接后取 MD5，结果小写（旧实现小写拼接再 toUpperCase）
+  const expected = md5(
+    `${md5("part-one").toUpperCase()}\n${md5("part-two").toUpperCase()}`,
+  )
+  assert.equal(commitCall!.form.sliceMd5, expected)
+  assert.equal(commitCall!.form.sliceMd5, expected.toLowerCase())
+  assert.equal(commitCall!.form.fileMd5, fileMd5)
+  // 建会话时调用方未提供真实 sliceMd5 → init 仍退回 fileMd5（内容尚未读取）
+  assert.equal(initCall!.form.sliceMd5, fileMd5)
+})
+
+test("F-135: numeric uploadFileId beyond 2^53 keeps full precision", async () => {
+  const { publicKey } = generateKeyPairSync("rsa", { modulusLength: 1024 })
+  const pubKey = publicKey.export({ type: "spki", format: "der" }).toString("base64")
+  const uploadFileId = 925521251969871401
+
+  globalThis.fetch = (async (input) => {
+    const url = requestUrl(input)
+    if (url.includes("/v2/getUserBriefInfo.action")) {
+      return mockResponse(url, { res_code: 0, sessionKey: "session-key" })
+    }
+    if (url.includes("/api/security/generateRsaKey.action")) {
+      return mockResponse(url, {
+        res_code: 0,
+        pubKey,
+        pkId: "pk-id",
+        expire: Date.now() + 60_000,
+      })
+    }
+    if (url.startsWith("https://upload.cloud.189.cn/person/initMultiUpload?")) {
+      // 服务端以 JSON 数字返回超出安全整数范围的 uploadFileId
+      return mockResponse(
+        url,
+        `{"code":"SUCCESS","data":{"uploadFileId":${uploadFileId},"fileDataExists":0}}`,
+      )
+    }
+    throw new Error(`unexpected fetch: ${url}`)
+  }) as typeof fetch
+
+  const client = new Pan189Client({ username: "", password: "" })
+  const result = await client.createMultiUpload(
+    "-11",
+    "big.bin",
+    10,
+    "0123456789abcdef0123456789abcdef",
+  )
+
+  assert.equal(result.uploadFileId, String(uploadFileId))
+})

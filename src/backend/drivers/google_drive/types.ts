@@ -30,6 +30,9 @@ export interface GoogleFile {
     targetId?: string
     targetMimeType?: string
   }
+  /** 列表解析出的快捷方式目标（仅用于展示/下载，写操作必须使用 shortcut 自身 id） */
+  targetId?: string
+  targetMimeType?: string
 }
 
 export const GOOGLE_DRIVE_FOLDER_MIME = "application/vnd.google-apps.folder"

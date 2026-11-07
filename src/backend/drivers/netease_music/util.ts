@@ -74,7 +74,20 @@ export class ClientNeteaseMusic {
       },
       body: new URLSearchParams(data).toString(),
     })
-    return resp.json()
+    if (!resp.ok) {
+      throw new Error(`[NeteaseMusic] HTTP ${resp.status} for ${url}`)
+    }
+    const json = (await resp.json()) as any
+    // Netease reports business errors (expired cookie, rate limit, missing
+    // resource) as {"code": <non-200>} with HTTP 200. Swallowing them turned
+    // failures into empty listings.
+    if (json && typeof json.code === "number" && json.code !== 200) {
+      const detail = json.message || json.msg || ""
+      throw new Error(
+        `[NeteaseMusic] API error ${json.code}${detail ? `: ${detail}` : ""}`,
+      )
+    }
+    return json
   }
 
   async getSongObjs(limit: number): Promise<NeteaseSongItem[]> {
@@ -87,6 +100,8 @@ export class ClientNeteaseMusic {
         cookies: [{ name: "os", value: "pc" }],
       },
     )) as NeteaseListResp
+    // Errors with non-200 codes already threw in request(); a 200 without
+    // data is a legitimately empty cloud drive.
     return resp.data || []
   }
 
@@ -107,9 +122,20 @@ export class ClientNeteaseMusic {
   }
 
   async removeSong(id: string): Promise<void> {
-    await this.request("http://music.163.com/weapi/cloud/del", "POST", {
-      crypto: "weapi",
-      data: { songIds: "[" + id + "]" },
-    })
+    // HTTPS: the request carries the full account Cookie (MUSIC_U), which must
+    // never travel over plaintext HTTP.
+    const resp = (await this.request(
+      "https://music.163.com/weapi/cloud/del",
+      "POST",
+      {
+        crypto: "weapi",
+        data: { songIds: "[" + id + "]" },
+      },
+    )) as { code?: number; message?: string }
+    if (resp?.code !== 200) {
+      throw new Error(
+        `[NeteaseMusic] failed to remove song ${id}: code ${resp?.code ?? "unknown"}`,
+      )
+    }
   }
 }

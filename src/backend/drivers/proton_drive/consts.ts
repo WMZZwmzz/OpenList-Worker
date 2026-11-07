@@ -1,7 +1,9 @@
 // ProtonDrive constants (aligned with Go drivers/proton_drive/meta.go)
 
 export const ProtonAPIBase = "https://drive.proton.me/api"
-export const ProtonAuthInfoURL = "https://account.proton.me/api/auth/info"
+// Official clients use POST /auth/v4/info (go-proton-api) or
+// /core/v4/auth/info (web); /api/auth/info is not a Proton route.
+export const ProtonAuthInfoURL = "https://account.proton.me/api/auth/v4/info"
 export const ProtonAuthURL = "https://account.proton.me/api/auth/v4"
 export const ProtonAuth2FAURL = "https://account.proton.me/api/auth/v4/2fa"
 export const ProtonRefreshURL = "https://account.proton.me/api/auth/v4/refresh"

@@ -39,6 +39,9 @@ function releaseSize(release: GHRRelease): number {
   return release.assets.reduce((sum, asset) => sum + (asset.size || 0), 0)
 }
 
+/** 单次翻页请求的硬上限（max_page=0 不限页时的护栏，F-309） */
+const MAX_PAGES_HARD = 100
+
 export class ClientGithubReleases {
   private addition: DriverGithubReleasesAddition
   private mounts: GHRMountPoint[]
@@ -46,6 +49,20 @@ export class ClientGithubReleases {
   constructor(addition: DriverGithubReleasesAddition) {
     this.addition = addition || ({} as DriverGithubReleasesAddition)
     this.mounts = this.parseMounts(this.addition.repo_structure || "")
+  }
+
+  /**
+   * 剥离通用层拼入的 root_folder_path 前缀（F-306）。
+   * resolvePath 传给驱动的 physicalPath 已带 root 前缀，而挂载点匹配必须基于
+   * 存储相对路径，否则设置非默认 root 后列表恒为空。
+   */
+  private storageRelative(p: string): string {
+    const clean = normalizePath(p)
+    const root = normalizePath(this.addition.root_folder_path || "/")
+    if (root === "/") return clean
+    if (clean === root) return "/"
+    if (clean.startsWith(root + "/")) return normalizePath(clean.slice(root.length))
+    return clean
   }
 
   /**
@@ -135,12 +152,63 @@ export class ClientGithubReleases {
     return this.get<GHRRelease>(`/repos/${repo}/releases/latest`)
   }
 
+  /**
+   * 祖先合成目录的聚合体量与时间（F-308，对齐 Go driver.go）。
+   * latest 模式取最新 release 的资产总和；全版本模式取所有版本之和。
+   */
+  private async repoAggregate(
+    repo: string,
+  ): Promise<{ size: number; modified: string }> {
+    try {
+      if (this.addition.show_all_version) {
+        const releases = await this.allReleases(repo)
+        if (releases.length === 0) return { size: 0, modified: "" }
+        return {
+          size: releases.reduce((sum, r) => sum + releaseSize(r), 0),
+          modified: releases[0].published_at || releases[0].created_at,
+        }
+      }
+      const release = await this.latestRelease(repo)
+      if (!release) return { size: 0, modified: "" }
+      return {
+        size: releaseSize(release),
+        modified: release.published_at || release.created_at,
+      }
+    } catch {
+      return { size: 0, modified: "" }
+    }
+  }
+
   /** 对齐 Go getAllReleases：per_page 默认 30（上限 100），max_page 为 0 时不限页数 */
   private async allReleases(repo: string): Promise<GHRRelease[]> {
     const perPage = clampNumber(this.addition.per_page, 30, 1, 100)
-    const maxPage = Math.max(0, Math.floor(Number(this.addition.max_page) || 0))
+    // F-309：max_page 与 per_page 使用同样的「非法值回落安全默认」语义，
+    // 并且即使配置为 0（不限页）也受 MAX_PAGES_HARD 护栏保护。
+    const rawMaxPage = this.addition.max_page
+    let maxPage = 0
+    if (
+      rawMaxPage !== undefined &&
+      rawMaxPage !== null &&
+      String(rawMaxPage).trim() !== ""
+    ) {
+      const parsed = Math.floor(Number(rawMaxPage))
+      if (!Number.isFinite(parsed) || parsed < 0) {
+        console.warn(
+          `[GitHub Releases] invalid max_page=${String(rawMaxPage)}, falling back to 1 page`,
+        )
+        maxPage = 1
+      } else {
+        maxPage = parsed
+      }
+    }
+    const pageLimit = maxPage === 0 ? MAX_PAGES_HARD : Math.min(maxPage, MAX_PAGES_HARD)
+    if (maxPage > MAX_PAGES_HARD) {
+      console.warn(
+        `[GitHub Releases] max_page=${maxPage} exceeds the hard limit, capped at ${MAX_PAGES_HARD}`,
+      )
+    }
     const out: GHRRelease[] = []
-    for (let page = 1; maxPage === 0 || page <= maxPage; page++) {
+    for (let page = 1; page <= pageLimit; page++) {
       const releases = await this.get<GHRRelease[]>(
         `/repos/${repo}/releases?per_page=${perPage}&page=${page}`,
       )
@@ -193,10 +261,12 @@ export class ClientGithubReleases {
   private readmeFiles(prefix: string, contents: GHRFileInfo[]): GHRFile[] {
     const out: GHRFile[] = []
     for (const f of contents) {
-      if (
-        f.name.toLowerCase().endsWith(".md") ||
-        f.name.toUpperCase().startsWith("LICENSE")
-      ) {
+      // F-307：/contents 返回的目录条目（download_url=null）不能当文件列出
+      if (f.type === "dir") continue
+      // 对齐 Go otherFiles：README.md 大小写不敏感等值，LICENSE 为大小写敏感前缀
+      const isReadme = f.name.toLowerCase() === "readme.md"
+      const isLicense = f.name.startsWith("LICENSE")
+      if (isReadme || isLicense) {
         out.push({
           path: joinPath(prefix, f.name),
           name: f.name,
@@ -241,8 +311,9 @@ export class ClientGithubReleases {
   }
 
   async list(virtualPath: string): Promise<GHRFile[]> {
-    const clean = normalizePath(virtualPath)
+    const clean = this.storageRelative(virtualPath)
     const files: GHRFile[] = []
+    const ancestorIndex = new Map<string, number>()
 
     for (const mount of this.mounts) {
       const point = normalizePath(mount.point)
@@ -265,15 +336,23 @@ export class ClientGithubReleases {
       ) {
         const prefix = clean === "/" ? "/" : clean + "/"
         const name = point.slice(prefix.length).split("/")[0]
-        if (name && !files.some((f) => f.name === name)) {
+        if (!name) continue
+        // F-308：聚合该仓库 release 的体量与真实发布时间；同名目录累加
+        const agg = await this.repoAggregate(mount.repo)
+        const existing = ancestorIndex.get(name)
+        if (existing === undefined) {
+          ancestorIndex.set(name, files.length)
           files.push({
             path: joinPath(clean, name),
             name,
-            size: 0,
+            size: agg.size,
             isDir: true,
-            modified: new Date().toISOString(),
+            modified: agg.modified || new Date().toISOString(),
             url: "",
           })
+        } else {
+          const item = files[existing]
+          item.size += agg.size
         }
         continue
       }
@@ -305,7 +384,7 @@ export class ClientGithubReleases {
 
   /** 仅挂载点、合成的祖先目录与 show_all_version 下的版本目录是目录 */
   async isDirectory(virtualPath: string): Promise<boolean> {
-    const clean = normalizePath(virtualPath)
+    const clean = this.storageRelative(virtualPath)
     if (clean === "/") return true
 
     for (const mount of this.mounts) {
@@ -324,43 +403,62 @@ export class ClientGithubReleases {
     return releases.some((r) => r.tag_name === rel)
   }
 
-  /** 获取单文件下载链接：版本目录 → 最新版本 → 其它版本 → README/LICENSE */
+  /**
+   * 获取单文件下载链接。解析必须与 list()/isDirectory() 的目录结构一致，
+   * 不做任何跨版本按名字兜底：越界的路径一律抛 Object not found，
+   * 否则某版本目录里不存在的资产名会命中 latest/其它 release 的同名资产，
+   * 用户会下载到与所列目录不符的文件。
+   */
   async getDownloadUrl(virtualPath: string): Promise<string> {
-    const mount = this.mountForPath(virtualPath)
-    if (!mount) return ""
-    const rel = this.relPath(mount, virtualPath)
-    const segs = rel.split("/").filter(Boolean)
-    const name = segs[segs.length - 1] || ""
-    if (!name) return ""
+    const relativePath = this.storageRelative(virtualPath)
+    const mount = this.mountForPath(relativePath)
+    const notFound = () => new Error(`Object not found: ${virtualPath}`)
+    if (!mount || (await this.isDirectory(relativePath))) throw notFound()
 
-    const releases = await this.allReleases(mount.repo).catch(() => [])
-    if (segs.length >= 2) {
-      const tagged = releases.find((r) => r.tag_name === segs[0])
-      if (tagged) {
-        const asset = tagged.assets.find((a) => a.name === name)
+    const rel = this.relPath(mount, relativePath)
+    const segs = rel.split("/").filter(Boolean)
+    // 挂载点根目录：最新版本资产 / 源码包 / README·LICENSE（见 mountContent）
+    if (segs.length === 1) {
+      const name = segs[0]
+      if (!this.addition.show_all_version) {
+        const latest = await this.latestRelease(mount.repo).catch(() => null)
+        if (latest) {
+          const asset = latest.assets.find((a) => a.name === name)
+          if (asset) return this.proxy(asset.browser_download_url)
+          if (this.addition.show_source_code) {
+            const source = this.sourceCodeUrl(name, latest)
+            if (source) return this.proxy(source)
+          }
+        }
+      }
+      if (this.addition.show_readme !== false) {
+        const contents = await this.repoFiles(mount.repo).catch(() => [])
+        // F-307：目录条目与 download_url 为空的条目不能当作可下载文件
+        const match = contents.find(
+          (c) =>
+            c.name === name && c.type !== "dir" && !!c.download_url,
+        )
+        if (match) return this.proxy(match.download_url)
+      }
+      throw notFound()
+    }
+
+    // 版本目录（仅 show_all_version 时存在）：只允许该 tag 自己的资产与源码包
+    if (segs.length === 2 && this.addition.show_all_version) {
+      const releases = await this.allReleases(mount.repo).catch(() => [])
+      const release = releases.find((r) => r.tag_name === segs[0])
+      if (release) {
+        const name = segs[1]
+        const asset = release.assets.find((a) => a.name === name)
         if (asset) return this.proxy(asset.browser_download_url)
-        const source = this.sourceCodeUrl(name, tagged)
-        if (source) return this.proxy(source)
+        if (this.addition.show_source_code) {
+          const source = this.sourceCodeUrl(name, release)
+          if (source) return this.proxy(source)
+        }
       }
     }
 
-    const latest = await this.latestRelease(mount.repo).catch(() => null)
-    if (latest) {
-      const asset = latest.assets.find((a) => a.name === name)
-      if (asset) return this.proxy(asset.browser_download_url)
-      const source = this.sourceCodeUrl(name, latest)
-      if (source) return this.proxy(source)
-    }
-
-    for (const release of releases) {
-      const asset = release.assets.find((a) => a.name === name)
-      if (asset) return this.proxy(asset.browser_download_url)
-    }
-
-    const contents = await this.repoFiles(mount.repo).catch(() => [])
-    const match = contents.find((c) => c.name === name)
-    if (match) return this.proxy(match.download_url)
-    return ""
+    throw notFound()
   }
 
   private sourceCodeUrl(name: string, release: GHRRelease): string {

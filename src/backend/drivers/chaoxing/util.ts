@@ -44,6 +44,25 @@ export class ClientChaoXing {
     return this.cookie
   }
 
+  /** cookie 失效时用已配置的账号密码重登一次并持久化，返回是否成功 */
+  private async relogin(): Promise<boolean> {
+    if (!this.addition.user_name || !this.addition.password) return false
+    try {
+      this.cookie = await this.login()
+      if (this.persistCookie) await this.persistCookie(this.cookie)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  private isAuthFailure(json: any): boolean {
+    if (!json || typeof json !== "object") return false
+    if ((json as any).result === 1) return false
+    const msg = String((json as any).msg || "")
+    return /登录|login|session|会话|passport/i.test(msg)
+  }
+
   downloadHeaders(): Record<string, string> {
     return {
       Cookie: this.cookie,
@@ -90,6 +109,7 @@ export class ClientChaoXing {
     method: string,
     query?: Record<string, string>,
     extraHeaders?: Record<string, string>,
+    retried = false,
   ): Promise<T> {
     const qs = query ? "?" + new URLSearchParams(query).toString() : ""
     const headers: Record<string, string> = {
@@ -99,15 +119,27 @@ export class ClientChaoXing {
       ...extraHeaders,
     }
     const resp = await fetch(`${API}${pathname}${qs}`, { method, headers })
+    if (
+      !retried &&
+      (resp.status === 401 || resp.status === 403) &&
+      (await this.relogin())
+    ) {
+      return this.request<T>(pathname, method, query, extraHeaders, true)
+    }
     if (resp.status >= 400) {
       throw new Error(`[ChaoXing] request failed: HTTP ${resp.status}`)
     }
-    return (await resp.json()) as T
+    const json = (await resp.json()) as any
+    if (!retried && this.isAuthFailure(json) && (await this.relogin())) {
+      return this.request<T>(pathname, method, query, extraHeaders, true)
+    }
+    return json as T
   }
 
   private async requestDownload<T = any>(
     pathname: string,
     method: string,
+    retried = false,
   ): Promise<T> {
     const headers: Record<string, string> = {
       Cookie: this.cookie,
@@ -116,6 +148,13 @@ export class ClientChaoXing {
       "User-Agent": UA,
     }
     const resp = await fetch(`${DOWNLOAD_API}${pathname}`, { method, headers })
+    if (
+      !retried &&
+      (resp.status === 401 || resp.status === 403) &&
+      (await this.relogin())
+    ) {
+      return this.requestDownload<T>(pathname, method, true)
+    }
     if (resp.status >= 400) {
       throw new Error(`[ChaoXing] download request failed: HTTP ${resp.status}`)
     }
@@ -142,6 +181,9 @@ export class ClientChaoXing {
       "GET",
       { bbsid: this.addition.bbsid, folderId: parent, recType: "2" },
     )
+    if (resps.result !== 1) {
+      throw new Error(`[ChaoXing] list files failed: result=${resps.result}`)
+    }
     for (const file of resps.list || []) {
       // 手机端超星上传的文件没有 fileId 字段，但 objectId 与 fileId 相同，可代替
       if (!file.content.fileId) {
@@ -220,10 +262,12 @@ export class ClientChaoXing {
     content: Uint8Array,
   ): Promise<void> {
     // 1. 获取上传配置（token / puid）
-    const cfgResp = await fetch(`${DOWNLOAD_API}/pc/files/getUploadConfig`, {
-      method: "GET",
-    })
-    const cfg = (await cfgResp.json()) as ChaoXingUploadConfigResp
+    // 上游 Go 实现经 d.request() 携带 Cookie/Referer；该端点会话门控，
+    // 裸 fetch 会收到登录页 302 导致 upload 必然失败。
+    const cfg = await this.requestDownload<ChaoXingUploadConfigResp>(
+      "/pc/files/getUploadConfig",
+      "GET",
+    )
     if (cfg.result !== 1 || !cfg.msg?.token) {
       throw new Error("[ChaoXing] get upload config failed")
     }

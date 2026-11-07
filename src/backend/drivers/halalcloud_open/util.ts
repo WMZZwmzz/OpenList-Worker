@@ -1,5 +1,6 @@
 // HalalCloud Open API 客户端（HL6-HMAC-SHA256 签名，AWS SigV4 变体）
 // 签名算法逆向自 github.com/halalcloud/golang-sdk-lite
+import { randomInt } from "../rand"
 import {
   DriverHalalCloudOpenAddition,
   HCloudFile,
@@ -79,7 +80,8 @@ export async function hcloudSign(
   const timestamp = now.toISOString()
   const nonce = (
     BigInt(Math.floor(now.getTime())) * 1000000n +
-    BigInt(Math.floor(Math.random() * 1000000))
+    // S-04 同类清单：nonce 随机段改用 CSPRNG（原 Math.random）。
+    BigInt(randomInt(1000000))
   ).toString(36)
 
   const hasBody = input.bodyRaw.length > 0

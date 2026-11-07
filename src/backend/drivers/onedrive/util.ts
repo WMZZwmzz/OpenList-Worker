@@ -1,27 +1,79 @@
 import { Addition, onedriveHostMap } from "./meta"
 import { File, Files, Metadata, DriveResp, Host } from "./types"
 
+/**
+ * F-316：refresh_token 是长期凭据，放进 GET 查询串会留在第三方与各级代理的
+ * 访问日志里。优先用 POST 表单体传递；仅当上游 renew 接口不支持 POST（返回
+ * 非 2xx / 非 JSON / 不含 token）时才回退到历史 GET 形态，保证刷新不中断。
+ */
+async function refreshViaOnlineApi(
+  d: Addition & { accessToken?: string },
+): Promise<void> {
+  const params: Record<string, string> = {
+    refresh_ui: d.refresh_token,
+    server_use: "true",
+    driver_txt: "onedrive_pr",
+  }
+
+  let data: any = null
+  try {
+    const resp = await fetch(d.api_url_address, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams(params).toString(),
+    })
+    if (resp.ok) {
+      data = await resp.json().catch(() => null)
+    }
+  } catch {
+    data = null
+  }
+
+  if (!data || !data.refresh_token || !data.access_token) {
+    // 兼容旧版 renew 接口（只接受 GET 查询参数）
+    const qs = new URLSearchParams(params).toString()
+    const resp = await fetch(`${d.api_url_address}?${qs}`)
+    data = await resp.json().catch(() => ({}))
+  }
+
+  if (!data?.refresh_token || !data?.access_token) {
+    if (data?.text) {
+      throw new Error(`failed to refresh token: ${data.text}`)
+    }
+    throw new Error("empty token returned from official API")
+  }
+  d.accessToken = data.access_token
+  d.refresh_token = data.refresh_token
+  await (d as any).onTokenUpdate?.(d.refresh_token)
+}
+
+/**
+ * F-315：驱动实例在同一 isolate 内被所有并发请求共享；token 过期时若每个 401
+ * 各自刷新，会并行发出多次刷新并各自走 onTokenUpdate 落库（整库读改写竞态，
+ * 旧 token 可能覆盖已轮换的新 token）。这里按驱动实例做 singleflight：
+ * 同一实例上并发的刷新只执行一次，其余调用共享同一个 Promise。
+ */
+const refreshInFlight = new WeakMap<object, Promise<void>>()
+
+export function refreshTokenOnce(
+  d: Addition & { accessToken?: string },
+): Promise<void> {
+  const key = d as unknown as object
+  const pending = refreshInFlight.get(key)
+  if (pending) return pending
+  const task = refreshToken(d).finally(() => {
+    refreshInFlight.delete(key)
+  })
+  refreshInFlight.set(key, task)
+  return task
+}
+
 export async function refreshToken(
   d: Addition & { accessToken?: string },
 ): Promise<void> {
   // Use online API
   if (d.use_online_api && d.api_url_address) {
-    const qs = new URLSearchParams({
-      refresh_ui: d.refresh_token,
-      server_use: "true",
-      driver_txt: "onedrive_pr",
-    }).toString()
-    const resp = await fetch(`${d.api_url_address}?${qs}`)
-    const data = await resp.json()
-    if (!data.refresh_token || !data.access_token) {
-      if (data.text) {
-        throw new Error(`failed to refresh token: ${data.text}`)
-      }
-      throw new Error("empty token returned from official API")
-    }
-    d.accessToken = data.access_token
-    d.refresh_token = data.refresh_token
-    await (d as any).onTokenUpdate?.(d.refresh_token)
+    await refreshViaOnlineApi(d)
     return
   }
 
@@ -45,9 +97,22 @@ export async function refreshToken(
     }).toString(),
   })
 
-  const data = await resp.json()
-  if (!data.refresh_token) {
-    throw new Error("Empty token")
+  // F-318：微软 OAuth 端点失败时返回 HTTP 400 + {error, error_description}
+  // （也可能是 HTML 错误页）。必须透出真正原因，而不是笼统的 "Empty token"。
+  const text = await resp.text()
+  let data: any = null
+  try {
+    data = text ? JSON.parse(text) : null
+  } catch {
+    data = null
+  }
+  if (!resp.ok || !data?.refresh_token) {
+    const detail = [data?.error, data?.error_description]
+      .filter(Boolean)
+      .join(": ")
+    const reason =
+      detail || (text ? text.slice(0, 500) : "") || "empty response"
+    throw new Error(`failed to refresh token (HTTP ${resp.status}): ${reason}`)
   }
   d.refresh_token = data.refresh_token
   d.accessToken = data.access_token
@@ -98,13 +163,18 @@ export async function requestApi<T>(
         res.status === 401) &&
       !noRetry
     ) {
-      await refreshToken(d)
+      await refreshTokenOnce(d)
       return requestApi(d, url, method, data, true)
     }
     throw new Error(errData?.message || `Request failed: ${res.status}`)
   }
-  if (res.status === 204) return undefined as unknown as T
-  return res.json() as Promise<T>
+  // 204 No Content / 202 Accepted 均为无响应体的成功响应：
+  // Graph 的 copy 返回 202 + 空 body（进度由 Location 头监控），
+  // 直接 res.json() 会抛 SyntaxError，导致复制成功却报失败。
+  if (res.status === 204 || res.status === 202) return undefined as unknown as T
+  const text = await res.text()
+  if (!text) return undefined as unknown as T
+  return JSON.parse(text) as T
 }
 
 function cleanSubPath(p: string): string {
@@ -182,6 +252,23 @@ export async function getFile(
   return requestApi<File>(d, url, "GET")
 }
 
+/**
+ * F-313：Graph 上传会话要求每个 byte range 必须是 320 KiB（327,680 字节）的
+ * 整数倍，否则大文件在最后一块提交时会报错。把配置的 MiB 值取整到最近的
+ * 320 KiB 倍数（至少 1 个单元），比直接乘以 1024*1024 更安全。
+ */
+export function alignChunkBytes(bytes: number): number {
+  const UNIT = 320 * 1024
+  const units = Math.max(1, Math.round(bytes / UNIT))
+  return units * UNIT
+}
+
+export function chunkSizeBytes(chunkSizeMb: number | string): number {
+  const mb = Number(chunkSizeMb)
+  const safeMb = Number.isFinite(mb) && mb > 0 ? mb : 5
+  return alignChunkBytes(safeMb * 1024 * 1024)
+}
+
 export function toAPIMetadata(
   modTime: Date | null,
   createTime: Date | null,
@@ -251,7 +338,7 @@ export async function getDirectUploadInfo(
   }
   return {
     UploadURL: uploadUrl,
-    ChunkSize: d.chunk_size * 1024 * 1024,
+    ChunkSize: chunkSizeBytes(d.chunk_size),
     Method: "PUT",
   }
 }

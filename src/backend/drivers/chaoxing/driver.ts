@@ -36,12 +36,14 @@ function fileToItem(f: ChaoXingFile): FileItem {
 
 export class DriverChaoXing implements StorageDriver {
   private client: ClientChaoXing
+  private addition: DriverChaoXingAddition
   private pathCache = new Map<string, string>()
 
   constructor(
     addition: DriverChaoXingAddition,
     persistCookie?: (cookie: string) => void | Promise<void>,
   ) {
+    this.addition = addition
     this.client = new ClientChaoXing(addition, persistCookie)
   }
 
@@ -60,53 +62,40 @@ export class DriverChaoXing implements StorageDriver {
     const rawName = parts[parts.length - 1] || "root"
     const parentPath = "/" + parts.slice(0, -1).join("/")
 
-    try {
-      const parentId = await this.pathToId(parentPath)
-      const files = await this.client.getFiles(parentId)
-      const target = files.find(
-        (f) => (f.content.folderName || f.content.name) === rawName,
-      )
-      if (target) {
-        const item = fileToItem(target)
-        if (!item.is_dir) {
-          const fileId = item.sign.split("$")[1] || ""
-          if (fileId) {
-            try {
-              const resp = await this.client.link(fileId)
-              item.raw_url = resp.download
-              item.raw_url_headers = this.client.downloadHeaders()
-            } catch {
-              item.raw_url_error = "[ChaoXing] failed to resolve download url"
-            }
+    // 父目录解析/列表请求的异常必须向上传播（让 op 层报 5xx），
+    // 只有「列表成功且确无该名字」才进入目录兜底/not found。
+    const parentId = await this.pathToId(parentPath)
+    const files = await this.client.getFiles(parentId)
+    const target = files.find(
+      (f) => (f.content.folderName || f.content.name) === rawName,
+    )
+    if (target) {
+      const item = fileToItem(target)
+      if (!item.is_dir) {
+        const fileId = item.sign.split("$")[1] || ""
+        if (fileId) {
+          try {
+            const resp = await this.client.link(fileId)
+            item.raw_url = resp.download
+            item.raw_url_headers = this.client.downloadHeaders()
+          } catch {
+            item.raw_url_error = "[ChaoXing] failed to resolve download url"
           }
         }
-        return item
       }
-    } catch {
-      // fall through to directory fallback
+      return item
     }
 
-    try {
-      const dirId = await this.pathToId(physicalPath)
-      return {
-        name: rawName,
-        size: 0,
-        is_dir: true,
-        modified: new Date().toISOString(),
-        sign: dirId,
-        type: 1,
-        raw_url: "",
-      }
-    } catch {
-      return {
-        name: rawName,
-        size: 0,
-        is_dir: false,
-        modified: new Date().toISOString(),
-        sign: "",
-        type: 0,
-        raw_url: "",
-      }
+    // 不是列表中的条目：确认是否为真实存在的目录，否则抛 not found。
+    const dirId = await this.pathToId(physicalPath)
+    return {
+      name: rawName,
+      size: 0,
+      is_dir: true,
+      modified: new Date().toISOString(),
+      sign: dirId,
+      type: 1,
+      raw_url: "",
     }
   }
 
@@ -143,13 +132,22 @@ export class DriverChaoXing implements StorageDriver {
 
   async move(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
     const entry = await this.resolveEntry(srcPhysical)
-    await this.client.move(entry.id, await this.pathToId(dstDir), entry.isDir)
+    // dstPhysical 是目标项自身的物理路径，目标目录取去掉末段后的父目录；
+    // 虚拟 dstDir 含挂载前缀，pathToId 只在物理根内解析，不能直接使用。
+    const dstParent =
+      "/" +
+      dstPhysical
+        .split("/")
+        .filter(Boolean)
+        .slice(0, -1)
+        .join("/")
+    await this.client.move(entry.id, await this.pathToId(dstParent), entry.isDir)
     this.pathCache.clear()
   }
 
@@ -185,14 +183,15 @@ export class DriverChaoXing implements StorageDriver {
     return { id: String(target.id), isDir: !!target.content.folderName }
   }
 
-  /** 物理路径 → 目录 ID（根目录返回 "-1"） */
+  /** 物理路径 → 目录 ID（根目录默认 "-1"，可通过 root_folder_id 覆盖） */
   private async pathToId(physicalPath: string): Promise<string> {
     const clean = physicalPath.split("/").filter(Boolean).join("/")
-    if (!clean) return "-1"
+    const rootId = this.addition.root_folder_id || "-1"
+    if (!clean) return rootId
     if (this.pathCache.has(clean)) return this.pathCache.get(clean)!
 
     const parts = clean.split("/")
-    let currentId = "-1"
+    let currentId = rootId
     for (let i = 0; i < parts.length; i++) {
       const files = await this.client.getFiles(currentId)
       const target = files.find((f) => f.content.folderName === parts[i])
@@ -200,7 +199,7 @@ export class DriverChaoXing implements StorageDriver {
         throw new Error(`[ChaoXing] Directory '${parts[i]}' not found`)
       }
       currentId = String(target.id)
-      const subPath = "/" + parts.slice(0, i + 1).join("/")
+      const subPath = parts.slice(0, i + 1).join("/")
       this.pathCache.set(subPath, currentId)
     }
     return currentId

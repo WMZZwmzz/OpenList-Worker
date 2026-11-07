@@ -4,6 +4,7 @@ import {
   StorageDriver,
 } from "../../internal/driver/base"
 import { sortFileItems } from "../../internal/driver/sort"
+import { randomHex } from "../rand"
 import {
   ThunderAddition,
   ThunderExpertAddition,
@@ -62,7 +63,8 @@ export function generateThunderDeviceId(addition?: any): string {
   if (seed.trim()) {
     return md5(seed)
   }
-  return md5(Math.random().toString(36) + Date.now().toString(36))
+  // S-04 同类清单：设备 id 随机段改用 CSPRNG（原 Math.random）。
+  return md5(randomHex(16) + Date.now().toString(36))
 }
 
 export class ThunderDriver implements StorageDriver {
@@ -70,6 +72,8 @@ export class ThunderDriver implements StorageDriver {
   protected addition: ThunderAddition | ThunderExpertAddition
   protected identity: string = ""
   protected onPersistCallback?: (tokens: any) => Promise<void> | void
+  /** 物理路径 → 迅雷服务端生成的文件/目录 ID（按名称链解析后缓存） */
+  private idCache = new Map<string, string>()
 
   constructor(
     addition: ThunderAddition,
@@ -139,25 +143,43 @@ export class ThunderDriver implements StorageDriver {
   async init(): Promise<void> {
     const username = this.addition.username || ""
     const password = this.addition.password || ""
-    const identity = md5(`${username}${password}`)
+    // F-280：identity 纳入持久化的 refresh_token，token 变化时才会重新初始化
+    const savedRefreshToken = (this.addition.refresh_token || "").trim()
+    const identity = md5(`${username}${password}${savedRefreshToken}`)
 
     if (this.identity !== identity || !(await this.client.isLogin())) {
       this.identity = identity
+      // F-280：优先复用 onPersistToken 持久化的 refresh_token（1 个请求），
+      // 失败再回落到完整的用户名/密码登录（3 个请求 + 风控暴露）。
+      if (savedRefreshToken) {
+        try {
+          await this.client.refreshToken(savedRefreshToken)
+          return
+        } catch {
+          // refresh_token 失效/被轮换：继续走账密登录
+        }
+      }
       await this.client.login(username, password)
     }
   }
 
-  protected resolveFolderId(physicalPath: string): string {
-    if (!physicalPath || physicalPath === "/" || physicalPath === "0") {
-      return this.addition.root_folder_id || ""
-    }
-    const parts = physicalPath.split("/").filter(Boolean)
-    return parts[parts.length - 1] || this.addition.root_folder_id || ""
+  private cleanPhysical(physicalPath: string): string {
+    return (
+      "/" +
+      String(physicalPath || "")
+        .split("/")
+        .filter(Boolean)
+        .join("/")
+    )
   }
 
-  async list(_virtualPath: string, physicalPath: string): Promise<FileItem[]> {
-    const folderId = this.resolveFolderId(physicalPath)
-    const items: FileItem[] = []
+  private get rootFolderId(): string {
+    return this.addition.root_folder_id || ""
+  }
+
+  /** 拉取某目录的全部分页子项（迅雷列表按 page_token 分页） */
+  private async listChildren(folderId: string): Promise<ThunderFile[]> {
+    const files: ThunderFile[] = []
     let pageToken = ""
 
     while (true) {
@@ -182,20 +204,95 @@ export class ThunderDriver implements StorageDriver {
         url.toString(),
         { method: "GET" },
       )
-
-      if (res.files && res.files.length > 0) {
-        for (const f of res.files) {
-          items.push(
-            thunderFileToFileItem(f, this.downloadUserAgent, this.useVideoUrl),
-          )
-        }
-      }
-
-      if (!res.next_page_token) {
-        break
-      }
+      if (res.files && res.files.length > 0) files.push(...res.files)
+      if (!res.next_page_token) break
       pageToken = res.next_page_token
     }
+    return files
+  }
+
+  private async findChild(
+    parentId: string,
+    rawName: string,
+    wantDir: boolean,
+  ): Promise<ThunderFile | null> {
+    let decodedName = rawName
+    try {
+      decodedName = decodeURIComponent(rawName)
+    } catch {}
+    const children = await this.listChildren(parentId)
+    const found = children.find(
+      (f) =>
+        (f.name === rawName || f.name === decodedName || f.id === rawName) &&
+        (wantDir ? f.kind === FOLDER : true),
+    )
+    return found || null
+  }
+
+  /**
+   * 物理路径 → 迅雷真实目录 ID（F-279）。
+   *
+   * physical 是「root_folder_path + 用户相对路径」的名称链（thunder 无
+   * root_folder_path，故就是相对路径），末段是名称而不是服务端 ID。
+   * 旧实现直接返回末段当 ID，导致除挂载根外所有操作把名称发给迅雷而失败。
+   * 这里从 root_folder_id 出发逐级按名称匹配换取真实 ID 并缓存。
+   */
+  protected async resolveFolderId(physicalPath: string): Promise<string> {
+    const clean = this.cleanPhysical(physicalPath)
+    if (clean === "/") return this.rootFolderId
+    const cached = this.idCache.get(clean)
+    if (cached) return cached
+
+    const segs = clean.split("/").filter(Boolean)
+    let parentId = this.rootFolderId
+    let curPath = ""
+    for (const seg of segs) {
+      curPath = `${curPath}/${seg}`
+      const hit = this.idCache.get(curPath)
+      if (hit) {
+        parentId = hit
+        continue
+      }
+      const child = await this.findChild(parentId, seg, true)
+      if (!child) throw new Error(`[Thunder] Directory not found: ${seg}`)
+      parentId = child.id
+      this.idCache.set(curPath, parentId)
+    }
+    return parentId
+  }
+
+  /** 解析任意条目（文件或目录）的真实 ID */
+  protected async resolveItemId(physicalPath: string): Promise<string> {
+    const clean = this.cleanPhysical(physicalPath)
+    if (clean === "/") return this.rootFolderId
+    const cached = this.idCache.get(clean)
+    if (cached) return cached
+
+    const segs = clean.split("/").filter(Boolean)
+    const name = segs[segs.length - 1]
+    const parentPath = "/" + segs.slice(0, -1).join("/")
+    const parentId = await this.resolveFolderId(parentPath)
+    const child = await this.findChild(parentId, name, false)
+    if (!child) throw new Error(`[Thunder] Item not found: ${name}`)
+    this.idCache.set(clean, child.id)
+    return child.id
+  }
+
+  private invalidateIdCache(): void {
+    this.idCache.clear()
+  }
+
+  async list(_virtualPath: string, physicalPath: string): Promise<FileItem[]> {
+    const folderId = await this.resolveFolderId(physicalPath)
+    const children = await this.listChildren(folderId)
+    const clean = this.cleanPhysical(physicalPath)
+    const items = children.map((f) => {
+      this.idCache.set(
+        clean === "/" ? `/${f.name}` : `${clean}/${f.name}`,
+        f.id,
+      )
+      return thunderFileToFileItem(f, this.downloadUserAgent, this.useVideoUrl)
+    })
 
     return sortFileItems(
       items,
@@ -205,7 +302,7 @@ export class ThunderDriver implements StorageDriver {
   }
 
   async get(_virtualPath: string, physicalPath: string): Promise<FileItem> {
-    const fileId = this.resolveFolderId(physicalPath)
+    const fileId = await this.resolveItemId(physicalPath)
     const url = new URL(`${FILE_API_URL}/${fileId}`)
     url.searchParams.set("space", this.addition.space || "")
 
@@ -219,7 +316,7 @@ export class ThunderDriver implements StorageDriver {
     const parts = physicalPath.split("/").filter(Boolean)
     const dirName = parts.pop() || "new_folder"
     const parentPath = "/" + parts.join("/")
-    const parentId = this.resolveFolderId(parentPath)
+    const parentId = await this.resolveFolderId(parentPath)
 
     await this.client.authRequest(FILE_API_URL, {
       method: "POST",
@@ -230,6 +327,7 @@ export class ThunderDriver implements StorageDriver {
         space: this.addition.space || "",
       },
     })
+    this.invalidateIdCache()
   }
 
   async rename(
@@ -237,7 +335,7 @@ export class ThunderDriver implements StorageDriver {
     physicalPath: string,
     newName: string,
   ): Promise<void> {
-    const fileId = this.resolveFolderId(physicalPath)
+    const fileId = await this.resolveItemId(physicalPath)
     await this.client.authRequest(`${FILE_API_URL}/${fileId}`, {
       method: "PATCH",
       body: {
@@ -245,6 +343,7 @@ export class ThunderDriver implements StorageDriver {
         space: this.addition.space || "",
       },
     })
+    this.invalidateIdCache()
   }
 
   async remove(
@@ -252,7 +351,7 @@ export class ThunderDriver implements StorageDriver {
     physicalPath: string,
     _names: string[],
   ): Promise<void> {
-    const fileId = this.resolveFolderId(physicalPath)
+    const fileId = await this.resolveItemId(physicalPath)
     const url = new URL(`${FILE_API_URL}/${fileId}/trash`)
     url.searchParams.set("space", this.addition.space || "")
 
@@ -260,17 +359,26 @@ export class ThunderDriver implements StorageDriver {
       method: "PATCH",
       body: {},
     })
+    this.invalidateIdCache()
   }
 
   async move(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhys: string,
-    _dstPhys: string,
+    dstPhys: string,
   ): Promise<void> {
-    const srcFileId = this.resolveFolderId(srcPhys)
-    const dstDirId = this.resolveFolderId(dstDir)
+    const srcFileId = await this.resolveItemId(srcPhys)
+    // dstDir 是站点虚拟路径；dstPhys 是目标条目自身的物理路径，取父目录
+    const dstParent =
+      "/" +
+      this.cleanPhysical(dstPhys)
+        .split("/")
+        .filter(Boolean)
+        .slice(0, -1)
+        .join("/")
+    const dstDirId = await this.resolveFolderId(dstParent)
 
     await this.client.authRequest(`${FILE_API_URL}:batchMove`, {
       method: "POST",
@@ -280,17 +388,25 @@ export class ThunderDriver implements StorageDriver {
         space: this.addition.space || "",
       },
     })
+    this.invalidateIdCache()
   }
 
   async copy(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhys: string,
-    _dstPhys: string,
+    dstPhys: string,
   ): Promise<void> {
-    const srcFileId = this.resolveFolderId(srcPhys)
-    const dstDirId = this.resolveFolderId(dstDir)
+    const srcFileId = await this.resolveItemId(srcPhys)
+    const dstParent =
+      "/" +
+      this.cleanPhysical(dstPhys)
+        .split("/")
+        .filter(Boolean)
+        .slice(0, -1)
+        .join("/")
+    const dstDirId = await this.resolveFolderId(dstParent)
 
     await this.client.authRequest(`${FILE_API_URL}:batchCopy`, {
       method: "POST",
@@ -300,6 +416,7 @@ export class ThunderDriver implements StorageDriver {
         space: this.addition.space || "",
       },
     })
+    this.invalidateIdCache()
   }
 
   async put(
@@ -310,8 +427,8 @@ export class ThunderDriver implements StorageDriver {
     const parts = physicalPath.split("/").filter(Boolean)
     const fileName = parts.pop() || "file"
     const parentPath = "/" + parts.join("/")
-    const parentId = this.resolveFolderId(parentPath)
-    const gcid = calcGcid(content)
+    const parentId = await this.resolveFolderId(parentPath)
+    const gcid = await calcGcid(content)
 
     const resp = await this.client.authRequest<ThunderUploadTaskResp>(
       FILE_API_URL,
@@ -356,6 +473,7 @@ export class ThunderDriver implements StorageDriver {
         )
       }
     }
+    this.invalidateIdCache()
   }
 }
 
@@ -436,6 +554,14 @@ export class ThunderExpertDriver extends ThunderDriver {
         await this.client.refreshToken(expAddition.refresh_token)
       } else if (expAddition.username && expAddition.password) {
         await this.client.login(expAddition.username, expAddition.password)
+      } else {
+        // F-285：凭据不满足所选 login_type 时必须显式报配置错误，
+        // 否则 init() 静默成功、失败被延迟到首次请求的 "empty token"。
+        throw new Error(
+          expAddition.login_type === "refresh_token"
+            ? "[Thunder] 登录方式为 refresh_token，但未配置 refresh_token（且缺少可回退的用户名/密码）"
+            : "[Thunder] 登录方式为账号密码，但用户名或密码为空",
+        )
       }
     }
   }

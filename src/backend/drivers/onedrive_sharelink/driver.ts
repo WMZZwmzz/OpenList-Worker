@@ -48,8 +48,6 @@ export class OnedriveSharelinkDriver implements StorageDriver {
 
   async get(virtualPath: string, physicalPath: string): Promise<FileItem> {
     const clean = this.cleanPath(physicalPath)
-    const name = clean.split("/").filter(Boolean).pop() || "root"
-
     if (clean === "/") {
       return {
         name: "root",
@@ -62,7 +60,14 @@ export class OnedriveSharelinkDriver implements StorageDriver {
       }
     }
 
-    const files = await this.client.getFiles("/")
+    // F-460：先列出父目录再按名匹配（getFiles 已支持按 folderPath 列子目录）。
+    // 之前对任何嵌套路径都只列分享根目录，导致嵌套文件报不存在，
+    // 或命中根目录下同名的另一个文件。
+    const parts = clean.split("/").filter(Boolean)
+    const name = parts.pop() || "root"
+    const parent = parts.length ? "/" + parts.join("/") : "/"
+
+    const files = await this.client.getFiles(parent)
     const found = files.find((f) => f.name === name)
     if (!found) {
       throw new Error(`File not found: ${clean}`)

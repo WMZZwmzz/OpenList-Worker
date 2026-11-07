@@ -376,7 +376,10 @@ export class InMemoryAuditLogStorage implements AuditLogStorage {
   }
 
   async query(filters: AuditLogQueryFilters): Promise<AuditLogEntry[]> {
-    let results = this.logs
+    // F-065: 无过滤条件时这里曾直接持有内部数组引用，末尾的 sort() 会**原地**
+    // 把 this.logs 重排成「最新在前」，随后 write() 的 shift() 淘汰的就成了
+    // 最新条目。始终复制一份再排序，保证 write 的淘汰顺序始终是时间上最旧。
+    let results = [...this.logs]
 
     // 过滤
     if (filters.start_time) {

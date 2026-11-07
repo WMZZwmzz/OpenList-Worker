@@ -36,6 +36,7 @@ export class ClientKodbox {
   private async request(
     endpoint: string,
     formData: Record<string, string>,
+    retried = false,
   ): Promise<KodboxCommonResp> {
     const form = new URLSearchParams({ accessToken: this.authorization, ...formData })
     const resp = await fetch(`${this.address}${endpoint}`, {
@@ -45,10 +46,14 @@ export class ClientKodbox {
       redirect: "follow",
     })
     const data: KodboxCommonResp = await resp.json().catch(() => ({ code: false }))
-    // token 过期：code === "10001" 时重新登录重试一次
+    // token 过期：code === "10001" 时重新登录重试一次（F-470：重试带上
+    // retried=true，服务端持续返回 10001 时不再无限递归）。
     if (data.code === "10001") {
+      if (retried) {
+        throw new Error("[KodBox] token invalid after re-login (code 10001)")
+      }
       await this.getToken()
-      return this.request(endpoint, formData)
+      return this.request(endpoint, formData, true)
     }
     if (data.code === false) {
       throw new Error(`[KodBox] ${data.data || "request failed"}`)

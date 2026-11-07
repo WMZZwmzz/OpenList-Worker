@@ -47,45 +47,35 @@ export class DriverQuarkUcTv implements StorageDriver {
     const parts = physicalPath.split("/").filter(Boolean)
     const rawName = parts[parts.length - 1] || "root"
     const parentPath = "/" + parts.slice(0, -1).join("/")
-    try {
-      const parentId = await this.resolveDirId(parentPath)
-      const files = await this.client.getFiles(parentId)
-      const file = files.find((f) => f.filename === rawName)
-      if (file) {
-        const item = this.fileToItem(file)
-        if (!item.is_dir) {
-          try {
-            item.raw_url = await this.client.getDownloadUrl(file.fid)
-          } catch (e: any) {
-            item.raw_url_error = e.message
-          }
-        }
-        return item
-      }
-    } catch {}
 
-    // Fallback: 目录
-    try {
-      await this.resolveDirId(physicalPath)
-      return {
-        name: rawName,
-        size: 0,
-        is_dir: true,
-        modified: new Date().toISOString(),
-        sign: "",
-        type: 1,
-        raw_url: "",
+    // F-424：父目录解析/列表请求的异常（网络、鉴权、限流）必须向上传播，
+    // 不得与「条目不存在」共用同一吞异常分支。
+    const parentId = await this.resolveDirId(parentPath)
+    const files = await this.client.getFiles(parentId)
+    const file = files.find((f) => f.filename === rawName)
+    if (file) {
+      const item = this.fileToItem(file)
+      if (!item.is_dir) {
+        try {
+          item.raw_url = await this.client.getDownloadUrl(file.fid)
+        } catch (e: any) {
+          item.raw_url_error = e.message
+        }
       }
-    } catch {
-      return {
-        name: rawName,
-        size: 0,
-        is_dir: false,
-        modified: new Date().toISOString(),
-        sign: "",
-        type: 0,
-        raw_url: "",
-      }
+      return item
+    }
+
+    // 不是文件：确认是否为真实存在的目录，否则抛 not found，
+    // 不再伪造 is_dir:false 的幻影条目。
+    await this.resolveDirId(physicalPath)
+    return {
+      name: rawName,
+      size: 0,
+      is_dir: true,
+      modified: new Date().toISOString(),
+      sign: "",
+      type: 1,
+      raw_url: "",
     }
   }
 

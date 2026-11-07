@@ -62,8 +62,11 @@ export class ClientDegoo {
       const payload = JSON.parse(
         atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")),
       )
-      const exp = Number(payload.exp) * 1000
-      return Date.now() + 5 * 60 * 1000 > exp
+      // F-419：exp 缺失或非数字时 Number(...) 为 NaN，`Date.now() > NaN`
+      // 恒为 false，坏 token 会被当成「未过期」。解析不出有效 exp 即视为过期。
+      const exp = Number(payload.exp)
+      if (!Number.isFinite(exp)) return true
+      return Date.now() + 5 * 60 * 1000 > exp * 1000
     } catch {
       return true
     }
@@ -126,6 +129,7 @@ export class ClientDegoo {
     operationName: string,
     query: string,
     variables: Record<string, unknown>,
+    attempts = 0,
   ): Promise<any> {
     await this.ensureValidToken()
     if (variables.Token !== undefined) {
@@ -144,9 +148,19 @@ export class ClientDegoo {
     if (data.errors && data.errors.length > 0) {
       const err = data.errors[0]
       if (err.errorType === "Unauthorized") {
+        // F-416：以前这里无条件递归重试，没有次数上限——当 login() 修不了
+        // 根因（x-api-key 失效、账号被停用）时会无限递归持续打上游。
+        // 现在只允许重试一次；没有可用的用户名/密码时直接抛原始错误，
+        // 不再用 undefined 凭据去调登录接口掩盖真实原因。
+        if (attempts >= 1) {
+          throw new Error(`[Degoo] GraphQL error: ${err.message}`)
+        }
+        if (!this.addition.username || !this.addition.password) {
+          throw new Error(`[Degoo] GraphQL error: ${err.message}`)
+        }
         await this.login()
         variables.Token = this.accessToken
-        return this.apiCall(operationName, query, variables)
+        return this.apiCall(operationName, query, variables, attempts + 1)
       }
       throw new Error(`[Degoo] GraphQL error: ${err.message}`)
     }

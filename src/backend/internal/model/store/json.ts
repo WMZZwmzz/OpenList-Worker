@@ -60,10 +60,23 @@ function installRespSafetyNet() {
         "[KV/RESP] Caught uncaught exception from storage binding, continuing:",
         err.message,
       )
-      // Do NOT re-throw — let the function instance survive.
+      // 只吞这一个已知类别的异常：它是存储绑定 RESP 解析器的兼容性问题，
+      // 重抛会让整个实例随每次 KV 访问崩溃。
       // Subsequent requests will fall back to memoryDb.
+      return
     }
-    // All other errors: let Node.js default handler process them.
+    // F-079：其余错误必须恢复 Node 的**默认崩溃行为**。
+    //
+    // Node 的语义是：只要注册了任意 uncaughtException 监听器，默认的「打印堆栈
+    // 并退出」就对所有未捕获异常被整体禁用 —— 监听器不主动终止进程，进程就会
+    // 带着可能已损坏的状态继续服务，且**连日志都没有**。历史注释声称「交给默认
+    // 处理器」，但它根本不会被调用。
+    //
+    // 在下一个 tick 重新抛出：既走回默认崩溃路径（打印 + 退出码 1），又不会
+    // 与当前监听器形成递归。
+    setImmediate(() => {
+      throw err
+    })
   })
 }
 
@@ -379,6 +392,12 @@ export async function getKvBinding(envCtx?: any): Promise<{
 async function readFromKv(
   kvInfo: Awaited<ReturnType<typeof getKvBinding>>,
   key = "openlist_config",
+  /**
+   * F-080：默认 `throwOnError=false` 保持「读失败按无数据」的旧行为（业务读取
+   * 不应该因为一次瞬时故障抛给用户）。诊断路径（getKvStatus）必须传 true，
+   * 才能区分「键不存在」与「读取失败（401 / 网络 / 解析）」。
+   */
+  opts: { throwOnError?: boolean } = {},
 ): Promise<any | null> {
   const { binding, mode } = kvInfo
   if (mode === "none" || !binding) return null
@@ -398,7 +417,13 @@ async function readFromKv(
       try {
         // Cloudflare KV 支持 (key, "text")，EdgeOne KV 支持 (key)
         val = await binding.get(key, "text")
-      } catch {
+      } catch (err) {
+        // 只有「签名不兼容」才回退第二种签名；真实读取故障必须原样抛出，
+        // 否则诊断接口会把 401/网络故障当成「键不存在」（F-080）。
+        const msg = String((err as any)?.message || "")
+        const isSignatureError =
+          err instanceof TypeError || /not a function/i.test(msg)
+        if (!isSignatureError) throw err
         val = await binding.get(key)
       }
       if (val === undefined || val === null) {
@@ -416,9 +441,13 @@ async function readFromKv(
         const text = await res.text()
         return JSON.parse(text)
       }
+      if (res.status !== 404) {
+        throw new Error(`KV REST read failed: HTTP ${res.status}`)
+      }
     }
   } catch (err) {
     console.error("[KV/Blob Store] Error reading key:", key, err)
+    if (opts.throwOnError) throw err
   }
   return null
 }
@@ -499,7 +528,13 @@ export async function getKvStatus(envCtx?: any) {
 
   if (isConfigured) {
     try {
-      const testVal = await readFromKv(kvInfo, "openlist_config")
+      // F-080：历史实现无条件 `connected = true`（readFromKv 把一切读错误吞成
+      // null，这里的 catch 是死代码），于是 401 / 网络故障时 /admin/kv/status
+      // 与 /healthz 仍报「已连接、无数据」，把「密钥不对」伪装成「空库」。
+      // 现在要求探测真实抛错才算失败，只有确证读取成功才置 connected。
+      const testVal = await readFromKv(kvInfo, "openlist_config", {
+        throwOnError: true,
+      })
       connected = true
       return {
         configured: true,
@@ -510,7 +545,8 @@ export async function getKvStatus(envCtx?: any) {
         error: null,
       }
     } catch (err: any) {
-      error = err.message || String(err)
+      error = err?.message || String(err)
+      connected = false
     }
   }
 

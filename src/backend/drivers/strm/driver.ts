@@ -125,15 +125,36 @@ export class StrmDriver implements StorageDriver {
       .join("/")
   }
 
-  private getLink(path: string): string {
+  private async getLink(path: string): Promise<string> {
     let finalPath = path
     if (this.addition.encodePath) finalPath = this.encodePath(path)
     const prefix = this.addition.PathPrefix || "/d"
     finalPath = joinPath(prefix, finalPath)
     if (!finalPath.startsWith("/")) finalPath = "/" + finalPath
-    if (this.addition.withoutUrl) return finalPath
+    if (this.addition.withoutUrl && !this.addition.withSign) return finalPath
     const apiUrl = (this.addition.siteUrl || "").replace(/\/+$/, "")
-    return `${apiUrl}${finalPath}`
+    let url = `${apiUrl}${finalPath}`
+    if (this.addition.withSign) {
+      // F-472：withSign 在管理界面可配置但驱动从未读取，开了全站下载签名
+      // （sign_all / link_expiration / 密码 / read_users / enable_sign）的部署
+      // 里每条 .strm 链接都会被 /d 的验签拦成 401。这里用同一套 HMAC
+      // （pkg/sign，与 raw.ts 共用密钥）为虚拟路径签发 sign 并拼到链接上。
+      //
+      // 签发与验签必须派生自同一把密钥：验签侧（raw.ts → verifyDownloadSign(c,
+      // ...)）的密钥来自请求的 env（env.JWT_SECRET / 持久化密钥），而驱动签名里
+      // 没有 c。传 {} 时 getJwtSecret({}) 会退到 process.env——部署若未配置
+      // JWT_SECRET 环境变量（密钥存 KV/D1），这里会各生成一把随机会话密钥，
+      // 签出来的 sign 验签永远失败。借 setEnvCtx 注入的请求级 env（与
+      // getDb() 无参调用同源，r2 驱动取绑定同款通道）保证两边一致；
+      // 取不到 env（单测 / 非 Workers）时为 null，回退行为与传 {} 相同。
+      const { getEnvCtx } = await import("../../internal/model/db")
+      const { getSignPolicy, signDownloadPath } = await import("../../pkg/sign")
+      const ctx = { env: getEnvCtx() }
+      const policy = await getSignPolicy(ctx)
+      const sign = await signDownloadPath(ctx, path, policy.expiresIn)
+      url += `${url.includes("?") ? "&" : "?"}sign=${encodeURIComponent(sign)}`
+    }
+    return url
   }
 
   private ext(name: string): string {
@@ -152,7 +173,10 @@ export class StrmDriver implements StorageDriver {
     }
   }
 
-  private convert(reqPath: string, items: FileItem[]): FileItem[] {
+  private async convert(
+    reqPath: string,
+    items: FileItem[],
+  ): Promise<FileItem[]> {
     const result: FileItem[] = []
     for (const item of items) {
       if (item.is_dir) {
@@ -165,9 +189,10 @@ export class StrmDriver implements StorageDriver {
         result.push({ ...item, size: item.size })
       } else if (this.supportSuffix.has(e)) {
         const strmName = item.name.replace(/\.[^.]+$/, "") + ".strm"
+        const link = await this.getLink(originalPath)
         result.push({
           name: strmName,
-          size: new TextEncoder().encode(this.getLink(originalPath)).length,
+          size: new TextEncoder().encode(link).length,
           is_dir: false,
           modified: item.modified,
           sign: originalPath, // 保存原始路径，供 get/createReadStream 还原
@@ -217,7 +242,7 @@ export class StrmDriver implements StorageDriver {
       if (!remote) continue
       const reqPath = joinPath(dst, sub)
       const items = await this.listRemote(dst, sub)
-      for (const converted of this.convert(reqPath, items)) {
+      for (const converted of await this.convert(reqPath, items)) {
         if (!seen.has(converted.name)) {
           seen.add(converted.name)
           merged.push(converted)
@@ -285,7 +310,7 @@ export class StrmDriver implements StorageDriver {
     const items = await this.list("", dir)
     const item = items.find((i) => i.name === name)
     if (!item || !item.sign) throw new Error(`[Strm] not found: ${path}`)
-    const link = this.getLink(item.sign)
+    const link = await this.getLink(item.sign)
     const bytes = new TextEncoder().encode(link)
     return new ReadableStream<Uint8Array>({
       start(controller) {

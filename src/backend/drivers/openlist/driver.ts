@@ -6,6 +6,14 @@ import {
 import { DriverOpenlistAddition } from "./types"
 import { ClientOpenlist } from "./util"
 
+/** 物理路径的父目录（根为 "/"），F-467 */
+export function parentPath(physicalPath: string): string {
+  const parts = String(physicalPath || "")
+    .split("/")
+    .filter(Boolean)
+  return parts.length > 1 ? "/" + parts.slice(0, -1).join("/") : "/"
+}
+
 export class DriverOpenlist implements StorageDriver {
   private client: ClientOpenlist
 
@@ -95,23 +103,34 @@ export class DriverOpenlist implements StorageDriver {
   }
 
   async move(
-    srcDir: string,
-    dstDir: string,
+    _srcDir: string,
+    _dstDir: string,
     names: string[],
-    _srcPhysical: string,
-    _dstPhysical: string,
+    srcPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
-    await this.client.move(srcDir, dstDir, names)
+    // F-467：对端实例只认识自己的路径命名空间；这里必须发物理路径
+    // （虚拟路径带挂载前缀，会在对端指向不存在的目录或另一个对象）。
+    await this.client.move(
+      parentPath(srcPhysical),
+      parentPath(dstPhysical),
+      names,
+    )
   }
 
   async copy(
-    srcDir: string,
-    dstDir: string,
+    _srcDir: string,
+    _dstDir: string,
     names: string[],
-    _srcPhysical: string,
-    _dstPhysical: string,
+    srcPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
-    await this.client.copy(srcDir, dstDir, names)
+    // F-467：同 move，两端都用物理路径。
+    await this.client.copy(
+      parentPath(srcPhysical),
+      parentPath(dstPhysical),
+      names,
+    )
   }
 
   async put(

@@ -11,6 +11,7 @@ import { search } from "../internal/op/search"
 import { checkAdminAuth } from "../pkg/utils"
 import { safeErrorMessage } from "../pkg/errs"
 import { assertSafeUrl } from "../pkg/http"
+import { canonicalVirtualPath } from "../pkg/path"
 import { validateHide } from "../pkg/meta"
 import {
   PROXY_RANGE_DRIVERS,
@@ -26,6 +27,8 @@ import {
   getCacheRuntimeStatus,
   type CacheKind,
 } from "../internal/cache"
+import { getAuditLogger } from "../pkg/audit"
+import { getUserFromContext } from "./middlewares"
 
 export const adminRouter = new Hono()
 
@@ -46,16 +49,18 @@ function generateSecureToken(length = 32): string {
   const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
   const bytes = new Uint8Array(length)
   if (
-    typeof crypto !== "undefined" &&
-    typeof crypto.getRandomValues === "function"
+    typeof crypto === "undefined" ||
+    typeof crypto.getRandomValues !== "function"
   ) {
-    crypto.getRandomValues(bytes)
-  } else {
-    // 极端兜底（几乎不会走到）：混入时间戳降低可预测性
-    for (let i = 0; i < length; i++) {
-      bytes[i] = ((Math.random() * 256) | 0) ^ (Date.now() & 0xff)
-    }
+    // L-10（2026-10-30 审查）：本函数用于轮换下载签名密钥等安全凭据，
+    // Math.random（xorshift128+）兜底会产出可预测密钥。所有受支持运行时
+    // （Workers / Node 18+ / ESA）都提供 Web Crypto，缺失即是运行环境异常，
+    // 直接 fail-closed 抛错，绝不降级为可预测随机源。
+    throw new Error(
+      "generateSecureToken: crypto.getRandomValues unavailable — refusing to derive security tokens from a non-CSPRNG source",
+    )
   }
+  crypto.getRandomValues(bytes)
   let res = ""
   for (let i = 0; i < length; i++) {
     res += chars.charAt(bytes[i] % chars.length)
@@ -227,18 +232,43 @@ const ensureStorageAdditionDeviceId = (
         typeof addition.device_id !== "string" ||
         addition.device_id.trim().length !== 32
       ) {
-        const rand32 =
-          typeof crypto !== "undefined" &&
-          typeof crypto.randomUUID === "function"
-            ? crypto.randomUUID().replace(/-/g, "")
-            : Math.random().toString(16).substring(2).padEnd(16, "0") +
-              Math.random().toString(16).substring(2).padEnd(16, "0")
+        // L-10 同源：设备标识用 CSPRNG（Web Crypto 在所有受支持运行时可用）。
+        const rand32 = crypto.randomUUID().replace(/-/g, "")
         addition.device_id = rand32.slice(0, 32)
         return JSON.stringify(addition)
       }
     } catch {}
   }
   return additionStr
+}
+
+/**
+ * 管理端存储 id 解析（F-004）。
+ *
+ * 历史缺陷：`parseInt(query || "0")` 把缺失参数得成 0、非数字得成 NaN，
+ * delete/enable/disable 无命中后仍然返回 200 success；update 用严格相等比较
+ * `s.id === body.id`，字符串 "5" 与数字 5 失配也静默成功。
+ * 这里统一把 number / 十进制字符串解析成非负整数，解析失败返回 null（→400）。
+ */
+function parseStorageId(value: unknown): number | null {
+  if (typeof value === "number") {
+    return Number.isSafeInteger(value) && value >= 0 ? value : null
+  }
+  const raw = String(value ?? "").trim()
+  if (!/^\d+$/.test(raw)) return null
+  const id = Number(raw)
+  return Number.isSafeInteger(id) ? id : null
+}
+
+/** 与 create/update 相同的挂载点规范化（"a/b/" → "/a/b"，空 → "/"）。 */
+function normalizeMountPath(value: unknown): string {
+  return (
+    "/" +
+    String(value || "")
+      .split("/")
+      .filter(Boolean)
+      .join("/")
+  )
 }
 
 adminRouter.post("/storage/create", async (c) => {
@@ -262,22 +292,21 @@ adminRouter.post("/storage/create", async (c) => {
     )
   }
 
+  // F-008：先归一化驱动名，再用归一化后的键查 default_mount_path。
+  // normalizeDriver 支持小写/别名（"webdav" → "WebDav"），拿原始 body.driver
+  // 去查 driverConfigs 会落空，空 mount_path 最终被算成 "/"，静默挂到根路径
+  // 并接管整站路径——正是下面注释要避免的结果。
+  const normalizedDriver = normalizeDriver(body.driver)
   // mount_path 为空时用驱动配置的 default_mount_path 兜底，
   // 避免空路径被规范化成 "/" 而与根挂载冲突
   let rawMount = body.mount_path
   if (!rawMount || String(rawMount).trim() === "") {
-    const fallbackMount =
-      driverConfigs[body.driver as string]?.default_mount_path
+    const fallbackMount = driverConfigs[normalizedDriver]?.default_mount_path
     if (fallbackMount) {
       rawMount = fallbackMount
     }
   }
-  const mountPath =
-    "/" +
-    String(rawMount || "")
-      .split("/")
-      .filter(Boolean)
-      .join("/")
+  const mountPath = normalizeMountPath(rawMount)
   if (
     db.storages.some(
       (s: any) =>
@@ -293,12 +322,10 @@ adminRouter.post("/storage/create", async (c) => {
     })
   }
 
-  const normalizedDriver = normalizeDriver(body.driver)
   const newAddition = ensureStorageAdditionDeviceId(
     normalizedDriver,
     body.addition || "{}",
   )
-
   const newStorage = {
     ...body,
     driver: normalizedDriver,
@@ -371,44 +398,57 @@ adminRouter.post("/storage/update", async (c) => {
   const body = await c.req.json().catch(() => ({}))
   const db = await getDb(c.env)
 
-  // 与 create 保持一致：空路径用 default_mount_path 兜底
+  // F-004：id 必须能被解析成整数（接受数字与十进制数字串），且必须命中
+  // 已存在的存储；否则明确 400 / 404，不再静默返回 200 success。
+  const requestedId = parseStorageId(body.id)
+  if (requestedId === null) {
+    return c.json({ code: 400, message: "invalid storage id", data: null }, 400)
+  }
+  const idx = db.storages.findIndex((s: any) => s.id === requestedId)
+  if (idx === -1) {
+    return c.json({ code: 404, message: "storage not found", data: null }, 404)
+  }
+
+  // 与 create 保持一致：空路径用 default_mount_path 兜底。
+  // F-008：兜底查找用归一化后的请求驱动名（支持小写/别名）。
+  const requestedDriver = body.driver
+    ? normalizeDriver(String(body.driver))
+    : ""
   let rawMount = body.mount_path
   if (!rawMount || String(rawMount).trim() === "") {
-    const fallbackMount =
-      driverConfigs[body.driver as string]?.default_mount_path
+    const fallbackMount = requestedDriver
+      ? driverConfigs[requestedDriver]?.default_mount_path
+      : undefined
     if (fallbackMount) {
       rawMount = fallbackMount
     }
   }
   const mountPath =
     String(rawMount || "").trim() !== ""
-      ? "/" +
-        String(rawMount || "")
-          .split("/")
-          .filter(Boolean)
-          .join("/")
+      ? normalizeMountPath(rawMount)
       : undefined
 
   if (mountPath) {
     if (
       db.storages.some(
         (s: any) =>
-          s.id !== body.id &&
+          s.id !== requestedId &&
           !s.disabled &&
-          "/" + (s.mount_path || "").split("/").filter(Boolean).join("/") ===
-            mountPath,
+          normalizeMountPath(s.mount_path) === mountPath,
       )
     ) {
-      return c.json({
-        code: 400,
-        message: `mount path already exists: ${mountPath}`,
-        data: null,
-      })
+      return c.json(
+        {
+          code: 400,
+          message: `mount path already exists: ${mountPath}`,
+          data: null,
+        },
+        400,
+      )
     }
   }
 
-  const idx = db.storages.findIndex((s: any) => s.id === body.id)
-  if (idx !== -1) {
+  {
     const rawDriver = body.driver || db.storages[idx].driver
     const normalizedDriver = normalizeDriver(rawDriver)
     const updatedAddition = ensureStorageAdditionDeviceId(
@@ -459,8 +499,15 @@ adminRouter.post("/storage/update", async (c) => {
 })
 
 adminRouter.post("/storage/delete", async (c) => {
-  const id = parseInt(c.req.query("id") || "0", 10)
+  // F-004：缺失/非数字 id 回 400，未命中回 404（此前一律 200 success）。
+  const id = parseStorageId(c.req.query("id"))
+  if (id === null) {
+    return c.json({ code: 400, message: "invalid storage id", data: null }, 400)
+  }
   const db = await getDb(c.env)
+  if (!db.storages.some((s: any) => s.id === id)) {
+    return c.json({ code: 404, message: "storage not found", data: null }, 404)
+  }
   db.storages = db.storages.filter((s: any) => s.id !== id)
   await saveDb(db, c.env)
   // 存储已删除：其文件树 / 下载链接缓存必须一并清理，否则 id 复用时
@@ -470,49 +517,92 @@ adminRouter.post("/storage/delete", async (c) => {
 })
 
 adminRouter.post("/storage/enable", async (c) => {
-  const id = parseInt(c.req.query("id") || "0", 10)
+  const id = parseStorageId(c.req.query("id"))
+  if (id === null) {
+    return c.json({ code: 400, message: "invalid storage id", data: null }, 400)
+  }
   const db = await getDb(c.env)
   const s = db.storages.find((s: any) => s.id === id)
-  if (s) {
-    s.disabled = false
-    s.modified = new Date().toISOString()
-    await saveDb(db, c.env)
-    await clearStorageCache(id, c.env)
-    // 异步初始化驱动（不阻塞响应）：启用多个云盘时立即返回，
-    // 初始化完成后更新状态；失败时把错误写入 status，下次访问或
-    // 重新加载时会再次尝试。
-    ;(async () => {
-      try {
-        await getDriver(s.driver, s)
-        const db2 = await getDb(c.env)
-        const st = db2.storages.find((x: any) => x.id === id)
-        if (st && !st.disabled) {
-          st.status = "work"
-          st.modified = new Date().toISOString()
-          await saveDb(db2, c.env)
-        }
-      } catch (e: any) {
-        const db3 = await getDb(c.env)
-        const st = db3.storages.find((x: any) => x.id === id)
-        if (st && !st.disabled) {
-          st.status = e.message || String(e)
-          await saveDb(db3, c.env)
-        }
-      }
-    })()
+  if (!s) {
+    return c.json({ code: 404, message: "storage not found", data: null }, 404)
   }
+  // F-005：create/update 的挂载点查重会跳过 disabled 存储，而 enable 之前从不
+  // 复查，于是「禁用 A(/x) → 创建 B(/x) → 重新启用 A」会留下两个已启用的同
+  // 挂载点存储（后者的内容在该路径静默不可达）。启用前必须复查冲突。
+  const mountPath = normalizeMountPath(s.mount_path)
+  const conflict = db.storages.find(
+    (other: any) =>
+      other.id !== s.id &&
+      !other.disabled &&
+      normalizeMountPath(other.mount_path) === mountPath,
+  )
+  if (conflict) {
+    return c.json(
+      {
+        code: 400,
+        message: `mount path already exists: ${mountPath}`,
+        data: null,
+      },
+      400,
+    )
+  }
+  s.disabled = false
+  s.modified = new Date().toISOString()
+  await saveDb(db, c.env)
+  await clearStorageCache(id, c.env)
+  // 异步初始化驱动（不阻塞响应）：启用多个云盘时立即返回，
+  // 初始化完成后更新状态；失败时把错误写入 status，下次访问或
+  // 重新加载时会再次尝试。
+  //
+  // F-003：裸 async IIFE 在 Workers 上不会被调度（handler 返回后未登记的
+  // Promise 会被取消），必须走 executionCtx.waitUntil；运行时没有
+  // executionCtx（Node/测试）时退化为内联 await，语义不变。
+  const initTask = (async () => {
+    try {
+      await getDriver(s.driver, s)
+      const db2 = await getDb(c.env)
+      const st = db2.storages.find((x: any) => x.id === id)
+      if (st && !st.disabled) {
+        st.status = "work"
+        st.modified = new Date().toISOString()
+        await saveDb(db2, c.env)
+      }
+    } catch (e: any) {
+      const db3 = await getDb(c.env)
+      const st = db3.storages.find((x: any) => x.id === id)
+      if (st && !st.disabled) {
+        st.status = e.message || String(e)
+        await saveDb(db3, c.env)
+      }
+    }
+  })()
+  let scheduled = false
+  try {
+    const executionCtx = c.executionCtx
+    if (executionCtx && typeof executionCtx.waitUntil === "function") {
+      executionCtx.waitUntil(initTask)
+      scheduled = true
+    }
+  } catch {
+    // executionCtx 可能是访问即抛错的对象：按不可用处理
+  }
+  if (!scheduled) await initTask
   return c.json({ code: 200, message: "success", data: null })
 })
 
 adminRouter.post("/storage/disable", async (c) => {
-  const id = parseInt(c.req.query("id") || "0", 10)
+  const id = parseStorageId(c.req.query("id"))
+  if (id === null) {
+    return c.json({ code: 400, message: "invalid storage id", data: null }, 400)
+  }
   const db = await getDb(c.env)
   const s = db.storages.find((s: any) => s.id === id)
-  if (s) {
-    s.disabled = true
-    await saveDb(db, c.env)
-    await clearStorageCache(id, c.env)
+  if (!s) {
+    return c.json({ code: 404, message: "storage not found", data: null }, 404)
   }
+  s.disabled = true
+  await saveDb(db, c.env)
+  await clearStorageCache(id, c.env)
   return c.json({ code: 200, message: "success", data: null })
 })
 
@@ -571,6 +661,13 @@ adminRouter.get("/driver/names", (c) => {
       "ProtonDrive",
       "GitHub Releases",
       "CNB Releases",
+      // F-007：以下驱动在 driverConfigs 与 internal/op/storage.ts 中都已有
+      // 真实实现，却漏在本手工名单里，按 names 枚举的前端存储列表看不到它们。
+      "CtFile",
+      "Cloudflare R2",
+      "WeiYun",
+      "SFTP",
+      "FTP",
     ],
   })
 })
@@ -4720,6 +4817,25 @@ adminRouter.get("/driver/info", (c) => {
   })
 })
 
+// L-2（安全审计报告）：/setting/list 不再把纯凭据类设置明文回给前端。
+// 这些 key 在列表响应中以固定占位符出现；真实值仅能通过 /setting/reveal
+// （同为管理员鉴权）单独获取。api_token 除外——它是管理员需要复制使用的
+// API 凭据，打码会让设置页失去唯一读取途径。
+const SETTING_SECRET_MASK = "••••••••"
+const MASKED_SETTING_KEYS = new Set([
+  "sso_client_secret",
+  "download_sign_secret",
+  "ldap_bind_password",
+])
+
+function maskSettingsForList(settings: any[]): any[] {
+  return (settings || []).map((s: any) =>
+    s && MASKED_SETTING_KEYS.has(s.key) && s.value
+      ? { ...s, value: SETTING_SECRET_MASK, __masked: true }
+      : s,
+  )
+}
+
 adminRouter.get("/setting/list", async (c) => {
   const db = await getDb(c.env)
   const groupQuery = c.req.query("group")
@@ -4735,7 +4851,30 @@ adminRouter.get("/setting/list", async (c) => {
     settings = settings.filter((s: any) => groupNums.includes(s.group))
   }
 
-  return c.json({ code: 200, message: "success", data: settings })
+  return c.json({ code: 200, message: "success", data: maskSettingsForList(settings) })
+})
+
+// POST /api/admin/setting/reveal —— 按需单独取回被打码的设置原值
+// （L-2 的「编辑时单独取」）。与 /setting/list 同在 adminAuthMiddleware 之后。
+adminRouter.post("/setting/reveal", async (c) => {
+  const body = await c.req.json().catch(() => ({}))
+  const key = typeof body?.key === "string" ? body.key : ""
+  if (!key) {
+    return c.json({ code: 400, message: "key is required", data: null }, 400)
+  }
+  if (!MASKED_SETTING_KEYS.has(key)) {
+    return c.json(
+      { code: 400, message: "key is not a masked setting", data: null },
+      400,
+    )
+  }
+  const db = await getDb(c.env)
+  const found = (db.settings || []).find((s: any) => s.key === key)
+  return c.json({
+    code: 200,
+    message: "success",
+    data: { key, value: found?.value ?? "" },
+  })
 })
 
 adminRouter.post("/setting/save", async (c) => {
@@ -4757,6 +4896,16 @@ adminRouter.post("/setting/save", async (c) => {
     let value = item.value
     if (value !== null && typeof value === "object") {
       value = JSON.stringify(value)
+    }
+
+    // L-2：前端拿着打码后的列表回存时，占位符不得覆盖真实凭据——
+    // 值等于掩码且库中已有非空值时跳过该 key。
+    if (
+      typeof key === "string" &&
+      MASKED_SETTING_KEYS.has(key) &&
+      value === SETTING_SECRET_MASK
+    ) {
+      continue
     }
 
     const idx = db.settings.findIndex((s: any) => s.key === key)
@@ -4948,12 +5097,10 @@ adminRouter.post("/meta/create", async (c) => {
   const db = await getDb(c.env)
   if (!db.metas) db.metas = []
 
-  const path =
-    "/" +
-    String(body.path || "")
-      .split("/")
-      .filter(Boolean)
-      .join("/")
+  // audit-L-3：meta.path 用 canonicalVirtualPath 规范化（折叠 `..`、多重解码
+  // 段折叠等，与实际路径判定同源）——旧实现仅 split/filter，`/..` 会被
+  // canonicalVirtualPath 折叠成 `/`，等于给全站加密码（管理员误配风险）。
+  const path = canonicalVirtualPath(String(body.path || ""))
   if (!path || path === "/") {
     return c.json({ code: 400, message: "path is required", data: null })
   }
@@ -5012,7 +5159,7 @@ adminRouter.post("/meta/update", async (c) => {
 
   const path =
     body.path !== undefined
-      ? "/" + String(body.path).split("/").filter(Boolean).join("/")
+      ? canonicalVirtualPath(String(body.path))
       : db.metas[idx].path
   if (path && db.metas.some((m: any) => m.path === path && m.id !== body.id)) {
     return c.json({ code: 400, message: "meta already exists", data: null })
@@ -5058,7 +5205,11 @@ adminRouter.post("/meta/update", async (c) => {
     p_sub: body.p_sub !== undefined ? !!body.p_sub : db.metas[idx].p_sub,
     write: body.write !== undefined ? !!body.write : db.metas[idx].write,
     w_sub: body.w_sub !== undefined ? !!body.w_sub : db.metas[idx].w_sub,
-    hide: body.hide !== undefined ? body.hide : db.metas[idx].hide,
+    // F-006：校验用的是 String(body.hide)，入库却存原始值——数组/对象会被
+    // 原样落库，之后 isHidden 对 hide.trim() 抛 TypeError，该 meta 覆盖的
+    // 路径每次列目录都 500。与 create 一致，统一存字符串。
+    hide:
+      body.hide !== undefined ? String(body.hide) : db.metas[idx].hide,
     h_sub: body.h_sub !== undefined ? !!body.h_sub : db.metas[idx].h_sub,
     readme: body.readme !== undefined ? body.readme : db.metas[idx].readme,
     r_sub: body.r_sub !== undefined ? !!body.r_sub : db.metas[idx].r_sub,
@@ -5212,6 +5363,51 @@ adminRouter.post("/storage/refresh_one", async (c) => {
 // 对大型存储可能耗时较长（受 Worker CPU 时限约束），但中小型部署可用；
 // 前端仍可实时搜索（search 函数递归遍历），索引缓存仅用于加速与进度展示。
 
+/**
+ * 收集 search() 的全量结果（F-001）。
+ *
+ * search() 的返回永远被 per_page 切片（默认 30、上限 100），`max_results`
+ * 只限制遍历时的收集上限、不影响返回的 content。索引/扫描此前只拿到前 30 条
+ * 却把 total 报告成全量数。这里按页聚合，直到取满 total 或翻页结束。
+ */
+async function collectSearchItems(
+  c: any,
+  opts: { parent: string; maxDepth: number; maxResults?: number },
+): Promise<{ items: any[]; total: number }> {
+  const perPage = 100
+  const items: any[] = []
+  let total = 0
+  for (let page = 1; page <= 100; page++) {
+    const res = await search(
+      {
+        parent: opts.parent,
+        keywords: "",
+        max_depth: opts.maxDepth,
+        max_results: opts.maxResults ?? 2000,
+        page,
+        per_page: perPage,
+      },
+      c.env,
+    )
+    total = res.total
+    items.push(...res.content)
+    if (res.content.length < perPage || items.length >= res.total) break
+  }
+  return { items, total: Math.max(total, items.length) }
+}
+
+/** /index/update 的去重键：同一父目录下的同名条目就是同一条索引。 */
+function searchItemKey(item: any): string {
+  return `${item?.parent || "/"}|${item?.name || ""}`
+}
+
+/** 索引条目是否属于某个（已规范化的）路径子树，按路径边界匹配。 */
+function isUnderIndexPath(parent: string, path: string): boolean {
+  if (path === "/") return true
+  const trimmed = path.replace(/\/+$/, "")
+  return parent === trimmed || parent.startsWith(trimmed + "/")
+}
+
 function indexProgress(db: any) {
   const idx = db.search_index || {}
   return {
@@ -5226,13 +5422,14 @@ function indexProgress(db: any) {
 adminRouter.post("/index/build", async (c) => {
   try {
     const db = await getDb(c.env)
-    const res = await search(
-      { parent: "/", keywords: "", max_depth: 20, max_results: 2000 },
-      c.env,
-    )
+    // F-001：search() 默认只返回 30 条，必须翻页取全量
+    const { items } = await collectSearchItems(c, {
+      parent: "/",
+      maxDepth: 20,
+    })
     db.search_index = {
-      items: res.content,
-      total: res.total,
+      items,
+      total: items.length,
       is_done: true,
       updated_at: new Date().toISOString(),
       error: "",
@@ -5252,21 +5449,38 @@ adminRouter.post("/index/build", async (c) => {
 adminRouter.post("/index/update", async (c) => {
   try {
     const body = await c.req.json().catch(() => ({}))
-    const paths: string[] = Array.isArray(body.paths) ? body.paths : ["/"]
+    const rawPaths: unknown[] = Array.isArray(body.paths) ? body.paths : ["/"]
+    // 规范化 + 丢弃非法条目，空结果视为整树重建
+    const paths = rawPaths
+      .filter((p): p is string => typeof p === "string" && p.trim() !== "")
+      .map((p) => {
+        const normalized = "/" + String(p).split("/").filter(Boolean).join("/")
+        return normalized === "" ? "/" : normalized
+      })
+    if (!paths.length) paths.push("/")
     const maxDepth = Math.min(20, Math.max(0, Number(body.max_depth) || 20))
     const db = await getDb(c.env)
     const prev = db.search_index?.items || []
-    // 移除旧索引中属于这些路径的条目，再重建
+    // F-001：按 paths 定向重建（search(parent: p)），而不是「保留 + 全树重搜」——
+    // 后者必然让 keep 与重搜结果重叠，条目重复且 total 双重计数。同时把
+    // startsWith 前缀匹配改成路径边界匹配（"/foo" 不再命中 "/foobar"）。
     const keep = prev.filter(
-      (it: any) => !paths.some((p: string) => (it.parent || "/").startsWith(p)),
+      (it: any) =>
+        !paths.some((p: string) => isUnderIndexPath(it.parent || "/", p)),
     )
-    const res = await search(
-      { parent: "/", keywords: "", max_depth: maxDepth, max_results: 2000 },
-      c.env,
-    )
+    const merged = new Map<string, any>()
+    for (const it of keep) merged.set(searchItemKey(it), it)
+    for (const path of paths) {
+      const { items } = await collectSearchItems(c, {
+        parent: path === "/" ? "/" : path,
+        maxDepth,
+      })
+      for (const it of items) merged.set(searchItemKey(it), it)
+    }
+    const items = [...merged.values()]
     db.search_index = {
-      items: [...keep, ...res.content],
-      total: keep.length + res.total,
+      items,
+      total: items.length,
       is_done: true,
       updated_at: new Date().toISOString(),
       error: "",
@@ -5318,13 +5532,14 @@ adminRouter.get("/index/progress", async (c) => {
 adminRouter.post("/scan/start", async (c) => {
   try {
     const db = await getDb(c.env)
-    const res = await search(
-      { parent: "/", keywords: "", max_depth: 20, max_results: 2000 },
-      c.env,
-    )
+    // F-001：同样翻页取全量，避免索引被截断为前 30 条
+    const { items } = await collectSearchItems(c, {
+      parent: "/",
+      maxDepth: 20,
+    })
     db.scan_result = {
-      items: res.content,
-      total: res.total,
+      items,
+      total: items.length,
       is_done: true,
       updated_at: new Date().toISOString(),
       error: "",
@@ -5334,7 +5549,7 @@ adminRouter.post("/scan/start", async (c) => {
       code: 200,
       message: "success",
       data: {
-        obj_count: res.total,
+        obj_count: items.length,
         is_done: true,
         last_done_time: db.scan_result.updated_at,
         error: "",
@@ -5455,6 +5670,21 @@ adminRouter.post("/plugin/install", async (c) => {
       (p: any) => p.id === pluginData.id,
     )
     const now = new Date().toISOString()
+    // M-10（安全审计报告）：插件脚本等价于存储型注入入口。签名校验需要前端/
+    // 发布链路配合（Ed25519 + 白名单源），当前先落实可落库的溯源最小集：
+    // 记录脚本/样式的内容哈希、安装者与安装来源，便于事后审计与篡改检测。
+    const sha256HexOf = async (s: string) => {
+      if (!s) return ""
+      const buf = await crypto.subtle.digest(
+        "SHA-256",
+        new TextEncoder().encode(s),
+      )
+      return Array.from(new Uint8Array(buf))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("")
+    }
+    const auth = await getUserFromContext(c)
+    const installedBy = auth?.username || "unknown"
     const newPlugin = {
       id: pluginData.id,
       name: pluginData.name,
@@ -5474,6 +5704,12 @@ adminRouter.post("/plugin/install", async (c) => {
       entry_url: pluginData.entry_url || "",
       script_content: pluginData.script_content || "",
       style_content: pluginData.style_content || "",
+      script_sha256: await sha256HexOf(pluginData.script_content || ""),
+      style_sha256: await sha256HexOf(pluginData.style_content || ""),
+      installed_by: installedBy,
+      installed_from: typeof body?.manifest_url === "string"
+        ? body.manifest_url
+        : "manual",
       config_schema: pluginData.config_schema || [],
       config_values:
         pluginData.config_values || pluginData.default_config || {},
@@ -5487,8 +5723,24 @@ adminRouter.post("/plugin/install", async (c) => {
 
     if (existingIndex >= 0) {
       db.plugins[existingIndex] = newPlugin
+      await getAuditLogger().log(
+        c,
+        "info" as any,
+        "config" as any,
+        "plugin.update",
+        `Plugin updated: ${newPlugin.id} v${newPlugin.version} (by ${newPlugin.installed_by})`,
+        { details: { sha256: newPlugin.script_sha256 } },
+      )
     } else {
       db.plugins.push(newPlugin)
+      await getAuditLogger().log(
+        c,
+        "warn" as any,
+        "config" as any,
+        "plugin.install",
+        `Plugin installed: ${newPlugin.id} v${newPlugin.version} (by ${newPlugin.installed_by}, from ${newPlugin.installed_from})`,
+        { details: { sha256: newPlugin.script_sha256 } },
+      )
     }
 
     await saveDb(db, c.env)
@@ -5752,7 +6004,12 @@ adminRouter.get("/audit/stats", async (c) => {
 adminRouter.post("/audit/cleanup", async (c) => {
   try {
     const body = await c.req.json().catch(() => ({}))
-    const retentionDays = parseInt(body.retention_days || "30", 10)
+    // L-8：retention_days 必须是正整数。NaN/-1 会把全部审计日志清空
+    // （取证失效），这里钳制到 [1, 3650]。
+    const rawDays = parseInt(body.retention_days ?? "30", 10)
+    const retentionDays = Number.isFinite(rawDays)
+      ? Math.min(Math.max(rawDays, 1), 3650)
+      : 30
 
     const { cleanupExpiredLogs } = await import("../internal/model/audit")
     cleanupExpiredLogs(retentionDays)

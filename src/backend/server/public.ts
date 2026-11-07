@@ -695,6 +695,31 @@ publicRouter.get("/init_status", async (c) => {
   })
 })
 
+/**
+ * /init/setup 的进程内互斥（F-039）。
+ *
+ * 历史实现是「getDb → 检查无 role=2 管理员 → 多个 await（ensureEncryptionSecret
+ * / setUserPassword）→ push → saveDb」，检查与写入之间没有任何锁。同一 isolate
+ * 内的并发请求共享同一个 db 对象（db.ts 的 1s TTL 缓存 + inflight 去重），因此
+ * 都会在任何人 push 之前通过「未初始化」检查，随后各自创建一个 role=2 管理员。
+ * 这把 promise 链锁把「复核 + 创建 + 落库」串行化，并在锁内重新查重。
+ *
+ * 边界：跨 isolate 的并发仍依赖存储层的 last-write-wins（没有 CAS/事务可用）；
+ * 这里保证单实例内不会出现多个管理员，且锁内复核会让后来者直接收到「已初始化」。
+ */
+let setupLock: Promise<void> = Promise.resolve()
+async function withSetupLock<T>(fn: () => Promise<T>): Promise<T> {
+  const prev = setupLock
+  let release!: () => void
+  setupLock = new Promise<void>((resolve) => (release = resolve))
+  await prev
+  try {
+    return await fn()
+  } finally {
+    release()
+  }
+}
+
 // 执行系统初始化：创建管理员账号并设置站点名称等初始参数。
 publicRouter.post("/init/setup", async (c) => {
   const body = await c.req.json().catch(() => ({}))
@@ -705,6 +730,21 @@ publicRouter.post("/init/setup", async (c) => {
   if (!username) {
     return c.json(
       { code: 400, message: "username is required", data: null },
+      400,
+    )
+  }
+  // F-040：guest 是保留用户名。middlewares.ts 的匿名回退按 `username === "guest"`
+  // 取**第一个**匹配并原样返回其 role/permission。若把管理员改名为 guest，users
+  // 里会出现两个同名用户且 role=2 的那行在前，所有匿名请求都会直接拿到管理员
+  // 身份（fs 读写、share 创建全部放行）。改名接口（user.ts）有唯一性检查，
+  // 唯独 setup 这条入口没有，必须在这里拒绝。
+  if (username.toLowerCase() === "guest") {
+    return c.json(
+      {
+        code: 400,
+        message: 'username "guest" is reserved for the anonymous guest account',
+        data: null,
+      },
       400,
     )
   }
@@ -801,58 +841,77 @@ publicRouter.post("/init/setup", async (c) => {
     )
   }
 
-  // 初始化阶段：确保**共享密钥**存在（JWT 签名 + DB_CIPHER 启用时的字段加密）。
-  //
-  // 只在 setup 中生成 —— 且仅当持久化键不存在时。一旦写入永不覆盖，
-  // 否则既有加密数据将无法解密。其他任何阶段都只读不生成。
-  //
-  // 注意：**与 DB_CIPHER 无关**。DB_CIPHER=none 仅表示「不加密数据库字段」，
-  // JWT 令牌签名仍然需要一把跨实例/跨冷启动一致的密钥：如果运维没有通过环境
-  // 变量 JWT_SECRET 提供，就必须在这里生成并持久化，否则每个实例/每次冷启动
-  // 都会各生成一把随机密钥，导致令牌随机失效。因此这里无条件调用。
-  await ensureEncryptionSecret(c.env)
-
-  if (existing) {
-    // admin 账号已存在但尚未设置密码（未初始化）：直接更新
-    existing.username = username
-    await setUserPassword(existing, password)
-  } else {
-    // 首次创建 admin 账号（Go User.SetPassword 双层哈希）
-    const admin: any = {
-      id: 1,
-      username,
-      password: "",
-      role: 2,
-      permission: 0,
-      base_path: "/",
-      disabled: false,
-      sso_id: "",
-      allow_ldap: false,
-      pwd_update_at: new Date().toISOString(),
+  // 复核 + 创建 + 落库必须在同一把锁内完成（F-039）：锁内重新取 db 并复查
+  // 「是否已存在带密码的 role=2 用户」，后来者直接得到 400，而不是再建一个管理员。
+  const outcome = await withSetupLock(async () => {
+    const latest = await getDb(c.env)
+    if (!latest.users) latest.users = []
+    const current = latest.users.find((u: any) => u.role === 2)
+    if (current && String(current.password || "").trim() !== "") {
+      return { initialized: true as const }
     }
-    await setUserPassword(admin, password)
-    db.users.push(admin)
-  }
 
-  if (siteTitle) {
-    if (!db.settings) db.settings = []
-    const site = db.settings.find((s: any) => s.key === "site_title")
-    if (site) {
-      site.value = siteTitle
+    // 初始化阶段：确保**共享密钥**存在（JWT 签名 + DB_CIPHER 启用时的字段加密）。
+    //
+    // 只在 setup 中生成 —— 且仅当持久化键不存在时。一旦写入永不覆盖，
+    // 否则既有加密数据将无法解密。其他任何阶段都只读不生成。
+    //
+    // 注意：**与 DB_CIPHER 无关**。DB_CIPHER=none 仅表示「不加密数据库字段」，
+    // JWT 令牌签名仍然需要一把跨实例/跨冷启动一致的密钥：如果运维没有通过环境
+    // 变量 JWT_SECRET 提供，就必须在这里生成并持久化，否则每个实例/每次冷启动
+    // 都会各生成一把随机密钥，导致令牌随机失效。因此这里无条件调用。
+    await ensureEncryptionSecret(c.env)
+
+    if (current) {
+      // admin 账号已存在但尚未设置密码（未初始化）：直接更新
+      current.username = username
+      await setUserPassword(current, password)
     } else {
-      db.settings.push({
-        key: "site_title",
-        value: siteTitle,
-        type: "string",
-        help: "Site Title",
-        group: 1,
-        flag: 0,
-      })
+      // 首次创建 admin 账号（Go User.SetPassword 双层哈希）
+      const admin: any = {
+        id: 1,
+        username,
+        password: "",
+        role: 2,
+        permission: 0,
+        base_path: "/",
+        disabled: false,
+        sso_id: "",
+        allow_ldap: false,
+        pwd_update_at: new Date().toISOString(),
+      }
+      await setUserPassword(admin, password)
+      latest.users.push(admin)
     }
-  }
 
-  // 初始化是唯一允许「在一次成功读取（确认存储为空）之后写入空壳」的场景，
-  // 因此显式 force；此时 db 已包含新建的管理员用户，本身也不再是空壳。
-  await saveDb(db, c.env, { force: true })
+    if (siteTitle) {
+      if (!latest.settings) latest.settings = []
+      const site = latest.settings.find((s: any) => s.key === "site_title")
+      if (site) {
+        site.value = siteTitle
+      } else {
+        latest.settings.push({
+          key: "site_title",
+          value: siteTitle,
+          type: "string",
+          help: "Site Title",
+          group: 1,
+          flag: 0,
+        })
+      }
+    }
+
+    // 初始化是唯一允许「在一次成功读取（确认存储为空）之后写入空壳」的场景，
+    // 因此显式 force；此时 db 已包含新建的管理员用户，本身也不再是空壳。
+    await saveDb(latest, c.env, { force: true })
+    return { initialized: false as const }
+  })
+
+  if (outcome.initialized) {
+    return c.json(
+      { code: 400, message: "system has already been initialized", data: null },
+      400,
+    )
+  }
   return c.json({ code: 200, message: "success", data: null })
 })

@@ -10,7 +10,8 @@ import {
   BaiduPhotoDownloadResp,
   BaiduPhotoPrecreateResp,
 } from "./types"
-import { md5 } from "../../pkg/crypto"
+import { md5, createMD5 } from "../../internal/seed/hashers"
+import { randomInt } from "../rand"
 
 const API_URL = "https://photo.baidu.com/youai"
 const ALBUM_API_URL = API_URL + "/album/v1"
@@ -25,7 +26,8 @@ const SLICE_SIZE = 256 * 1024 // 256KB slice-md5
 
 export function getTid(): string {
   const sec = Math.floor(Date.now() / 1000)
-  const rand = Math.floor(9000000 * Math.random() + 1000000)
+  // S-04 同类清单：设备标识随机段改用 CSPRNG（原 Math.random）。
+  const rand = 1000000 + randomInt(9000000)
   return `3${sec}${rand}`
 }
 
@@ -35,6 +37,18 @@ function getFileName(path: string): string {
 
 function fsidsFormatNotUk(ids: number[]): string {
   return "[" + ids.map((id) => `{"fsid":${id}}`).join(",") + "]"
+}
+
+/**
+ * 解析百度相册 JSON 响应。
+ *
+ * 相册 tid 是 18 位 int64（约 3.2e17），超出 Number.MAX_SAFE_INTEGER；
+ * 若按 JSON 数字解析会被舍入成错误值（F-300）。这里在 JSON.parse 之前
+ * 把 `"tid":<大整数>` 预置为字符串，保证全链路拿到服务端签发的原值。
+ */
+export function parseBaiduPhotoJson<T>(text: string): T {
+  const guarded = text.replace(/("tid"\s*:\s*)(-?\d{16,})/g, '$1"$2"')
+  return JSON.parse(guarded) as T
 }
 
 export class ClientBaiduPhoto {
@@ -100,7 +114,23 @@ export class ClientBaiduPhoto {
     } = {},
   ): Promise<T> {
     const resp = await this.request(method, url, options)
-    const data = (await resp.json().catch(() => ({}))) as T & { errno?: number }
+    const text = await resp.text()
+    // F-299：非 2xx（网关 5xx / WAF 拦截页）必须显式失败，不能当作成功。
+    if (!resp.ok) {
+      throw new Error(
+        `[BaiduPhoto] HTTP ${resp.status} ${resp.statusText || ""} for ${url}: ${text.slice(0, 200)}`,
+      )
+    }
+    let data: T & { errno?: number }
+    try {
+      data = parseBaiduPhotoJson<T & { errno?: number }>(text)
+    } catch {
+      // F-299：非 JSON 响应（HTML 错误页/空响应）解析失败时要报出 HTTP 状态，
+      // 而不是静默降级为 {} 让写操作假成功。
+      throw new Error(
+        `[BaiduPhoto] invalid JSON response (HTTP ${resp.status}) for ${url}: ${text.slice(0, 200)}`,
+      )
+    }
     const errno = (data as any).errno
     if (errno !== undefined && errno !== 0) {
       throw new Error(
@@ -111,7 +141,8 @@ export class ClientBaiduPhoto {
   }
 
   async uInfo(): Promise<{ youa_id?: string }> {
-    return this.requestJson(USER_API_URL + "/getuinfo", "GET")
+    // 注意参数顺序：requestJson(method, url, options)
+    return this.requestJson("GET", USER_API_URL + "/getuinfo")
   }
 
   private async getBDStoken(): Promise<string> {
@@ -163,7 +194,7 @@ export class ClientBaiduPhoto {
 
   async getAllAlbumFile(
     albumId: string,
-    tid: number,
+    tid: string,
   ): Promise<BaiduPhotoAlbumFile[]> {
     const files: BaiduPhotoAlbumFile[] = []
     let cursor = ""
@@ -207,14 +238,14 @@ export class ClientBaiduPhoto {
   async linkAlbumFile(
     fsid: number,
     albumId: string,
-    tid: number,
+    tid: string,
     uk: number,
   ): Promise<string> {
     const resp = await this.request("HEAD", ALBUM_API_URL + "/download", {
       query: {
         fsid: String(fsid),
         album_id: albumId,
-        tid: String(tid),
+        tid,
         uk: String(uk),
       },
       redirect: "manual",
@@ -258,23 +289,23 @@ export class ClientBaiduPhoto {
 
   async setAlbumName(
     albumId: string,
-    tid: number,
+    tid: string,
     name: string,
   ): Promise<void> {
     await this.requestJson("POST", ALBUM_API_URL + "/settitle", {
-      form: { title: name, album_id: albumId, tid: String(tid) },
+      form: { title: name, album_id: albumId, tid },
     })
   }
 
   async deleteAlbum(
     albumId: string,
-    tid: number,
+    tid: string,
     deleteOrigin: boolean,
   ): Promise<void> {
     await this.requestJson("POST", ALBUM_API_URL + "/delete", {
       form: {
         album_id: albumId,
-        tid: String(tid),
+        tid,
         delete_origin_image: deleteOrigin ? "1" : "0",
       },
     })
@@ -289,14 +320,14 @@ export class ClientBaiduPhoto {
   async deleteAlbumFile(
     fsid: number,
     albumId: string,
-    tid: number,
+    tid: string,
     uk: number,
     deleteOrigin: boolean,
   ): Promise<void> {
     await this.requestJson("POST", ALBUM_API_URL + "/delfile", {
       form: {
         album_id: albumId,
-        tid: String(tid),
+        tid,
         list: `[{"fsid":${fsid},"uk":${uk}}]`,
         del_origin: deleteOrigin ? "1" : "0",
       },
@@ -305,13 +336,13 @@ export class ClientBaiduPhoto {
 
   async addAlbumFile(
     albumId: string,
-    tid: number,
+    tid: string,
     fsid: number,
   ): Promise<void> {
     await this.requestJson("GET", ALBUM_API_URL + "/addfile", {
       query: {
         album_id: albumId,
-        tid: String(tid),
+        tid,
         list: fsidsFormatNotUk([fsid]),
       },
     })
@@ -320,7 +351,7 @@ export class ClientBaiduPhoto {
   async copyAlbumFile(
     fsid: number,
     albumId: string,
-    tid: number,
+    tid: string,
     uk: number,
   ): Promise<number> {
     const resp = await this.requestJson<{
@@ -328,7 +359,7 @@ export class ClientBaiduPhoto {
     }>("POST", ALBUM_API_URL + "/copyfile", {
       form: {
         album_id: albumId,
-        tid: String(tid),
+        tid,
         uk: String(uk),
         list: fsidsFormatNotUk([fsid]),
       },
@@ -349,16 +380,19 @@ export class ClientBaiduPhoto {
       throw new Error("[BaiduPhoto] file size cannot be zero")
     }
 
-    const contentMd5 = md5(content)
-    const sliceMd5 = md5(
-      content.subarray(0, Math.min(SLICE_SIZE, content.length)),
-    )
+    // F-304：用流式哈希器在遍历分块的同一次循环里同时喂给整文件与分块
+    // 哈希，避免把整个文件再复制进 padded 缓冲区，也避免再单独全量扫描一遍。
+    const contentHasher = (await createMD5()).init()
     const blockList: string[] = []
     for (let i = 0; i < content.length; i += DEFAULT) {
-      blockList.push(
-        md5(content.subarray(i, Math.min(i + DEFAULT, content.length))),
-      )
+      const slice = content.subarray(i, Math.min(i + DEFAULT, content.length))
+      blockList.push(await md5(slice))
+      contentHasher.update(slice)
     }
+    const contentMd5 = contentHasher.digest("hex") as string
+    const sliceMd5 = await md5(
+      content.subarray(0, Math.min(SLICE_SIZE, content.length)),
+    )
     const blockListStr = JSON.stringify(blockList)
 
     const params: Record<string, string> = {
@@ -393,18 +427,6 @@ export class ClientBaiduPhoto {
             partseq + 1 === count ? content.length - offset : DEFAULT
           const partContent = content.subarray(offset, offset + byteSize)
 
-          const fd = new FormData()
-          fd.append(
-            "file",
-            new Blob([
-              partContent.buffer.slice(
-                partContent.byteOffset,
-                partContent.byteOffset + partContent.byteLength,
-              ) as ArrayBuffer,
-            ]),
-            fileName,
-          )
-
           const upUrl = new URL(
             "https://c3.pcs.baidu.com/rest/2.0/pcs/superfile2",
           )
@@ -413,14 +435,7 @@ export class ClientBaiduPhoto {
           upUrl.searchParams.set("partseq", String(partseq))
           upUrl.searchParams.set("uploadid", uploadid || "")
           upUrl.searchParams.set("app_id", "16051585")
-          const upResp = await fetch(upUrl.toString(), {
-            method: "POST",
-            headers: { Cookie: this.cookie, "User-Agent": UA },
-            body: fd,
-          })
-          if (!upResp.ok) {
-            throw new Error(`[BaiduPhoto] 上传切片失败: HTTP ${upResp.status}`)
-          }
+          await this.uploadSlice(upUrl, fileName, partContent)
         }
         // step.3 create
         params.uploadid = uploadid || ""
@@ -446,9 +461,77 @@ export class ClientBaiduPhoto {
         throw new Error("[BaiduPhoto] precreate 返回未知 return_type")
     }
 
+    // F-303：create 未返回 fs_id 时不能静默当作成功（否则上传到相册的文件
+    // 只落在根目录，后续 addAlbumFile 被跳过，而 put 报成功）。
+    if (!newFsid) {
+      throw new Error("[BaiduPhoto] create 未返回 fs_id，上传未完成")
+    }
+
     // step.4 若上传到相册，则加入相册
     if (parentAlbum && newFsid) {
       await this.addAlbumFile(parentAlbum.album_id, parentAlbum.tid, newFsid)
     }
+  }
+
+  /**
+   * 上传单个分片（F-303）：
+   * - 读取并校验响应体（pcs superfile2 的业务失败是 HTTP 200 + errno≠0）；
+   * - 网络/HTTP/业务错误做有限次重试；
+   * - 非 JSON 响应视为失败，而不是继续走 create 报误导性错误。
+   */
+  private async uploadSlice(
+    upUrl: URL,
+    fileName: string,
+    partContent: Uint8Array,
+  ): Promise<void> {
+    const MAX_ATTEMPTS = 3
+    let lastError: unknown
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      try {
+        const fd = new FormData()
+        fd.append(
+          "file",
+          new Blob([
+            partContent.buffer.slice(
+              partContent.byteOffset,
+              partContent.byteOffset + partContent.byteLength,
+            ) as ArrayBuffer,
+          ]),
+          fileName,
+        )
+        const upResp = await fetch(upUrl.toString(), {
+          method: "POST",
+          headers: { Cookie: this.cookie, "User-Agent": UA },
+          body: fd,
+        })
+        const text = await upResp.text()
+        if (!upResp.ok) {
+          throw new Error(
+            `[BaiduPhoto] 上传切片失败: HTTP ${upResp.status} ${text.slice(0, 200)}`,
+          )
+        }
+        let body: any
+        try {
+          body = text ? parseBaiduPhotoJson(text) : {}
+        } catch {
+          throw new Error(
+            `[BaiduPhoto] 上传切片返回非 JSON 响应 (HTTP ${upResp.status}): ${text.slice(0, 200)}`,
+          )
+        }
+        const errno = body?.errno ?? body?.error_code
+        if (errno !== undefined && Number(errno) !== 0) {
+          throw new Error(`[BaiduPhoto] 上传切片失败: errno ${errno}`)
+        }
+        return
+      } catch (err) {
+        lastError = err
+        if (attempt < MAX_ATTEMPTS - 1) {
+          await new Promise((r) => setTimeout(r, 200 * (attempt + 1)))
+        }
+      }
+    }
+    throw lastError instanceof Error
+      ? lastError
+      : new Error(`[BaiduPhoto] 上传切片失败: ${String(lastError)}`)
   }
 }

@@ -48,13 +48,10 @@ test("MegaDriver instantiation and methods", async () => {
   assert.equal(items[1].is_dir, false)
   assert.equal(items[1].size, 10485760)
 
-  // Mock getDownloadLink
-  ;(driver as any).client.getDownloadLink = async (handle: string) =>
-    "https://gfs270n123.userstorage.mega.co.nz/download/video.mp4"
-
-  const link = await driver.link("/video.mp4", "/video.mp4")
-  assert.equal(
-    link.url,
-    "https://gfs270n123.userstorage.mega.co.nz/download/video.mp4",
-  )
+  // Mega download URLs are ciphertext: direct links must fail explicitly and
+  // downloads must go through the decrypting stream.
+  ;(driver as any).client.createReadStream = async () => new ReadableStream()
+  await assert.rejects(() => driver.link("/video.mp4", "/video.mp4"), /not supported/)
+  const stream = await driver.createReadStream("/video.mp4")
+  assert.ok(stream instanceof ReadableStream)
 })

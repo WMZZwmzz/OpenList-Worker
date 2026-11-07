@@ -67,6 +67,11 @@ export interface Yun139DiskResp {
     }
     getDiskResult?: {
       nodeCount?: number
+      /**
+       * 真实 API 的文件数组字段名是 contentList（alist/OpenList Go 驱动与
+       * boxplayer 均读取该字段）。fileList 从未在响应中出现过，仅作历史兼容。
+       */
+      contentList?: Yun139FileItem[]
       fileList?: Yun139FileItem[]
       catalogList?: Array<{
         catalogID: string

@@ -37,11 +37,12 @@ export class Pan115ShareDriver implements StorageDriver {
     for (const part of parts) {
       const files = await this.client.getFiles(currentCid)
       const folder = files.find((f) => f.is_file === 0 && f.file_name === part)
-      if (folder && folder.category_id) {
-        currentCid = folder.category_id
-      } else {
-        break
+      // 未找到目录段必须报错：静默 break 会把祖先目录的 cid 返回给调用方，
+      // list 不存在的路径会拿到祖先内容，错误数据还会按请求路径写入文件树缓存。
+      if (!folder || !folder.category_id) {
+        throw new Error(`path not found: "${part}" in "${physicalPath}"`)
       }
+      currentCid = folder.category_id
     }
 
     return currentCid

@@ -29,8 +29,15 @@ export class ClientIpfs {
     return (await resp.json().catch(() => ({}))) as T
   }
 
-  async ls(cid: string): Promise<IpfsLsResp> {
-    return this.post<IpfsLsResp>("ls", [`/ipfs/${cid}`])
+  /**
+   * F-469：接受完整 /ipfs、/ipns 路径（或裸 CID）。之前无条件拼 `/ipfs/`，
+   * ipns 模式下会发出 `/ipfs//ipns/...` 这种结构性非法参数。
+   */
+  async ls(pathOrCid: string): Promise<IpfsLsResp> {
+    const arg = /^\/(ipfs|ipns)\//.test(pathOrCid)
+      ? pathOrCid
+      : `/ipfs/${pathOrCid}`
+    return this.post<IpfsLsResp>("ls", [arg])
   }
 
   async filesStat(path: string): Promise<IpfsFilesStatResp> {

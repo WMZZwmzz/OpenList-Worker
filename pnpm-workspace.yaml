@@ -8,3 +8,6 @@ packages:
 # 跳过其编译可避免 install 阶段做无用的原生编译（拖慢甚至拖垮 CI 构建）。
 neverBuiltDependencies:
   - cpu-features
+# 传递依赖漏洞的版本钳制放在 package.json 的 pnpm.overrides（本仓库
+# packageManager 钉在 pnpm@9，9.x 只读 package.json 的 pnpm 字段）。
+

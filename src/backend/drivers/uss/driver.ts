@@ -17,6 +17,27 @@ function joinPath(a: string, b: string): string {
   return left + "/" + right
 }
 
+/**
+ * F-479：key 未经编码直接拼进 URL 路径时，`#` 之后会被当 fragment、`?` 之后
+ * 被当 query（`new URL(".../dir#1/").pathname === ".../dir"`），列目录/下载/
+ * 建目录/删除/上传/移动全部错位。按要求逐段 encodeURIComponent。
+ */
+function encodeKeyPath(key: string): string {
+  return key
+    .split("/")
+    .map((seg) => encodeURIComponent(seg))
+    .join("/")
+}
+
+/** 又拍云列目录迭代终止标记（最后一页的 x-upyun-list-iter 值） */
+const LIST_ITER_END = "g2gCZAAEbmV4dGQAA2VvZg"
+
+/** HEAD 响应头里的类型判定（x-upyun-file-type: file | folder） */
+function isFolderType(res: Response): boolean {
+  const type = (res.headers.get("x-upyun-file-type") || "").toLowerCase()
+  return type === "folder" || type === "dir" || type === "d"
+}
+
 export class UssDriver implements StorageDriver {
   private addition: UssAddition
   private authHeader: string
@@ -56,40 +77,90 @@ export class UssDriver implements StorageDriver {
 
   async list(_v: string, physicalPath: string): Promise<FileItem[]> {
     const prefix = this.getKey(physicalPath, true)
-    const url = `${this.apiBase}/${prefix}`
-    const res = await fetch(url, {
-      method: "GET",
-      headers: {
+    const items: FileItem[] = []
+    // F-478：又拍云列表默认只返回 100 条（x-list-limit 最大 10000），后续页
+    // 必须把响应头 x-upyun-list-iter 回传为请求头 x-list-iter，直到值为
+    // LIST_ITER_END（或空）。原实现只发一次请求，超过 100 条的目录被静默截断。
+    let iter = ""
+    const seenIters = new Set<string>()
+    for (;;) {
+      const headers: Record<string, string> = {
         Authorization: this.authHeader,
         Accept: "application/json",
-      },
-    })
-    if (!res.ok) throw new Error(`[USS] list failed: HTTP ${res.status}`)
-    const text = await res.text()
-    const items: FileItem[] = []
-    try {
-      const arr = JSON.parse(text)
-      if (Array.isArray(arr)) {
-        for (const f of arr) {
-          const name = f.name || f.file_name || ""
-          const isDir =
-            f.type === "F" || f.is_dir === true || name.endsWith("/")
-          items.push({
-            name: name.replace(/\/+$/, ""),
-            size: f.length || f.size || 0,
-            is_dir: isDir,
-            modified: f.last_modified
-              ? new Date(f.last_modified * 1000).toISOString()
-              : new Date().toISOString(),
-            sign: "",
-            type: calcFileType(name, isDir),
-            raw_url: "",
-          })
-        }
-        return sortFileItems(items, "name", "asc")
+        "x-list-limit": "10000",
       }
-    } catch {
-      // fall through to text line parsing
+      if (iter) headers["x-list-iter"] = iter
+      const url = `${this.apiBase}/${encodeKeyPath(prefix)}`
+      const res = await fetch(url, { method: "GET", headers })
+      if (!res.ok) throw new Error(`[USS] list failed: HTTP ${res.status}`)
+      const text = await res.text()
+      const page = this.parseListPage(text)
+      items.push(...page.items)
+      if (!page.parsed) return sortFileItems(items, "name", "asc")
+      const nextIter =
+        page.iter || res.headers.get("x-upyun-list-iter") || ""
+      if (!nextIter || nextIter === LIST_ITER_END || seenIters.has(nextIter)) {
+        break
+      }
+      seenIters.add(nextIter)
+      iter = nextIter
+    }
+    return sortFileItems(items, "name", "asc")
+  }
+
+  /**
+   * 解析一页列表响应：JSON（{"files":[...],"iter":"..."}）或文本行格式。
+   * `parsed` 为 false 表示 JSON 结构不符（调用方应立即停止翻页，不可退化成
+   * 按行解析整段 JSON）。
+   */
+  private parseListPage(text: string): {
+    items: FileItem[]
+    iter: string
+    parsed: boolean
+  } {
+    const items: FileItem[] = []
+    // F-475：Accept: application/json 时又拍云返回对象
+    // {"files":[{"type":"folder"|MIME,"length":N,"name":"...","last_modified":ts}],"iter":"..."}，
+    // files 是对象字段而非顶层数组；目录的 type 是 "folder"。
+    const trimmed = text.trim()
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+      try {
+        const parsed: any = JSON.parse(trimmed)
+        const arr: any[] | null = Array.isArray(parsed)
+          ? parsed
+          : Array.isArray(parsed?.files)
+            ? parsed.files
+            : null
+        if (arr) {
+          for (const f of arr) {
+            const rawName = String(f?.name ?? f?.file_name ?? "")
+            const name = rawName.replace(/\/+$/, "")
+            if (!name) continue
+            const isDir =
+              f?.type === "folder" || f?.type === "F" || f?.is_dir === true
+            items.push({
+              name,
+              size: Number(f?.length ?? f?.size ?? 0) || 0,
+              is_dir: isDir,
+              modified: f?.last_modified
+                ? new Date(Number(f.last_modified) * 1000).toISOString()
+                : new Date().toISOString(),
+              sign: "",
+              type: calcFileType(name, isDir),
+              raw_url: "",
+            })
+          }
+          return {
+            items,
+            iter: typeof parsed?.iter === "string" ? parsed.iter : "",
+            parsed: true,
+          }
+        }
+        // 结构不符的 JSON：不要退回按行解析（会把整段 JSON 当成一个条目）
+        return { items, iter: "", parsed: false }
+      } catch {
+        // 非 JSON：继续按文本行解析
+      }
     }
     // 文本行解析：name<TAB>type<TAB>size<TAB>time
     for (const line of text.split("\n")) {
@@ -111,36 +182,92 @@ export class UssDriver implements StorageDriver {
         raw_url: "",
       })
     }
-    return sortFileItems(items, "name", "asc")
+    return { items, iter: "", parsed: true }
+  }
+
+  /** 上游 HEAD：区分目录/文件并确认存在（F-480） */
+  private async headObject(key: string): Promise<{
+    is_dir: boolean
+    size: number
+    modified: string
+  }> {
+    const attempt = (k: string) =>
+      fetch(`${this.apiBase}/${encodeKeyPath(k)}`, {
+        method: "HEAD",
+        headers: { Authorization: this.authHeader },
+      })
+    let res = await attempt(key)
+    // 部分实现对目录只认带尾斜杠的 key：补一次探测，避免把目录判成 404
+    if (res.status === 404 && !key.endsWith("/")) {
+      const dirRes = await attempt(key + "/")
+      if (dirRes.ok && isFolderType(dirRes)) res = dirRes
+    }
+    if (res.status === 404) {
+      throw new Error(`[USS] object not found: ${key}`)
+    }
+    if (!res.ok) {
+      throw new Error(`[USS] head failed: HTTP ${res.status}`)
+    }
+    const isDir = isFolderType(res)
+    const size = parseInt(res.headers.get("x-upyun-file-size") || "0", 10) || 0
+    const dateHeader = parseInt(
+      res.headers.get("x-upyun-file-date") || "",
+      10,
+    )
+    return {
+      is_dir: isDir,
+      size: isDir ? 0 : size,
+      modified: Number.isFinite(dateHeader)
+        ? new Date(dateHeader * 1000).toISOString()
+        : new Date().toISOString(),
+    }
   }
 
   async get(_v: string, physicalPath: string): Promise<FileItem> {
     const key = this.getKey(physicalPath)
+    if (!key) {
+      return {
+        name: "root",
+        size: 0,
+        is_dir: true,
+        modified: new Date().toISOString(),
+        sign: "",
+        type: 1,
+        raw_url: "",
+      }
+    }
+    // F-480：必须与上游确认存在性与类型。原实现恒返回 is_dir:false/size:0 的
+    // 伪造条目：目录被上报成文件、不存在的路径也返回 200（要到下载时才 404）。
+    const meta = await this.headObject(key)
     const name = key.split("/").filter(Boolean).pop() || key
-    // 又拍云 Token 防盗链：_upt = MD5(token&expire&/key)[12:20] + expire
-    const expireAt =
-      Math.floor(Date.now() / 1000) +
-      (this.addition.sign_url_expire || 4) * 3600
-    const token =
-      this.addition.anti_theft_chain_token || this.addition.operator_password
-    const signStr = `${token}&${expireAt}&/${key}`
-    const upt = md5(signStr).slice(12, 20) + expireAt
-    const upd = encodeURIComponent(name)
-    const rawUrl = `${this.getDownloadHost()}/${key}?_upd=${upd}&_upt=${upt}`
+    let rawUrl = ""
+    if (!meta.is_dir) {
+      // 又拍云 Token 防盗链：_upt = MD5(token&expire&/key)[12:20] + expire
+      const expireAt =
+        Math.floor(Date.now() / 1000) +
+        (this.addition.sign_url_expire || 4) * 3600
+      const token =
+        this.addition.anti_theft_chain_token ||
+        this.addition.operator_password
+      const signStr = `${token}&${expireAt}&/${key}`
+      const upt = md5(signStr).slice(12, 20) + expireAt
+      const upd = encodeURIComponent(name)
+      rawUrl = `${this.getDownloadHost()}/${encodeKeyPath(key)}?_upd=${upd}&_upt=${upt}`
+    }
     return {
       name,
-      size: 0,
-      is_dir: false,
-      modified: new Date().toISOString(),
+      size: meta.size,
+      is_dir: meta.is_dir,
+      modified: meta.modified,
       sign: key,
-      type: calcFileType(name, false),
+      type: calcFileType(name, meta.is_dir),
       raw_url: rawUrl,
     }
   }
 
   async mkdir(_v: string, physicalPath: string): Promise<void> {
     const key = this.getKey(physicalPath, true)
-    const res = await fetch(`${this.apiBase}/${key}`, {
+    const res = await fetch(`${this.apiBase}/${encodeKeyPath(key)}`, {
       method: "POST",
       headers: { Authorization: this.authHeader, Folder: "true" },
     })
@@ -166,7 +293,7 @@ export class UssDriver implements StorageDriver {
     _names: string[],
   ): Promise<void> {
     const key = this.getKey(physicalPath)
-    const res = await fetch(`${this.apiBase}/${key}`, {
+    const res = await fetch(`${this.apiBase}/${encodeKeyPath(key)}`, {
       method: "DELETE",
       headers: { Authorization: this.authHeader },
     })
@@ -198,7 +325,7 @@ export class UssDriver implements StorageDriver {
 
   async put(_v: string, physicalPath: string, content: Buffer): Promise<void> {
     const key = this.getKey(physicalPath)
-    const res = await fetch(`${this.apiBase}/${key}`, {
+    const res = await fetch(`${this.apiBase}/${encodeKeyPath(key)}`, {
       method: "PUT",
       headers: {
         Authorization: this.authHeader,
@@ -215,9 +342,12 @@ export class UssDriver implements StorageDriver {
     op: "move" | "copy",
   ): Promise<void> {
     const header = op === "move" ? "X-Upyun-Move-Source" : "X-Upyun-Copy-Source"
-    const res = await fetch(`${this.apiBase}/${dstKey}`, {
+    // F-476：官方格式为 "/<bucket>/<source_to_file>"（如 /upyun/foo/source.jpg），
+    // srcKey 不含 bucket 段，必须显式拼上，否则服务端解析不到源文件。
+    const source = `/${this.addition.bucket}/${srcKey}`
+    const res = await fetch(`${this.apiBase}/${encodeKeyPath(dstKey)}`, {
       method: "PUT",
-      headers: { Authorization: this.authHeader, [header]: `/${srcKey}` },
+      headers: { Authorization: this.authHeader, [header]: source },
     })
     if (!res.ok) throw new Error(`[USS] ${op} failed: HTTP ${res.status}`)
   }

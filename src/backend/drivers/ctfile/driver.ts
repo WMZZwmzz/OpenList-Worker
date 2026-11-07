@@ -28,8 +28,11 @@ export function normalizeCtFileAddition(a: any): CtFileAddition {
  * - unix 秒（数字/纯数字字符串）→ ISO
  * - "YYYY-MM-DD HH:mm:ss" 字符串 → ISO
  * - 其他/缺失 → 当前时间
+ *
+ * F-235：城通返回的无时区墙钟串是服务端（UTC+8）时间，必须显式按 +08:00
+ * 解析，否则在 TZ=UTC 的 Workers 与本地 Asia/Shanghai 的 Node 上相差 8 小时。
  */
-function ctfileDateToIso(date?: number | string): string {
+export function ctfileDateToIso(date?: number | string): string {
   if (date === undefined || date === null || date === "") {
     return new Date().toISOString()
   }
@@ -41,7 +44,17 @@ function ctfileDateToIso(date?: number | string): string {
       return new Date(n > 1e12 ? n : n * 1000).toISOString()
     }
   }
-  const parsed = new Date(raw.replace(" ", "T"))
+  // 已带时区（Z / ±hh:mm）的字符串保持原语义，不重复追加偏移。
+  const hasZone = /(?:z|[+-]\d{2}:?\d{2})$/i.test(raw)
+  let candidate = raw.replace(" ", "T")
+  if (
+    !hasZone &&
+    /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?$/.test(raw)
+  ) {
+    // 无时区的日期时间串按城通服务端墙钟（UTC+8）解释。
+    candidate += "+08:00"
+  }
+  const parsed = new Date(candidate)
   if (!isNaN(parsed.getTime())) return parsed.toISOString()
   return new Date().toISOString()
 }
@@ -239,9 +252,10 @@ export class CtFileDriver implements StorageDriver {
     try {
       fileItem.raw_url = await this.client.fetchDownloadUrl(key)
     } catch (err: any) {
-      const msg = err?.message || String(err)
-      fileItem.raw_url_error = msg
-      throw new Error(`[CtFile] 获取下载直链失败 (${item.name}): ${msg}`)
+      // F-230：按框架契约设置 raw_url_error 后正常返回条目，
+      // 让 raw.ts 回 404 + 原因（而不是把瞬态直链故障变成 500）。
+      fileItem.raw_url_error = err?.message || String(err)
+      return fileItem
     }
 
     fileItem.raw_url_headers = {
@@ -286,13 +300,16 @@ export class CtFileDriver implements StorageDriver {
 
   async move(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
     const { isDir, key } = await this.resolveEntry(srcPhysical)
-    const dstKey = await this.resolveFolderKey(dstDir)
+    // F-229：dstDir 是站点虚拟路径，dstPhysical 才是目标条目自身的物理
+    // 路径。取 dstPhysical 的父目录再解析城通文件夹 key。
+    const dstParentSegs = splitPath(dstPhysical).slice(0, -1)
+    const dstKey = await this.resolveFolderKey("/" + dstParentSegs.join("/"))
     await this.client.move([key], dstKey)
     if (isDir) this.pathKeyCache.clear()
   }
@@ -312,7 +329,8 @@ export class CtFileDriver implements StorageDriver {
     const parentPath = "/" + segs.slice(0, segs.length - 1).join("/")
     const parentKey = await this.resolveFolderKey(parentPath)
 
-    const data = new Uint8Array(content)
+    // F-231：Buffer 本身就是 Uint8Array，直接透传（不再整文件复制一份）。
+    const data = content
     const ticket = await this.client.uploadTicket(parentKey, fileName, data)
     if (Number(ticket.exists || 0) > 0) {
       // 秒传命中：文件已存在，无需真正上传

@@ -31,13 +31,30 @@ async function fetchWithTimeout(
   url: string,
   init: RequestInit,
   timeout: number,
+  externalSignal?: AbortSignal | null,
 ): Promise<Response> {
   const controller = new AbortController()
+  // F-059: FetchConfig.signal used to be silently dropped (`signal:` below
+  // overwrote anything in `init`). Merge the caller's signal with the timeout
+  // controller so cancellation propagates in both directions.
+  const onExternalAbort = () => controller.abort(externalSignal?.reason)
+  let listenerAttached = false
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      controller.abort(externalSignal.reason)
+    } else {
+      externalSignal.addEventListener("abort", onExternalAbort)
+      listenerAttached = true
+    }
+  }
   const id = setTimeout(() => controller.abort(), timeout)
   try {
     return await fetch(url, { ...init, signal: controller.signal })
   } finally {
     clearTimeout(id)
+    if (listenerAttached) {
+      externalSignal!.removeEventListener("abort", onExternalAbort)
+    }
   }
 }
 
@@ -87,6 +104,7 @@ export async function get<T = any>(
     finalUrl,
     { method: "GET", headers: config?.headers },
     config?.timeout ?? DEFAULT_TIMEOUT,
+    config?.signal,
   )
   return parseResponse<T>(res, config?.responseType)
 }
@@ -105,6 +123,7 @@ export async function post<T = any>(
     url,
     { method: "POST", headers, body },
     config?.timeout ?? DEFAULT_TIMEOUT,
+    config?.signal,
   )
   return parseResponse<T>(res, config?.responseType)
 }
@@ -117,6 +136,8 @@ export async function request<T = any>(config: {
   params?: Record<string, string>
   timeout?: number
   responseType?: string
+  /** F-059: caller-supplied cancellation signal (merged with the timeout) */
+  signal?: AbortSignal
 }): Promise<HttpResponse<T>> {
   const finalUrl = buildUrl(config.url, config.params)
   const headers: Record<string, string> = { ...(config.headers ?? {}) }
@@ -133,6 +154,7 @@ export async function request<T = any>(config: {
     finalUrl,
     { method: config.method.toUpperCase(), headers, body },
     config.timeout ?? DEFAULT_TIMEOUT,
+    config.signal,
   )
   return parseResponse<T>(res, config.responseType)
 }
@@ -266,7 +288,19 @@ export function isSafeUrl(
       return false
     }
 
-    const host = parsed.hostname.toLowerCase().trim()
+    // 尾点归一化（F-055）：WHATWG URL 对**域名**类主机保留结尾点
+    //（`http://localhost./` 的 hostname 仍是 "localhost."），而下面所有
+    // 黑名单都是 `===` / `endsWith` / `$` 锚定匹配，尾点会让它们全部落空。
+    // 实测 `localhost.`、`metadata.google.internal.`、`127.0.0.1.nip.io.`
+    // 可绕过全部检查并真实解析到回环/元数据地址。与 isBrowserUnsafeUrl
+    // 的处理保持一致。
+    //
+    // 大小写与 IDN 已由 URL 解析器归一化（hostname 为小写 punycode），
+    // 这里只需去掉一个或多个结尾点。
+    const host = parsed.hostname
+      .toLowerCase()
+      .trim()
+      .replace(/\.+$/, "")
     if (!host) return false
 
     // 白名单：管理员在存储配置里主动填写的 endpoint host（可能是内网/私有地址）
@@ -326,6 +360,12 @@ export function isSafeUrl(
       if ((g[0] & 0xff00) === 0xff00) return false
       // ::ffff:0:0/96 IPv4-mapped IPv6
       if (isZero(0, 5) && g[5] === 0xffff) {
+        if (isRestrictedIpv4(embeddedIpv4(g[6], g[7]))) return false
+      }
+      // ::/96 IPv4-compatible IPv6（audit L-6，已废弃但部分内核仍按内嵌 IPv4
+      // 解析）：高 6 组全 0、低 2 组还原为 IPv4 后复用同一套判定。
+      // `http://[::7f00:1]/`（= 127.0.0.1）此前会被放行。
+      if (isZero(0, 6)) {
         if (isRestrictedIpv4(embeddedIpv4(g[6], g[7]))) return false
       }
       // 2002::/16 6to4：内嵌 IPv4 位于第 2、3 组

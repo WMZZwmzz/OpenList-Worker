@@ -41,9 +41,10 @@ test("DropboxDriver instantiation and methods", async () => {
   assert.equal(files[1].is_dir, false)
   assert.equal(files[1].size, 1024)
 
-  // Mock getTemporaryLink
-  ;(driver as any).client.getTemporaryLink = async () =>
-    "https://dl.dropboxusercontent.com/test.txt"
+  // Mock getTemporaryLink（F-339 起返回 { link, metadata }）
+  ;(driver as any).client.getTemporaryLink = async () => ({
+    link: "https://dl.dropboxusercontent.com/test.txt",
+  })
 
   const link = await driver.link("/test.txt", "/test.txt")
   assert.equal(link.url, "https://dl.dropboxusercontent.com/test.txt")

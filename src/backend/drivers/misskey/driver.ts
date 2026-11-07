@@ -6,6 +6,14 @@ import {
 import { DriverMisskeyAddition } from "./types"
 import { ClientMisskey } from "./util"
 
+/** 物理路径的父目录（根为 "/"），F-467 */
+export function parentPath(physicalPath: string): string {
+  const parts = String(physicalPath || "")
+    .split("/")
+    .filter(Boolean)
+  return parts.length > 1 ? "/" + parts.slice(0, -1).join("/") : "/"
+}
+
 export class DriverMisskey implements StorageDriver {
   private client: ClientMisskey
   private pathCache = new Map<string, string>()
@@ -141,13 +149,14 @@ export class DriverMisskey implements StorageDriver {
 
   async move(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
+    // F-467：resolveFolderId 按名称逐段解析 Misskey 网盘目录，必须喂物理路径。
     const { id, isDir } = await this.resolveEntry(srcPhysical)
-    const dstId = await this.resolveFolderId(dstDir)
+    const dstId = await this.resolveFolderId(parentPath(dstPhysical))
     if (isDir) await this.client.updateFolder(id, { parentId: dstId })
     else await this.client.updateFile(id, { folderId: dstId })
     this.pathCache.clear()
@@ -155,13 +164,14 @@ export class DriverMisskey implements StorageDriver {
 
   async copy(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
+    // F-467：同 move，目标文件夹取物理路径。
     const { id, isDir } = await this.resolveEntry(srcPhysical)
-    const dstId = await this.resolveFolderId(dstDir)
+    const dstId = await this.resolveFolderId(parentPath(dstPhysical))
     if (isDir) {
       throw new Error("[Misskey] folder copy not supported")
     }
@@ -190,7 +200,9 @@ export class DriverMisskey implements StorageDriver {
       const target = folders.find((f) => f.name === parts[i])
       if (!target) throw new Error(`[Misskey] Folder '${parts[i]}' not found`)
       currentId = target.id
-      const subPath = "/" + parts.slice(0, i + 1).join("/")
+      // F-474：读取键是去掉前导斜杠的 clean（:192），写入键必须同格式，
+      // 否则 pathCache 永远不命中。
+      const subPath = parts.slice(0, i + 1).join("/")
       this.pathCache.set(subPath, currentId)
     }
     return currentId

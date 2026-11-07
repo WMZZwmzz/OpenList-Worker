@@ -45,46 +45,35 @@ export class DriverDoubao implements StorageDriver {
     const parts = physicalPath.split("/").filter(Boolean)
     const rawName = parts[parts.length - 1] || "root"
     const parentPath = "/" + parts.slice(0, -1).join("/")
-    try {
-      const parentId = await this.resolveDirId(parentPath)
-      const files = await this.client.getFiles(parentId)
-      const file = files.find((f) => f.name === rawName)
-      if (file) {
-        const item = this.fileToItem(file)
-        if (!item.is_dir) {
-          try {
-            item.raw_url = await this.client.getDownloadUrl(file)
-            item.raw_url_headers = this.client.downloadHeaders()
-          } catch (e: any) {
-            item.raw_url_error = e.message
-          }
-        }
-        return item
-      }
-    } catch {}
 
-    // Fallback: 目录
-    try {
-      await this.resolveDirId(physicalPath)
-      return {
-        name: rawName,
-        size: 0,
-        is_dir: true,
-        modified: new Date().toISOString(),
-        sign: "",
-        type: 1,
-        raw_url: "",
+    // 父目录解析/列表请求的异常必须向上传播；仅当列表成功且确无该名字时
+    // 才进入目录兜底/not found，避免把瞬时故障伪装成「文件存在」。
+    const parentId = await this.resolveDirId(parentPath)
+    const files = await this.client.getFiles(parentId)
+    const file = files.find((f) => f.name === rawName)
+    if (file) {
+      const item = this.fileToItem(file)
+      if (!item.is_dir) {
+        try {
+          item.raw_url = await this.client.getDownloadUrl(file)
+          item.raw_url_headers = this.client.downloadHeaders()
+        } catch (e: any) {
+          item.raw_url_error = e.message
+        }
       }
-    } catch {
-      return {
-        name: rawName,
-        size: 0,
-        is_dir: false,
-        modified: new Date().toISOString(),
-        sign: "",
-        type: 0,
-        raw_url: "",
-      }
+      return item
+    }
+
+    // 不是文件：确认是否为真实存在的目录，否则抛 not found。
+    await this.resolveDirId(physicalPath)
+    return {
+      name: rawName,
+      size: 0,
+      is_dir: true,
+      modified: new Date().toISOString(),
+      sign: "",
+      type: 1,
+      raw_url: "",
     }
   }
 
@@ -102,8 +91,10 @@ export class DriverDoubao implements StorageDriver {
     physicalPath: string,
     newName: string,
   ): Promise<void> {
-    const nodeId = await this.resolveDirId(physicalPath)
-    await this.client.rename(nodeId, newName)
+    // physicalPath 是条目自身的物理路径；resolveDirId 只匹配目录
+    //（node_type===1），文件必须用 resolveEntry 按名称匹配。
+    const entry = await this.resolveEntry(physicalPath)
+    await this.client.rename(entry.id, newName)
     this.pathCache.clear()
   }
 
@@ -112,20 +103,26 @@ export class DriverDoubao implements StorageDriver {
     physicalPath: string,
     _names: string[],
   ): Promise<void> {
-    const nodeId = await this.resolveDirId(physicalPath)
-    await this.client.remove(nodeId)
+    const entry = await this.resolveEntry(physicalPath)
+    await this.client.remove(entry.id)
     this.pathCache.clear()
   }
 
   async move(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
+    // F-467 同类：dstDir 是含挂载前缀的虚拟路径，resolveDirId 只认豆包账号内
+    // 路径；目标父目录必须从物理路径 dstPhysical 派生（去掉条目自身的名字）。
     const entry = await this.resolveEntry(srcPhysical)
-    const dstId = await this.resolveDirId(dstDir)
+    const dstSegs = String(dstPhysical || "")
+      .split("/")
+      .filter(Boolean)
+    dstSegs.pop()
+    const dstId = await this.resolveDirId("/" + dstSegs.join("/"))
     await this.client.move(entry.id, entry.parentId, dstId)
     this.pathCache.clear()
   }

@@ -74,26 +74,41 @@ export class DropboxDriver implements StorageDriver {
     }
 
     try {
-      const url = await this.client.getTemporaryLink(clean)
+      const { link, metadata } = await this.client.getTemporaryLink(clean)
+      // F-339：优先使用响应里自带的 metadata（真实 size / server_modified），
+      // 而不是硬编码的 0 与「当前时间」。
       return {
-        name,
-        size: 0,
+        name: metadata?.name || name,
+        size: metadata?.size || 0,
         is_dir: false,
-        modified: new Date().toISOString(),
-        sign: clean,
-        type: calcFileType(name, false),
-        raw_url: url,
+        modified:
+          metadata?.server_modified ||
+          metadata?.client_modified ||
+          new Date().toISOString(),
+        sign: metadata?.id || clean,
+        type: calcFileType(metadata?.name || name, false),
+        raw_url: link,
       }
-    } catch {
-      return {
-        name,
-        size: 0,
-        is_dir: true,
-        modified: new Date().toISOString(),
-        sign: clean,
-        type: 1,
-        raw_url: "",
+    } catch (e: any) {
+      // F-336：get_temporary_link 对目录返回 path/not_file，可以据此回退成目录；
+      // 但「对象不存在」「鉴权失败」「网络/限流」必须原样上抛，否则
+      // /fs/get 与 WebDAV 会把不存在的路径或上游故障当成目录。
+      const tag = String(e?.tag || "")
+      if (tag === "not_file" || tag === "not_a_file") {
+        return {
+          name,
+          size: 0,
+          is_dir: true,
+          modified: new Date().toISOString(),
+          sign: clean,
+          type: 1,
+          raw_url: "",
+        }
       }
+      if (tag === "not_found") {
+        throw new Error(`[Dropbox] path not found: ${clean}`)
+      }
+      throw e
     }
   }
 
@@ -102,8 +117,8 @@ export class DropboxDriver implements StorageDriver {
     physicalPath: string,
   ): Promise<{ url: string; headers?: Record<string, string> }> {
     const clean = this.cleanPath(physicalPath)
-    const url = await this.client.getTemporaryLink(clean)
-    return { url }
+    const { link } = await this.client.getTemporaryLink(clean)
+    return { url: link }
   }
 
   async mkdir(virtualPath: string, physicalPath: string): Promise<void> {
@@ -167,21 +182,9 @@ export class DropboxDriver implements StorageDriver {
     content: Buffer | Uint8Array,
   ): Promise<void> {
     const clean = this.cleanPath(physicalPath)
-    await this.client.request("/2/files/upload", {
-      method: "POST",
-      isContentApi: true,
-      customHeaders: {
-        "Dropbox-API-Arg": JSON.stringify({
-          path: clean,
-          mode: "overwrite",
-          autorename: false,
-          mute: false,
-          strict_conflict: false,
-        }),
-        "Content-Type": "application/octet-stream",
-      },
-      body: content,
-    })
+    // F-335/F-338：参数头改为纯 ASCII 的 JSON（非 Latin-1 文件名不再炸），
+    // 且 >150MiB 的文件自动改走 upload_session 分片上传。
+    await this.client.upload(clean, content)
   }
 
   async getDetails(): Promise<{ total_space?: number; used_space?: number }> {

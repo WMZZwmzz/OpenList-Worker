@@ -164,6 +164,15 @@ const PBKDF2_ITERATIONS = 100000
 // 仅提示一次的 legacy 弱 KDF 告警标记（M-4）
 let legacyKdfWarned = false
 
+// S-15：是否允许解密遗留弱 KDF（1 次迭代 + 固定 salt）格式。
+// 默认关闭（fail-closed）；宿主层按 DB_CIPHER_ALLOW_LEGACY 注入。
+let legacyKdfAllowed = false
+
+/** 宿主层（db.ts）按 `DB_CIPHER_ALLOW_LEGACY` 注入；仅供测试重置。 */
+export function setLegacyWeakKdfAllowed(enabled: boolean): void {
+  legacyKdfAllowed = enabled
+}
+
 async function deriveKey(
   password: string,
   salt: Uint8Array | string = "salt",
@@ -221,6 +230,16 @@ export async function decrypt(
     iterations = PBKDF2_ITERATIONS
   } else if (parts.length === 2) {
     // Legacy format compatibility: iv:ciphertext (1 iteration, static "salt")
+    // S-15：该形态只有极早期的部署才会产生（iterations=1 + 固定 salt，可被
+    // 预计算彩虹表）。默认拒绝解密；部署方设置 DB_CIPHER_ALLOW_LEGACY=1 后
+    // 放行（读取一次后下次保存即迁移为新格式，届时可移除该开关）。
+    // env 由宿主层（db.ts）经 setLegacyWeakKdfAllowed 注入，本模块不依赖 env。
+    if (!legacyKdfAllowed) {
+      throw new Error(
+        "[Crypto] Refusing to decrypt legacy weak-KDF format (1-iteration PBKDF2, static salt). " +
+          "Set DB_CIPHER_ALLOW_LEGACY=1 to allow one read; the value migrates to the current format on the next save.",
+      )
+    }
     ivHex = parts[0]
     cipherHex = parts[1]
     iterations = 1
@@ -328,10 +347,12 @@ export function randomString(length: number): string {
  * Used by chaoxing login (key = "u2oh6Vu^HWe4_AES", IV = key).
  * Web Crypto supports AES-CBC with 128/192/256-bit keys.
  *
- * NOTE: the standard WebCrypto (Cloudflare Workers, browsers) does NOT apply
- * PKCS#7 padding automatically — non-block-aligned input throws. Node's
- * `crypto.subtle` (undici/webcrypto) DOES auto-pad. To behave identically in
- * both runtimes, we pad manually only outside Node.
+ * F-053: 这里曾用 `process.release.name === "node"` 嗅探运行时，只在非 Node
+ * 上手动 `pkcs7Pad`。前提是错的：**W3C WebCrypto 规定 AES-CBC encrypt 必须
+ * 自动加 PKCS#7 填充**（Node 的 webcrypto、浏览器、workerd 都遵守）。于是在
+ * Cloudflare Workers（workerd 里 process 存在但 release 缺失 → isNode=false）
+ * 上变成「手动 pad 一层 + workerd 再 pad 一层」，密文多出一整块填充，chaoxing
+ * 登录凭证被污染。直接交原始明文，所有运行时得到统一的单层填充密文。
  */
 export async function aesCbcEncryptBase64(
   plaintext: string,
@@ -348,13 +369,10 @@ export async function aesCbcEncryptBase64(
     ["encrypt"],
   )
   const pt = toBytes(plaintext) as Uint8Array
-  const isNode =
-    typeof process !== "undefined" && process?.release?.name === "node"
-  const data = isNode ? pt : pkcs7Pad(pt)
   const cipherBuf = await crypto.subtle.encrypt(
     { name: "AES-CBC", iv: ivBytes as any },
     keyMat,
-    data as any,
+    pt as any,
   )
   const bytes = new Uint8Array(cipherBuf)
   let binary = ""
@@ -407,8 +425,15 @@ export type DbCipher =
   | "des-cbc-hmac"
   | "3des-cbc-hmac"
 
-/** DB_CIPHER 的默认值：不加密（向后兼容「明文落盘」的既有部署） */
-export const DEFAULT_DB_CIPHER: DbCipher = "none"
+/**
+ * DB_CIPHER 的默认值：AES-256-GCM（2026-10-31 深度安全审查报告 S-01）。
+ *
+ * 此前默认 `none`，即 refresh_token、OTP 种子、口令哈希等全部明文落库——
+ * 任何能读到 KV/D1 的人都等于接管全部网盘账号。密文自带 `enc:vN:` 版本前缀
+ * 且读取按前缀识别算法，历史明文库不受影响：加载时明文原样返回，下次保存
+ * 即自动迁移为密文（平滑兼容）。显式设置 `DB_CIPHER=none` 仍可关闭加密。
+ */
+export const DEFAULT_DB_CIPHER: DbCipher = "aes-256-gcm"
 
 /** 可选算法（文档与错误提示用，顺序即推荐顺序） */
 export const DB_CIPHER_VALUES: DbCipher[] = [
@@ -484,8 +509,8 @@ const DB_CIPHER_ALIASES: Record<string, DbCipher> = {
 /**
  * 解析 DB_CIPHER 取值。
  *
- * @returns `known=false` 表示取值无法识别（调用方应告警，但仍拿到安全默认值 `none`，
- *          绝不因为拼错变量而悄悄启用一把谁也不知道的算法）
+ * @returns `known=false` 表示取值无法识别（调用方应当**拒绝启动**而不是降级，
+ *          见 S-01：静默降级会让「以为开了加密」的部署实际裸奔）
  */
 export function resolveDbCipher(raw: unknown): {
   cipher: DbCipher

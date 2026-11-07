@@ -286,7 +286,7 @@ export class TeraboxApiClient {
     form.set("filelist", JSON.stringify(filelist))
     form.set("ondup", "newcopy")
 
-    return this.request("/api/filemanager", {
+    const resp = await this.request<any>("/api/filemanager", {
       method: "POST",
       params: {
         onnest: "fail",
@@ -299,5 +299,13 @@ export class TeraboxApiClient {
         ondup: "newcopy",
       },
     })
+
+    // /api/filemanager 以 HTTP 200 + errno≠0 表达失败（重名、权限、空间等），
+    // 不检查会把网盘拒绝的操作报告成成功。
+    const errno = Number(resp?.errno ?? 0)
+    if (errno !== 0) {
+      throw new Error(`[TeraBox] ${opera} failed (errno: ${errno})`)
+    }
+    return resp
   }
 }

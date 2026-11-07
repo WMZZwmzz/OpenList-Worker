@@ -120,3 +120,32 @@ test("深层 base_path 同样只在自己的根内活动", () => {
     )
   }
 })
+
+test("F-064: base_path 自身含 .. 时，根目录与子路径解析到同一棵树", () => {
+  // 之前只有 reqPath="/" 的分支会折叠 base_path 里的 ..，子路径分支把非折叠的
+  // base_path 拼进去，导致根列表指向 /photos、子路径落在 /data/photos/...，
+  // isWithinUserRoot 随后拒绝一切写入。
+  for (const base of ["/data/../photos", "/data/%2e%2e/photos", "/data/.../photos"]) {
+    const u = { role: 0, permission: 0, base_path: base } as any
+    assert.equal(getActualPath(u, "/"), "/photos", `root for ${base}`)
+    const child = getActualPath(u, "/sub/file.txt")
+    assert.equal(child, "/photos/sub/file.txt", `child for ${base}`)
+    assert.equal(isWithinUserRoot(u, child), true, `containment for ${base}`)
+    assert.equal(
+      isWithinUserRoot(u, getActualPath(u, "/")),
+      true,
+      `root containment for ${base}`,
+    )
+  }
+})
+
+test("F-064: 规范化后的 base_path 仍然无法被 .. 逃逸", () => {
+  const u = { role: 0, permission: 0, base_path: "/data/../photos" } as any
+  for (const req of ["/../x", "/../../x", "/a/../../../x", "/%2e%2e/x"]) {
+    const actual = getActualPath(u, req)
+    assert.ok(
+      actual === "/photos" || actual.startsWith("/photos/"),
+      `escape: req=${JSON.stringify(req)} actual=${JSON.stringify(actual)}`,
+    )
+  }
+})

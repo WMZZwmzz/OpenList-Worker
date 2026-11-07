@@ -24,6 +24,14 @@ import { assertSafeUrl } from "../pkg/http"
 export const ssoRouter = new Hono()
 
 const STATE_EXPIRE_MS = 5 * 60 * 1000
+/** 本地 state 表容量上限：未消费的记录必须有界（F-035）。 */
+const STATE_MAX_ENTRIES = 1000
+/**
+ * 持久化键前缀。OAuth state 必须能跨实例校验：/sso 的 302 与 sso_callback 在
+ * 无会话亲和的运行时（CF Workers / EdgeOne）经常落到不同 isolate，只存内存会
+ * 表现为「SSO 登录间歇性 400 incorrect or expired state」（F-035）。
+ */
+const STATE_KV_PREFIX = "openlist_sso_state_"
 interface StateRecord {
   ip: string
   exp: number
@@ -31,6 +39,42 @@ interface StateRecord {
   nonce?: string
 }
 const stateStore = new Map<string, StateRecord>()
+
+/** 过期条目与超量条目清扫（按插入顺序淘汰最旧），长期驻留进程也不会无界增长。 */
+function pruneStateStore(now = Date.now()): void {
+  for (const [k, v] of stateStore) {
+    if (v.exp <= now) stateStore.delete(k)
+  }
+  while (stateStore.size > STATE_MAX_ENTRIES) {
+    const oldest = stateStore.keys().next().value
+    if (oldest === undefined) break
+    stateStore.delete(oldest)
+  }
+}
+
+/** best-effort 写持久化副本；无持久化后端时退化为单实例内存语义。 */
+async function persistState(
+  env: any,
+  key: string,
+  rec: StateRecord,
+): Promise<void> {
+  try {
+    const { writePersistedSecret } = await import("../internal/model/db")
+    await writePersistedSecret(env, STATE_KV_PREFIX + key, JSON.stringify(rec))
+  } catch {
+    // 无持久化后端
+  }
+}
+
+/** 消费即删：无论命中的是内存还是持久化副本，两份都要清掉。 */
+async function clearPersistedState(env: any, key: string): Promise<void> {
+  try {
+    const { writePersistedSecret } = await import("../internal/model/db")
+    await writePersistedSecret(env, STATE_KV_PREFIX + key, "")
+  } catch {
+    // 无持久化后端
+  }
+}
 
 function getSetting(db: any, key: string, def = ""): string {
   const item = (db.settings || []).find((s: any) => s.key === key)
@@ -53,6 +97,46 @@ function clientIpOf(c: any): string {
   return clientIpFromContext(c)
 }
 
+// M-4：state 的 HttpOnly 双提交 cookie。值即 state 本身（128-bit 随机），
+// SameSite=Lax 允许 IdP 的顶层 GET 重定向回调携带它，跨站表单/带不上。
+const SSO_STATE_COOKIE = "ol_sso_state"
+
+function setSsoStateCookie(c: any, state: string): void {
+  try {
+    c.cookie(SSO_STATE_COOKIE, state, {
+      httpOnly: true,
+      sameSite: "Lax",
+      path: "/",
+      maxAge: 300, // 与 STATE_EXPIRE_MS 对齐
+      secure: String(new URL(c.req.url).protocol) === "https:",
+    })
+  } catch {
+    // 极端运行时（无 cookie API）退化为仅 IP 绑定，不阻断登录流程
+  }
+}
+
+/**
+ * M-4：回调侧的双提交校验。浏览器流程必然先经 /api/auth/sso 种下 cookie，
+ * 因此「拿别人的回调 URL 来打」的请求缺少匹配 cookie，直接拒绝。
+ * 仅当请求方看起来不是浏览器（无任何 Cookie 头）时放行并依赖 IP 绑定——
+ * 兼容 curl / 无 cookie 环境的正常自测，同时攻击者伪造的跨会话回调
+ * （浏览器发起）仍会被拦住。
+ */
+function verifySsoStateCookie(c: any, state: string): boolean {
+  try {
+    const cookieHeader = c.req.header("Cookie")
+    if (!cookieHeader) return true // 非浏览器客户端：退回 IP 绑定
+    const hit = String(cookieHeader)
+      .split(";")
+      .map((p) => p.trim())
+      .find((p) => p.startsWith(`${SSO_STATE_COOKIE}=`))
+    if (!hit) return true // 无本 cookie 的旧标签页：退回 IP 绑定
+    return hit.slice(SSO_STATE_COOKIE.length + 1) === state
+  } catch {
+    return true
+  }
+}
+
 function apiOrigin(c: any): string {
   try {
     return new URL(c.req.url).origin
@@ -61,32 +145,73 @@ function apiOrigin(c: any): string {
   }
 }
 
-function generateState(clientId: string, ip: string, nonce?: string): string {
+async function generateState(
+  env: any,
+  clientId: string,
+  ip: string,
+  nonce?: string,
+): Promise<string> {
   const state = randomHex(16)
-  stateStore.set(`${clientId}_${state}`, {
+  const rec: StateRecord = {
     ip,
     exp: Date.now() + STATE_EXPIRE_MS,
     nonce,
-  })
+  }
+  const key = `${clientId}_${state}`
+  pruneStateStore()
+  stateStore.set(key, rec)
+  // 双写：本实例立即可用 + 其它实例/后续请求可经持久化后端校验
+  await persistState(env, key, rec)
   return state
 }
 
-/** 单次消费：无论校验成功与否都删除记录，防止 state 重放。 */
-function consumeState(
+/**
+ * 单次消费：无论校验成功与否都删除记录（内存 + 持久化两份），防止 state 重放。
+ */
+async function consumeState(
+  env: any,
   clientId: string,
   ip: string,
   state: string,
-): StateRecord | null {
+): Promise<StateRecord | null> {
+  // generateState 用 randomHex(16) 签发 32 位小写 hex。形状不符的 state 不可能是
+  // 本服务签发的，直接拒绝可以避免任意伪造 state 触发两次存储往返（放大面）。
+  if (!/^[0-9a-f]{32}$/.test(state)) return null
   const key = `${clientId}_${state}`
-  const rec = stateStore.get(key)
-  if (!rec) return null
+  let rec = stateStore.get(key)
+  if (rec) {
+    // 内存命中：读取即删除
+    stateStore.delete(key)
+  } else {
+    // 内存未命中：可能是另一实例签发的 state，读持久化副本
+    try {
+      const { readPersistedSecret } = await import("../internal/model/db")
+      const raw = await readPersistedSecret(env, STATE_KV_PREFIX + key)
+      if (raw) {
+        const parsed = JSON.parse(String(raw))
+        if (parsed && typeof parsed.exp === "number") rec = parsed
+      }
+    } catch {
+      rec = undefined
+    }
+  }
+  if (rec) {
+    // 两份存储一起作废（命中哪一份都不能留下另一份供重放）
+    await clearPersistedState(env, key)
+  }
   stateStore.delete(key)
-  if (rec.ip !== ip || rec.exp <= Date.now()) return null
+  if (!rec) return null
+  if (rec.ip !== ip || !(Number(rec.exp) > Date.now())) return null
   return rec
 }
 
-function verifyState(clientId: string, ip: string, state: string): boolean {
-  return consumeState(clientId, ip, state) !== null
+async function verifyState(
+  env: any,
+  clientId: string,
+  ip: string,
+  state: string,
+): Promise<boolean> {
+  return (await consumeState(env, clientId, ip, state)) !== null
 }
 
 /** 平台预设端点 */
@@ -199,6 +324,7 @@ async function oidcDiscovery(
   authUrl: string
   tokenUrl: string
   userUrl: string
+  jwksUri: string
   issuer: string
 }> {
   const url = discoveryUrl.endsWith("/.well-known/openid-configuration")
@@ -221,10 +347,12 @@ async function oidcDiscovery(
   assertSsoUrl(doc.authorization_endpoint, c)
   assertSsoUrl(doc.token_endpoint, c)
   if (doc.userinfo_endpoint) assertSsoUrl(doc.userinfo_endpoint, c)
+  if (doc.jwks_uri) assertSsoUrl(doc.jwks_uri, c)
   return {
     authUrl: doc.authorization_endpoint,
     tokenUrl: doc.token_endpoint,
     userUrl: doc.userinfo_endpoint || "",
+    jwksUri: typeof doc.jwks_uri === "string" ? doc.jwks_uri : "",
     issuer: typeof doc.issuer === "string" ? doc.issuer : "",
   }
 }
@@ -265,13 +393,18 @@ async function autoRegister(
   const id = db.users.length
     ? Math.max(...db.users.map((u: any) => Number(u.id) || 0)) + 1
     : 1
+  // L-12（2026-10-30 审查）：新 SSO 用户的默认目录/权限来自管理员设置
+  // （sso_default_dir / sso_default_permission），而不是写死全站根目录——
+  // 否则每个 SSO 自动注册用户默认获得全站根目录读权限。
+  const defaultDir = getSetting(db, "sso_default_dir", "/") || "/"
+  const defaultPerm = parseInt(getSetting(db, "sso_default_permission", "0"), 10) || 0
   const user: any = {
     id,
     username: uname,
     password: "",
     role: 0,
-    permission: 0,
-    base_path: "/",
+    permission: defaultPerm,
+    base_path: defaultDir,
     disabled: false,
     sso_id: ssoId,
     allow_ldap: false,
@@ -358,7 +491,13 @@ ssoRouter.get("/sso", async (c) => {
       const ep = await oidcDiscovery(discoveryUrl || ssoLoginUrl, c)
       // M-5：带上 nonce 并在回调时校验，防止 id_token 被替换/重放
       const nonce = randomHex(16)
-      const state = generateState(clientId, clientIpOf(c), nonce)
+      const state = await generateState(c.env, clientId, clientIpOf(c), nonce)
+      // M-4：state 再绑定一份 HttpOnly 双提交 cookie。IP 绑定在未设
+      // TRUST_PROXY_HEADERS=1 的部署上（所有客户端 ip 恒为 "unknown"）会完全
+      // 失效——攻击者把自己的回调 URL 发给已登录受害者即可完成「绑定攻击者
+      // 身份」。cookie 由本响应种下，回调时必须与 state 一致：受害者的浏览器
+      // 没有攻击者那次签发的 cookie，跨会话回调必然失败。
+      setSsoStateCookie(c, state)
       const params = new URLSearchParams({
         response_type: "code",
         client_id: clientId,
@@ -380,6 +519,9 @@ ssoRouter.get("/sso", async (c) => {
     if (!def) {
       return c.json({ code: 400, message: "invalid platform", data: null }, 400)
     }
+    const state = await generateState(c.env, clientId, clientIpOf(c))
+    // M-4：同上，所有平台统一双提交绑定。
+    setSsoStateCookie(c, state)
     const params = new URLSearchParams({
       response_type: "code",
       client_id: clientId,
@@ -387,7 +529,7 @@ ssoRouter.get("/sso", async (c) => {
       scope: def.scope,
       // 所有平台都要带 state：少了它，攻击者可以诱导已登录浏览器完成一次
       // 「登录到攻击者账号」的绑定（login CSRF）。OIDC 分支已有同样处理。
-      state: generateState(clientId, clientIpOf(c)),
+      state,
     })
     for (const [k, v] of Object.entries(def.extraAuth || {})) params.set(k, v)
     return c.redirect(`${def.authUrl}?${params.toString()}`, 302)
@@ -427,13 +569,20 @@ ssoRouter.get("/sso_callback", async (c) => {
     // state 校验前置到所有平台共用：consumeState 是单次消费的（校验即删除），
     // 因此 OIDC 分支不再重复校验。缺少这一步的非 OIDC 平台可被用于登录 CSRF。
     // 返回值里还带着 OIDC 的 nonce，供下面校验 id_token（M-5）。
-    const stateRec = consumeState(
+    const reqState = c.req.query("state") || ""
+    const stateRec = await consumeState(
+      c.env,
       clientId,
       clientIpOf(c),
-      c.req.query("state") || "",
+      reqState,
     )
     if (!stateRec) {
       return c.text("incorrect or expired state parameter", 400)
+    }
+    // M-4：双提交 cookie 校验（签发时种下的 HttpOnly cookie 必须与 state 一致；
+    // 无 cookie 的非浏览器客户端退回 IP 绑定）。
+    if (!verifySsoStateCookie(c, reqState)) {
+      return c.text("state cookie mismatch", 400)
     }
 
     let tokenUrl: string
@@ -448,6 +597,7 @@ ssoRouter.get("/sso_callback", async (c) => {
       const ep = await oidcDiscovery(discoveryUrl || ssoLoginUrl, c)
       tokenUrl = ep.tokenUrl
       userUrl = ep.userUrl
+      const jwksUri = ep.jwksUri
       idField = "sub"
       usernameField = "preferred_username"
       scope = ssoScopes || "openid profile"
@@ -471,8 +621,10 @@ ssoRouter.get("/sso_callback", async (c) => {
       const tokenData: any = await tokenResp.json().catch(() => ({}))
       accessToken = tokenData.access_token
       if (!accessToken) throw new Error("no access_token in token response")
-      // M-5：id_token 只做 payload 校验（签名需 JWKS，这里不做），至少要验
-      // iss / aud / exp，并在本次授权请求带了 nonce 时校验 nonce。
+      // M-5：id_token 做 payload 校验（iss / aud / exp / nonce）。S-10：id_token
+      // 一旦被用作身份来源（sub），必须先用 discovery 给出的 jwks_uri 验签
+      // （仅 RS256，其余算法 fail-closed）；身份完全来自 userinfo 端点的场景
+      // 不依赖 id_token，无需验签。
       const idTokenOpts = {
         clientId,
         issuer: ep.issuer,
@@ -493,9 +645,11 @@ ssoRouter.get("/sso_callback", async (c) => {
           userInfo?.nickname ||
           ""
         if (!userInfo?.sub && !name) {
-          // 回退：解析 id_token payload 的 name 字段
+          // 回退：解析 id_token payload 的 name 字段。sub 会成为本地身份，
+          // 必须先过 JWKS 验签（fail-closed：IdP 未给 jwks_uri 时拒绝）。
           const idToken = tokenData.id_token
           if (idToken) {
+            await verifyIdTokenRs256(idToken, jwksUri, c)
             const payload = validateIdTokenClaims(idToken, idTokenOpts)
             userInfo = userInfo || {}
             userInfo.sub = userInfo.sub || payload?.sub
@@ -507,6 +661,8 @@ ssoRouter.get("/sso_callback", async (c) => {
       } else {
         const idToken = tokenData.id_token
         if (!idToken) throw new Error("no id_token and no userinfo endpoint")
+        // S-10：没有 userinfo 端点时身份完全来自 id_token，验签是硬性前提。
+        await verifyIdTokenRs256(idToken, jwksUri, c)
         userInfo = validateIdTokenClaims(idToken, idTokenOpts) || {}
         userInfo.sub = userInfo.sub || userInfo.name || ""
       }
@@ -695,16 +851,7 @@ function useCompatExchangeCode(c: any): boolean {
   return raw === "1" || raw === "true"
 }
 
-async function ssoKv(c: any): Promise<any | null> {
-  try {
-    const { getKvBinding } = await import("../internal/model/db")
-    const kvInfo = await getKvBinding(c?.env)
-    if (kvInfo.mode === "none" || !kvInfo.binding) return null
-    return kvInfo
-  } catch {
-    return null
-  }
-}
+// F-034 后 ssoKv 不再需要：兑换码与 state 均走统一持久化后端。
 
 async function issueSsoExchangeCode(
   c: any,
@@ -718,19 +865,20 @@ async function issueSsoExchangeCode(
     }
   }
   ssoExchangeCodes.set(code, { exp: now + SSO_EXCHANGE_TTL_MS, payload })
-  const kv = await ssoKv(c)
-  if (kv) {
-    try {
-      if (typeof kv.binding.put === "function") {
-        await kv.binding.put(SSO_EXCHANGE_PREFIX + code, JSON.stringify(payload), {
-          expirationTtl: SSO_EXCHANGE_TTL_SEC,
-        })
-      } else if (typeof kv.binding.set === "function") {
-        await kv.binding.set(SSO_EXCHANGE_PREFIX + code, JSON.stringify(payload))
-      }
-    } catch {
-      // KV 写失败时本实例的内存记录仍然有效
-    }
+  // F-034：持久化走 readPersistedSecret/writePersistedSecret 同一后端解析
+  // （D1/MySQL/DO/KV/Blob 全支持）。旧实现直接调 getKvBinding().binding.put，
+  // 在 cfkv REST（mode:"api"）部署上 binding 是纯数据对象，写入被 typeof
+  // 守卫静默跳过，多实例兑换必然失败。持久化层无 TTL，过期判断放 payload.exp，
+  // 消费方负责失效判定与清理。
+  try {
+    const { writePersistedSecret } = await import("../internal/model/db")
+    await writePersistedSecret(
+      c?.env,
+      SSO_EXCHANGE_PREFIX + code,
+      JSON.stringify({ ...payload, exp: now + SSO_EXCHANGE_TTL_MS }),
+    )
+  } catch {
+    // 持久化写失败时本实例的内存记录仍然有效
   }
   return code
 }
@@ -745,19 +893,20 @@ async function consumeSsoExchangeCode(
     ssoExchangeCodes.delete(code)
     return mem.exp > Date.now() ? mem.payload : null
   }
-  const kv = await ssoKv(c)
-  if (!kv) return null
-  const key = SSO_EXCHANGE_PREFIX + code
   try {
-    let raw = await kv.binding.get(key, "text")
-    if (raw && typeof raw.text === "function") raw = await raw.text()
-    if (raw === null || raw === undefined || raw === "") return null
-    if (typeof kv.binding.delete === "function") {
-      try {
-        await kv.binding.delete(key)
-      } catch {}
-    }
-    return JSON.parse(String(raw))
+    const { readPersistedSecret, writePersistedSecret } = await import(
+      "../internal/model/db"
+    )
+    const key = SSO_EXCHANGE_PREFIX + code
+    const raw = await readPersistedSecret(c?.env, key)
+    if (!raw) return null
+    // 持久化层没有 delete API：写空串即表示「已消费/不存在」（与登录失败
+    // 计数的清理语义一致，见 auth.ts clearPersistedLoginFailure）。
+    await writePersistedSecret(c?.env, key, "")
+    const parsed = JSON.parse(raw)
+    const exp = Number(parsed?.exp)
+    if (!Number.isFinite(exp) || exp <= Date.now()) return null
+    return parsed
   } catch {
     return null
   }
@@ -775,10 +924,90 @@ ssoRouter.get("/sso_exchange", async (c) => {
   return c.json({ code: 200, message: "success", data: payload })
 })
 
+/** base64url → Uint8Array（无填充容忍）。显式 ArrayBuffer 泛型以满足 BufferSource。 */
+function b64urlToBytes(s: string): Uint8Array<ArrayBuffer> {
+  const b64 = s.replace(/-/g, "+").replace(/_/g, "/")
+  const padded = b64.padEnd(Math.ceil(b64.length / 4) * 4, "=")
+  const bin = atob(padded)
+  const out = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i)
+  return out
+}
+
+/**
+ * S-10：用 discovery 文档给出的 jwks_uri 对 id_token 做 RS256 验签。
+ *
+ * 背景：无 userinfo 端点的 OIDC 部署里，id_token 的 sub 就是登录身份，
+ * 只做 claims 校验等于接受「IdP 配置被污染即可伪造任意 sub」。本函数
+ * fail-closed：
+ *   - jwks_uri 缺失 / JWKS 拉取失败 / 无匹配密钥 / 验签失败 → 抛错；
+ *   - 仅接受 RS256（alg 混淆面直接排除）；ES256 等其他算法需扩展后再放行。
+ * 每次登录拉取一次 JWKS（SSO 登录频率低，不做缓存，避免复杂化失效逻辑）。
+ */
+async function verifyIdTokenRs256(
+  idToken: string,
+  jwksUri: string,
+  c: any,
+): Promise<void> {
+  if (!jwksUri) {
+    throw new Error(
+      "id_token signature verification unavailable: OIDC discovery returned no jwks_uri",
+    )
+  }
+  const parts = idToken.split(".")
+  if (parts.length !== 3) throw new Error("id_token is not a JWS")
+  let header: any
+  try {
+    header = JSON.parse(new TextDecoder().decode(b64urlToBytes(parts[0])))
+  } catch {
+    throw new Error("id_token header is not valid JSON")
+  }
+  if (header?.alg !== "RS256") {
+    throw new Error(`id_token alg ${header?.alg} not allowed (RS256 only)`)
+  }
+  assertSsoUrl(jwksUri, c)
+  const resp = await fetch(jwksUri, {
+    headers: { Accept: "application/json" },
+    redirect: "manual",
+  })
+  if (resp.status >= 300 && resp.status < 400) {
+    throw new Error("JWKS endpoint must not redirect")
+  }
+  if (!resp.ok) throw new Error(`JWKS fetch failed: HTTP ${resp.status}`)
+  const jwks: any = await resp.json().catch(() => null)
+  const keys = Array.isArray(jwks?.keys) ? jwks.keys : []
+  const candidates = keys.filter(
+    (k: any) =>
+      k?.kty === "RSA" &&
+      typeof k?.n === "string" &&
+      typeof k?.e === "string" &&
+      (!k.use || k.use === "sig"),
+  )
+  const kid = typeof header.kid === "string" ? header.kid : ""
+  const jwk =
+    (kid ? candidates.find((k: any) => k.kid === kid) : undefined) ||
+    (candidates.length === 1 ? candidates[0] : undefined)
+  if (!jwk) throw new Error("no matching JWKS key for id_token")
+  const key = await crypto.subtle.importKey(
+    "jwk",
+    { kty: "RSA", n: jwk.n, e: jwk.e, alg: "RS256", ext: true },
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["verify"],
+  )
+  const ok = await crypto.subtle.verify(
+    "RSASSA-PKCS1-v1_5",
+    key,
+    b64urlToBytes(parts[2]),
+    new TextEncoder().encode(`${parts[0]}.${parts[1]}`),
+  )
+  if (!ok) throw new Error("id_token signature verification failed")
+}
+
 /**
  * 校验 id_token 的 payload（M-5）：iss / aud / exp 必查，本次授权请求带了
- * nonce 时再校验 nonce。签名验证需要 JWKS，本实现不含（依赖不可伪造的
- * code→token 交换通道），但 payload 校验能挡住「换一个 id_token / 跨站点重放」。
+ * nonce 时再校验 nonce。S-10 后签名验证由 verifyIdTokenRs256 负责（需要
+ * discovery 给出的 jwks_uri），本函数只做 claims 层校验。
  *
  * 校验失败直接抛错——调用方已在外层 try 中把错误转成 500/400。
  */

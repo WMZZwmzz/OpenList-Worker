@@ -39,6 +39,7 @@ import {
 import { buildWebDavPropfindResponse } from "../internal/webdav/webdav"
 import { safeErrorMessage } from "../pkg/errs"
 import { encodeDownloadPath } from "../pkg/path"
+import { readBodyWithinLimit } from "../pkg/upload-limit"
 
 /**
  * WebDAV 协议服务（挂载于 /dav/*）。
@@ -284,6 +285,43 @@ function davPrefixOf(c: any, davPath: string): string {
     : ""
 }
 
+/**
+ * 单个**文件**资源的 207 响应体（F-046）。
+ *
+ * 不能复用 generateWebDavXml：那里把被请求资源恒定声明为集合（pkg/xml.ts:111），
+ * 文件会被报告成目录且没有 getcontentlength。这里按 RFC 4918 §9.1 输出空
+ * resourcetype + 大小 + 修改时间，href 仍是与请求路径一致的相对引用。
+ */
+function filePropfindXml(requestPath: string, item: any): string {
+  const esc = (s: string) =>
+    String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+  const modifiedTs = Date.parse(String(item.modified || ""))
+  const modified = new Date(
+    Number.isFinite(modifiedTs) ? modifiedTs : Date.now(),
+  ).toUTCString()
+  return (
+    `<?xml version="1.0" encoding="utf-8" ?>\n` +
+    `<d:multistatus xmlns:d="DAV:">\n` +
+    `  <d:response>\n` +
+    `    <d:href>${esc(requestPath)}</d:href>\n` +
+    `    <d:propstat>\n` +
+    `      <d:prop>\n` +
+    `        <d:resourcetype/>\n` +
+    `        <d:getcontentlength>${Number(item.size) || 0}</d:getcontentlength>\n` +
+    `        <d:getcontenttype>application/octet-stream</d:getcontenttype>\n` +
+    `        <d:getlastmodified>${modified}</d:getlastmodified>\n` +
+    `      </d:prop>\n` +
+    `      <d:status>HTTP/1.1 200 OK</d:status>\n` +
+    `    </d:propstat>\n` +
+    `  </d:response>\n` +
+    `</d:multistatus>`
+  )
+}
+
 webdavRouter.all("/*", async (c) => {
   const method = c.req.method.toUpperCase()
 
@@ -350,18 +388,33 @@ webdavRouter.all("/*", async (c) => {
           return metaForbidden(c)
         }
         const depth = c.req.header("Depth") || "1"
-        const res = await listItems(actualPath, ctx)
-        const items = (res.content || []).map((it: any) => ({
-          name: it.name,
-          size: it.size || 0,
-          isFolder: !!it.is_dir,
-          modified: it.modified || new Date().toISOString(),
-        }))
+        // F-046：必须先分辨目标是目录还是文件。
+        //   ① 对文件调 listItems 会把文件物理路径当目录去 list（autoindex 甚至
+        //      会去 fetch 一个“文件目录”，返回 404/500 或空列表）；
+        //   ② 文件被当成集合输出（resourcetype 恒为 collection、没有
+        //      getcontentlength），依赖文件 PROPFIND 的客户端拿到错误元数据。
+        const { item } = await getItem(actualPath, ctx)
+        if (!item) return c.text("Not found", 404)
+        if (!item.is_dir) {
+          return c.body(filePropfindXml(davRequestPath(c), item), 207, {
+            "Content-Type": "application/xml; charset=utf-8",
+          })
+        }
+        // Depth:0 只返回集合自身；Depth:1（及不能递归的 infinity）列直接子项
+        const isSelfOnly = depth.trim() === "0"
+        const items = isSelfOnly
+          ? []
+          : ((await listItems(actualPath, ctx)).content || []).map((it: any) => ({
+              name: it.name,
+              size: it.size || 0,
+              isFolder: !!it.is_dir,
+              modified: it.modified || new Date().toISOString(),
+            }))
         // davPathOf 已剥掉挂载前缀，那是给存储层寻址用的；href 必须反映真实请求
         // 路径。少了挂载前缀，rclone / Windows 资源管理器会因「返回的 href 与请求
         // 路径对不上」丢弃全部记录（能下载但列不出目录）。见 Issue #104。
         const xml = buildWebDavPropfindResponse(davRequestPath(c), items)
-        return c.body(xml, depth === "0" ? 207 : 207, {
+        return c.body(xml, 207, {
           "Content-Type": "application/xml; charset=utf-8",
         })
       }
@@ -395,8 +448,20 @@ webdavRouter.all("/*", async (c) => {
         if (await deniedByMetaWrite(c, user, splitPath(actualPath).dir, true)) {
           return metaForbidden(c)
         }
-        const buffer = Buffer.from(await c.req.arrayBuffer())
-        await putItem(actualPath, buffer, ctx)
+        // F-044：与 /fs/put、S3 PutObject 共用同一套上限（Content-Length 预检 +
+        // 边读边计的实际字节复核）。历史实现直接 arrayBuffer() 整包读入内存，
+        // 超大 PUT（或省略 Content-Length 的 chunked 请求）可打爆 isolate。
+        // 默认上限 25MB（MAX_UPLOAD 可调）；WebDAV 客户端上传大文件需要管理员
+        // 按部署实际调整该变量。
+        const body = await readBodyWithinLimit(c, false)
+        if (!body.ok) {
+          return c.text(
+            `Payload Too Large: upload exceeds the ${body.limit} byte limit`,
+            413,
+            { "Content-Type": "text/plain; charset=utf-8" },
+          )
+        }
+        await putItem(actualPath, body.buffer, ctx)
         return c.body(null, 201)
       }
 

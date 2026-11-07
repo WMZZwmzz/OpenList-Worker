@@ -70,6 +70,17 @@ function createMockSqlDriver(name = "mock-sql"): Driver {
         const k = String(params[0])
         return schemaInfo.has(k) ? [{ v: schemaInfo.get(k) }] : []
       }
+      // SELECT 1 FROM `table` LIMIT 1（load 的「标记缺失但表非空」探测）
+      const exists = trimmed.match(/^SELECT 1 FROM `?(\w+)`? LIMIT 1$/i)
+      if (exists) {
+        return ensureTable(exists[1]).length > 0 ? [{ "1": 1 }] : []
+      }
+      // SELECT `keyCol` FROM `table`（大表删除前读取既有主键）
+      const selCol = trimmed.match(/^SELECT `?(\w+)`? FROM `?(\w+)`?$/i)
+      if (selCol && selCol[1] !== "*") {
+        const [, column, table] = selCol
+        return ensureTable(table).map((r: any) => ({ [column]: r[column] }))
+      }
       // SELECT * FROM `table`
       const m = trimmed.match(/^SELECT \* FROM `?(\w+)`?/i)
       if (m) return ensureTable(m[1]).map((r) => ({ ...r }))
@@ -100,6 +111,20 @@ function createMockSqlDriver(name = "mock-sql"): Driver {
           tables.set(
             table,
             rows.filter((r: any) => keep.has(String(r[keyCol]))),
+          )
+          continue
+        }
+        // DELETE FROM `table` WHERE `key` IN (?, ?, ...)（大表分片删除）
+        const delIn = trimmed.match(
+          /^DELETE FROM `?(\w+)`? WHERE `?(\w+)`? IN \(([^)]*)\)/i,
+        )
+        if (delIn) {
+          const [, table, keyCol] = delIn
+          const victims = new Set(params.map((p) => String(p)))
+          const rows = ensureTable(table)
+          tables.set(
+            table,
+            rows.filter((r: any) => !victims.has(String(r[keyCol]))),
           )
           continue
         }
@@ -207,6 +232,48 @@ test("schema: SQL table names align with Go GORM naming", () => {
   assert.ok(D1_SCHEMA.some((d) => d.includes("x_sharing_dbs")))
 })
 
+test("schema: MySQL 键列必须是 VARCHAR（TEXT 键会触发 ERROR 1170）", () => {
+  // 回归防护（F-076）：MySQL 不允许 TEXT/BLOB 列在不带前缀长度时作为
+  // PRIMARY KEY / UNIQUE。旧实现把所有 string 列映射成 TEXT 再追加键约束，
+  // 生成的 CREATE TABLE 在全新 MySQL 库上必然失败，mysql 驱动整体不可用。
+  const mysql = MYSQL_SCHEMA.join("\n")
+  for (const ddl of MYSQL_SCHEMA) {
+    assert.ok(
+      !/`[^`]+` TEXT[^,)]*(PRIMARY KEY|UNIQUE)/i.test(ddl),
+      `MySQL DDL 仍有 TEXT 键列: ${ddl}`,
+    )
+  }
+
+  const ddlOf = (table: string) => {
+    const found = MYSQL_SCHEMA.find((d) =>
+      d.startsWith(`CREATE TABLE IF NOT EXISTS \`${table}\``),
+    )
+    assert.ok(found, `缺少表 ${table} 的 MySQL DDL`)
+    return found!
+  }
+
+  // 全部受影响的键列（含复核发现的 x_storages.mount_path）
+  assert.ok(ddlOf("x_setting_items").includes("`key` VARCHAR(191) PRIMARY KEY"))
+  assert.ok(ddlOf("x_sharing_dbs").includes("`id` VARCHAR(191) PRIMARY KEY"))
+  assert.ok(ddlOf("x_plugins").includes("`id` VARCHAR(191) PRIMARY KEY"))
+  assert.ok(
+    ddlOf("x_users").includes("`username` VARCHAR(191) NOT NULL UNIQUE"),
+  )
+  assert.ok(
+    ddlOf("x_storages").includes("`mount_path` VARCHAR(191) NOT NULL UNIQUE"),
+  )
+  assert.ok(ddlOf("x_metas").includes("`path` VARCHAR(191) NOT NULL UNIQUE"))
+
+  // 非键字符串列保持 TEXT，不收紧容量
+  assert.ok(ddlOf("x_setting_items").includes("`value` TEXT"))
+  assert.ok(ddlOf("x_users").includes("`password` TEXT"))
+
+  // SQLite（D1 / DO）没有该限制，保持 TEXT 键，不做无谓变更
+  const d1 = D1_SCHEMA.join("\n")
+  assert.ok(d1.includes("`username` TEXT NOT NULL UNIQUE"))
+  assert.ok(d1.includes("`key` TEXT PRIMARY KEY"))
+})
+
 test("schema: column serialization roundtrip", () => {
   const boolCol = { name: "disabled", type: "bool" as const }
   assert.equal(serializeColumn(boolCol, true), 1)
@@ -300,6 +367,104 @@ test("sql format: MySQL dialect uses ON DUPLICATE KEY UPDATE (no INSERT OR REPLA
   const driver = createMockSqlDriver("mysql")
   assert.equal(await sqlFormat.save(SAMPLE_DB, driver), true)
   assert.deepEqual(await sqlFormat.load(driver), SAMPLE_DB)
+})
+
+/**
+ * 在 mock SQL 驱动外包一层「单语句绑定参数上限」断言，并记录每次 batch
+ * 收到的语句（供断言语句顺序）。
+ *
+ * 与真实 D1 / DO 一致：任何一条语句的参数数超过 limit 即抛错
+ * （"too many SQL variables"），使越限的保存**整单失败**。
+ */
+function withParamLimit(base: Driver, limit: number) {
+  const batches: Array<Array<{ sql: string; params: any[] }>> = []
+  const driver: Driver = {
+    ...base,
+    async batch(statements: Array<{ sql: string; params: any[] }>) {
+      for (const s of statements) {
+        if (s.params.length > limit) {
+          throw new Error(
+            `too many SQL variables (${s.params.length} > ${limit}): ${s.sql}`,
+          )
+        }
+      }
+      batches.push(statements.map((s) => ({ sql: s.sql, params: [...s.params] })))
+      await base.batch!(statements)
+    },
+  }
+  return { driver, batches }
+}
+
+test("sql format: 大表保存不产生超过 100 个绑定参数的语句（F-083）", async () => {
+  const base = createMockSqlDriver()
+  const { driver, batches } = withParamLimit(base, 100)
+
+  // 120 行 metas：旧实现会生成 120 个占位符的 DELETE ... NOT IN，必然超限。
+  const metas = Array.from({ length: 120 }, (_, i) => ({
+    id: i + 1,
+    path: `/p${i + 1}`,
+  }))
+  assert.equal(await sqlFormat.save({ ...SAMPLE_DB, metas }, driver), true)
+
+  // 每条语句的参数数都在上限内
+  for (const s of batches.flat()) {
+    assert.ok(
+      s.params.length <= 100,
+      `语句参数超限 (${s.params.length}): ${s.sql}`,
+    )
+  }
+
+  const loaded: any = await sqlFormat.load(driver)
+  assert.equal(loaded.metas.length, 120)
+
+  // 缩减到 95 行（仍 > 90 的内部预算）：25 行陈旧数据必须被分片 IN 删除
+  const kept = metas.slice(0, 95)
+  assert.equal(await sqlFormat.save({ ...SAMPLE_DB, metas: kept }, driver), true)
+  const reloaded: any = await sqlFormat.load(driver)
+  assert.deepEqual(
+    reloaded.metas.map((m: any) => m.path).sort(),
+    kept.map((m) => m.path).sort(),
+  )
+})
+
+test("sql format: 初始化标记是写入序列的第一条语句（F-084）", async () => {
+  const base = createMockSqlDriver()
+  const { driver, batches } = withParamLimit(base, 100)
+
+  assert.equal(await sqlFormat.save(SAMPLE_DB, driver), true)
+
+  const first = batches[0][0]
+  assert.match(
+    first.sql,
+    /schema_info/i,
+    "标记必须先行：首片失败则什么都没写，首片成功则标记必然存在",
+  )
+  assert.equal(first.params[0], "openlist_config")
+})
+
+test("sql format: 标记缺失但表已有数据时不得被当作全新空库（F-084）", async () => {
+  const driver = createMockSqlDriver()
+
+  // 模拟「首次保存中途失败」：数据行已提交，schema_info 标记从未写成
+  await driver.batch!([
+    {
+      sql: "INSERT OR REPLACE INTO `x_metas` (`id`, `path`) VALUES (?, ?)",
+      params: [1, "/real"],
+    },
+  ])
+
+  // 必须抛错（loadDb 会记录 loadError 并拒绝匿名 /init/setup），而不是返回 null
+  await assert.rejects(
+    () => sqlFormat.load(driver),
+    /init marker .* is missing/i,
+    "有数据但无标记必须报错，不能静默呈现为全新空库",
+  )
+})
+
+test("sql format: 真正的全新空库（无标记、无数据）仍返回 null（F-084）", async () => {
+  // 正常初始化路径不受影响：所有数据表都为空 → 视为未初始化
+  const driver = createMockSqlDriver()
+  assert.equal(await sqlFormat.load(driver), null)
 })
 
 /**

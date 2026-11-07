@@ -185,10 +185,12 @@ test("saveDb: without DB_CIPHER sensitive fields are written as plaintext", asyn
   })
   __setStoreBackendLoaderForTest(async () => backend)
 
-  // 不配置 DB_CIPHER（默认 none）：即便提供了 JWT_SECRET 也不加密数据库字段。
+  // 显式关闭加密（DB_CIPHER=none）：即便提供了 JWT_SECRET 也不加密数据库字段。
+  // 缺省已是 aes-256-gcm（S-01，见 db_cipher.test.ts 的默认加密用例）。
   const env = {
     DB_DRIVER: "counting",
     JWT_SECRET: "test-config-encryption-secret",
+    DB_CIPHER: "none",
   }
   const plain = await getDb(env)
   await saveDb(plain, env)

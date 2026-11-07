@@ -225,7 +225,15 @@ export function getActualPath(
   }
 
   let basePath = (user?.base_path || "/").trim()
-  if (!basePath || basePath === "/") {
+  if (!basePath) basePath = "/"
+  // F-064: base_path 自身可能带 `..` 段（管理员经 API 写入的畸形值）。
+  // 之前只有 reqPath === "/" 的分支走 canonicalVirtualPath（会折叠），子路径
+  // 分支把未折叠的 base_path 拼进去并用「含 .. 的段数」当钳制层数：
+  // base_path="/data/../photos" 时根目录解析成 /photos、子路径却解析成
+  // /data/photos/...，isWithinUserRoot 随后拒绝一切写入。先规范化 base_path，
+  // 让两个分支与 isWithinUserRoot 三者同源。
+  basePath = canonicalVirtualPath(basePath)
+  if (basePath === "/") {
     // 没有 base_path 时也返回规范形式：resolvePath 之后会解码并折叠 `..`，而 meta
     // 覆盖判定与签名计算都是字符串比较，两者必须同源——否则
     // `/public/../secret/x.txt` 会被判成「不在保护区内」（免签名），却照样读得到。
@@ -234,13 +242,11 @@ export function getActualPath(
 
   const cleanReq = p.startsWith("/") ? p : `/${p}`
   if (cleanReq === "/") {
-    return canonicalVirtualPath(basePath)
+    return basePath
   }
 
   const joined = `${basePath}${cleanReq}`
-  const baseStack = decodePathFully(basePath)
-    .split("/")
-    .filter((s) => s !== "" && s !== ".")
+  const baseStack = basePath.split("/").filter((s) => s !== "" && s !== ".")
 
   // 统一取「多重解码 + 段折叠」的规范形式（与 resolvePath 同源），并在用户自己的
   // 根目录处钳制：既堵住 base_path 逃逸，也让 meta 覆盖 / 签名判定看到同一个路径。

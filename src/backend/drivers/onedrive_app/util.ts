@@ -1,5 +1,6 @@
 import { Addition, onedriveHostMap } from "./meta"
 import { File, Files, DriveResp } from "./types"
+import { chunkSizeBytes, buildUrl } from "../onedrive/util"
 
 export function getMetaUrl(
   d: Addition,
@@ -32,21 +33,9 @@ export function getMetaUrl(
     return `${hostMap.api}/v1.0/users/${d.email}/drive/root`
   }
 
-  const encoded = trimmed
-    .split("/")
-    .map((p) => {
-      try {
-        return encodeURIComponent(decodeURIComponent(p))
-      } catch {
-        return encodeURIComponent(p)
-      }
-    })
-    .join("/")
-
-  if (suffix) {
-    return `${hostMap.api}/v1.0/users/${d.email}/drive/root:/${encoded}:/${suffix}`
-  }
-  return `${hostMap.api}/v1.0/users/${d.email}/drive/root:/${encoded}:`
+  // F-312：段已是解码后的字面文件名，与 onedrive/util.ts 的 buildUrl 一致，
+  // 只做 encodeURIComponent，不再 decodeURIComponent（否则含转义序列的名字会错位）。
+  return buildUrl(`${hostMap.api}/v1.0/users/${d.email}`, reqPath, suffix)
 }
 
 export async function accessToken(
@@ -150,8 +139,13 @@ export async function requestApi<T>(
     }
     throw new Error(errData?.message || `Request failed: ${res.status}`)
   }
-  if (res.status === 204) return undefined as unknown as T
-  return res.json() as Promise<T>
+  // 204 No Content / 202 Accepted 均为无响应体的成功响应：
+  // Graph 的 copy 返回 202 + 空 body（进度由 Location 头监控），
+  // 直接 res.json() 会抛 SyntaxError，导致复制成功却报失败。
+  if (res.status === 204 || res.status === 202) return undefined as unknown as T
+  const text = await res.text()
+  if (!text) return undefined as unknown as T
+  return JSON.parse(text) as T
 }
 
 export async function getFiles(
@@ -210,7 +204,7 @@ export async function getDirectUploadInfo(
   }
   return {
     UploadURL: uploadUrl,
-    ChunkSize: (d.chunk_size || 5) * 1024 * 1024,
+    ChunkSize: chunkSizeBytes(d.chunk_size),
     Method: "PUT",
   }
 }

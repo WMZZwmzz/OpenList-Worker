@@ -1,6 +1,7 @@
 // 123 Cloud Drive API client
 // Based on: https://github.com/OpenListTeam/OpenList/tree/main/drivers/123
 import { safeRedirectUrl } from "../../pkg/http"
+import { randomInt } from "../rand"
 import {
   Pan123Addition,
   Pan123DownloadResp,
@@ -123,18 +124,21 @@ const TABLE = [
 ]
 
 function signPath(path: string): string {
-  const random = Math.round(1e7 * Math.random()).toString()
+  // S-04 同类清单：sign 随机数改用 CSPRNG（原 Math.random）。
+  const random = String(randomInt(1e7))
   const now = new Date()
-  // UTC+8 (CST)
-  const ts = Math.round((now.getTime() + 8 * 3600000) / 1000)
-  const timestamp = ts.toString()
+  // F-194：对齐 Go 参考实现（drivers/123/util.go signPath）：
+  //   - timestamp 是**纯 epoch 秒**（此前误加了 8 小时，成了未来时间）；
+  //   - 年月日时分整体按 CST 格式化（小时 00-23，日期随小时一起滚动）。
+  const timestamp = Math.round(now.getTime() / 1000).toString()
+  const cst = new Date(now.getTime() + 8 * 3600000)
 
   // Format YYYYMMDDhhmm in CST, then map each digit through TABLE
-  const y = now.getUTCFullYear()
-  const mo = String(now.getUTCMonth() + 1).padStart(2, "0")
-  const d = String(now.getUTCDate()).padStart(2, "0")
-  const h = String(now.getUTCHours() + 8).padStart(2, "0") // CST hours
-  const mi = String(now.getUTCMinutes()).padStart(2, "0")
+  const y = cst.getUTCFullYear()
+  const mo = String(cst.getUTCMonth() + 1).padStart(2, "0")
+  const d = String(cst.getUTCDate()).padStart(2, "0")
+  const h = String(cst.getUTCHours()).padStart(2, "0")
+  const mi = String(cst.getUTCMinutes()).padStart(2, "0")
   const dateStr = `${y}${mo}${d}${h}${mi}`
   const mapped = dateStr
     .split("")
@@ -304,10 +308,47 @@ export class Pan123Client {
         init.body = JSON.stringify(body)
       }
       const res = await fetch(signed, init)
-      return res.json()
+      // F-198：先看 HTTP 状态/正文再解析。网关返回 HTML 风控页/5xx 时，
+      // 直接 res.json() 只会抛出无状态码的 SyntaxError，且 401 永远到不了
+      // 重登录分支。这里把状态码挂到错误对象上，供 request() 识别。
+      const text = await res.text()
+      let data: any = {}
+      if (text) {
+        try {
+          data = JSON.parse(text)
+        } catch {
+          if (res.ok) {
+            const err: any = new Error(
+              `[123Pan] invalid JSON response (HTTP ${res.status}): ${text.slice(0, 200)}`,
+            )
+            err.status = res.status
+            throw err
+          }
+          data = {}
+        }
+      }
+      if (!res.ok && (data == null || data.code === undefined)) {
+        const err: any = new Error(
+          `[123Pan] HTTP ${res.status} ${res.statusText || ""}: ${text.slice(0, 200)}`,
+        )
+        err.status = res.status
+        throw err
+      }
+      return data
     }
 
-    let data = await doReq()
+    let data: any
+    try {
+      data = await doReq()
+    } catch (e: any) {
+      // HTTP 层 401（正文非 JSON 或缺少 code 字段）同样触发一次重登录
+      if (e?.status === 401 && !skipLoginRetry) {
+        await this.login()
+        data = await doReq()
+      } else {
+        throw e
+      }
+    }
     const code = data?.code
     if (code !== 0 && code !== 200) {
       // 401 → token expired, retry login once.

@@ -104,6 +104,11 @@ export class ChunkDriver implements StorageDriver {
         10,
       )
       if (Number.isNaN(idx)) continue
+      if (parts[idx]) {
+        throw new Error(
+          `[Chunk] duplicate chunk part index ${idx}: '${parts[idx].name}' and '${item.name}'`,
+        )
+      }
       parts[idx] = {
         name: item.name,
         size: item.size,
@@ -112,7 +117,18 @@ export class ChunkDriver implements StorageDriver {
         raw_url_headers: item.raw_url_headers,
       }
     }
-    return parts.filter((p) => !!p)
+    // 分片序号必须为 0..n-1 连续。稀疏数组直接 filter 会把空洞压实，
+    // 让残缺的上传产物被当成完整文件按错误顺序拼接（静默数据损坏），
+    // 因此缺失任一序号都必须报错（对齐 Go 版语义）。
+    const indices = Object.keys(parts)
+      .map(Number)
+      .sort((a, b) => a - b)
+    for (let i = 0; i < indices.length; i++) {
+      if (indices[i] !== i) {
+        throw new Error(`[Chunk] chunk part ${i} is missing`)
+      }
+    }
+    return indices.map((i) => parts[i])
   }
 
   /** 分片文件总大小（通过分片目录合并计算） */
@@ -136,7 +152,9 @@ export class ChunkDriver implements StorageDriver {
           result.push(null as unknown as FileItem)
           chunkTasks.push(
             (async () => {
-              const virtualPath2 = joinPath(physicalPath, item.name)
+              // item.name 已含 chunkPrefix，而 chunkDirRemote() 会自行再拼一次前缀；
+              // 必须传入去掉前缀的虚拟文件名，否则会指向双重前缀的不存在目录。
+              const virtualPath2 = joinPath(physicalPath, name)
               const size = await this.totalChunkSize(virtualPath2)
               result[idx] = {
                 name,
@@ -327,6 +345,14 @@ export class ChunkDriver implements StorageDriver {
   ): Promise<ReadableStream<Uint8Array>> {
     this.ensureReady()
     const parts = await this.listParts(physicalPath)
+    // 底层列表把大小报成 0（元数据缺失）时分片并非空片：
+    // 继续按 size 跳过会输出空/错位流，必须显式拒绝服务。
+    const unknownSize = parts.find((p) => p.size <= 0)
+    if (unknownSize) {
+      throw new Error(
+        `[Chunk] chunk part '${unknownSize.name}' has unknown size (reported 0); refusing to merge`,
+      )
+    }
     const totalSize = parts.reduce((sum, p) => sum + p.size, 0)
     const remoteDriver = this.remoteDriver
     const chunkPrefix = this.chunkPrefix

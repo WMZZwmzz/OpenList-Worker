@@ -22,6 +22,8 @@ process.env.JWT_SECRET = JWT_SECRET
 const TENANT_ID = 2
 const SHARE_PERMISSION = 1 << 14
 const WRITE_PERMISSION = 1 << 3
+const MOVE_PERMISSION = 1 << 5
+const COPY_PERMISSION = 1 << 6
 
 function makeRoot(): string {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "openlist-meta-"))
@@ -56,6 +58,7 @@ async function seed(
   metas: any[],
   shares: any[] = [],
   settings: any[] = [],
+  permission: number = SHARE_PERMISSION | WRITE_PERMISSION,
 ): Promise<string> {
   await saveDb(
     {
@@ -66,7 +69,7 @@ async function seed(
           username: "tenant",
           password: "x",
           role: 0,
-          permission: SHARE_PERMISSION | WRITE_PERMISSION,
+          permission,
           base_path: "/local/u1",
           disabled: false,
         },
@@ -252,4 +255,83 @@ test("SEC-085: read_users-only 的路径在 /fs/list 会签发下载签名", asy
   )
   assert.equal(res.status, 200)
   assert.equal(await res.text(), "RESTRICTED")
+})
+
+test("F-009: /fs/copy、/fs/move、/fs/recursive_move 的源路径必须满足读 ACL", async () => {
+  const root = makeRoot()
+  fs.mkdirSync(path.join(root, "u1", "dst-copy"), { recursive: true })
+  fs.mkdirSync(path.join(root, "u1", "dst-move"), { recursive: true })
+  fs.mkdirSync(path.join(root, "u1", "dst-rec"), { recursive: true })
+  const a = newApp()
+  const token = await seed(
+    root,
+    [
+      {
+        ...metaBase,
+        path: "/local/u1/protected",
+        password: "meta-pass",
+      },
+    ],
+    [],
+    [],
+    COPY_PERMISSION | MOVE_PERMISSION,
+  )
+
+  // 不知目录密码：三个搬运端点都必须 403（此前只查目标侧写 ACL，源可被搬走后读取）
+  const copyDenied = await post(
+    a,
+    "/api/fs/copy",
+    { src_dir: "/protected", dst_dir: "/dst-copy", names: ["x.txt"] },
+    token,
+  )
+  assert.equal(copyDenied.status, 403, await copyDenied.text())
+
+  const moveDenied = await post(
+    a,
+    "/api/fs/move",
+    { src_dir: "/protected", dst_dir: "/dst-move", names: ["x.txt"] },
+    token,
+  )
+  assert.equal(moveDenied.status, 403, await moveDenied.text())
+
+  const recDenied = await post(
+    a,
+    "/api/fs/recursive_move",
+    { src_dir: "/protected", dst_dir: "/dst-rec" },
+    token,
+  )
+  assert.equal(recDenied.status, 403, await recDenied.text())
+
+  // 源文件没有被搬动：拒绝必须发生在任何写入之前
+  assert.equal(
+    fs.readFileSync(path.join(root, "u1", "protected", "x.txt"), "utf8"),
+    "PROTECTED",
+  )
+
+  // 带正确目录密码（与 /fs/list、/fs/get 的 password 字段一致）时放行
+  const copyOk = await post(
+    a,
+    "/api/fs/copy",
+    {
+      src_dir: "/protected",
+      dst_dir: "/dst-copy",
+      names: ["x.txt"],
+      password: "meta-pass",
+    },
+    token,
+  )
+  assert.equal(copyOk.status, 200, await copyOk.text())
+  assert.equal(
+    fs.readFileSync(path.join(root, "u1", "dst-copy", "x.txt"), "utf8"),
+    "PROTECTED",
+  )
+
+  // 不带 meta 保护的源路径不受影响（回归：闸门不能误伤普通搬运）
+  const plainCopy = await post(
+    a,
+    "/api/fs/copy",
+    { src_dir: "/", dst_dir: "/dst-copy", names: ["mine.txt"] },
+    token,
+  )
+  assert.equal(plainCopy.status, 200, await plainCopy.text())
 })

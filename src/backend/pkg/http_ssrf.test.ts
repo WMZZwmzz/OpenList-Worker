@@ -129,6 +129,34 @@ test("does not regress normal public hosts", () => {
   }
 })
 
+test("blocks trailing-dot variants of dangerous hosts (F-055)", () => {
+  // WHATWG URL 对域名类主机保留结尾点（`localhost.` 仍是 "localhost."），
+  // 而黑名单用 === / endsWith / $ 锚定匹配。旧实现未归一化尾点，实测
+  // localhost. / metadata.google.internal. / 127.0.0.1.nip.io. 均可绕过
+  // 全部 SSRF 检查并真实解析到回环或云元数据地址。
+  for (const url of [
+    "http://localhost./x",
+    "http://localhost.../x", // 多个尾点同样归一化
+    "http://metadata.google.internal./x",
+    "http://metadata./x",
+    "http://foo.local./x",
+    "http://foo.internal./x",
+    "http://127.0.0.1.nip.io./x",
+    "http://localtest.me./x",
+    "http://xip.io./x",
+    "http://vcap.me./x",
+    "http://0x7f000001./x", // 十六进制整数 IP + 尾点
+    "http://2130706433./x", // 十进制整数 IP + 尾点
+    "http://0177.0.0.1./x", // 前导零八进制 + 尾点
+  ]) {
+    assert.equal(isSafeUrl(url), false, `must block ${url}`)
+  }
+
+  // 尾点归一化后，正常公网主机不受影响
+  assert.equal(isSafeUrl("http://example.com./x"), true)
+  assert.equal(isSafeUrl("https://bucket.cos.ap-guangzhou.myqcloud.com./a"), true)
+})
+
 test("allowHosts only exempts exact host matches", () => {
   const allow = ["dav.example.com", "minio.internal"]
 

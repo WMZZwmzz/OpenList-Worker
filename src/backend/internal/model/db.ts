@@ -4,6 +4,7 @@ import {
   createFieldCipher,
   detectCipherPrefix,
   isSealedCiphertext,
+  setLegacyWeakKdfAllowed,
   type FieldCipher,
 } from "../../pkg/crypto"
 import {
@@ -867,6 +868,16 @@ let dbTrusted = false
 let dbWriteBlocked = false
 let dbLastLoadError: string | null = null
 
+/**
+ * 是否曾经成功从持久化后端读到过一份快照（不论它是否「完整」）。
+ *
+ * 与 `dbTrusted` 分离：QS-1 下 key 格式 + KV 族后端的 list 可能部分漏报，
+ * 读到的快照**可用但不完整**，不能标记 dbTrusted（它不是持久化状态的完整镜像），
+ * 却仍然比默认空壳更接近事实。后续读到「空」时要用它来守住这份快照，
+ * 否则一次最终一致性抖动就会把用户踢回默认库。
+ */
+let dbSnapshotLoaded = false
+
 /** 当前内存库是否可信（可安全写回持久化存储）。 */
 export function isDbTrusted(): boolean {
   return dbTrusted
@@ -1021,10 +1032,21 @@ const ensureDefaultSettings = (db: any) => {
       newSettings.push(JSON.parse(JSON.stringify(defSetting)))
       modified = true
     } else {
-      // If duplicates existed in KV/storage, pick the one with non-empty value if available
+      // If duplicates existed in KV/storage, pick the one with non-empty value if available.
+      //
+      // 不能用 `s.value && s.value.trim() !== ""`：setting 的 value 并不保证是
+      // 字符串。POST /admin/setting/save 只对 object 做 JSON.stringify，number /
+      // boolean 会原样入库（例如 default_page_size = 20）。对数字调用 .trim()
+      // 抛 TypeError，而本函数在 loadDb 的 try 内执行 → 整库被判为「读取失败」，
+      // 回退到默认空壳（storages / users 全部丢失）；之后管理员改任一设置就能让
+      // 空壳通过写前守卫并覆盖真实配置。
+      //
+      // 这里统一按「存在且字符串化后非空白」判定：0 / false 是合法取值（有值），
+      // 不应被当成「空值」跳过。
+      const hasNonEmptyValue = (v: any): boolean =>
+        v !== undefined && v !== null && String(v).trim() !== ""
       const chosen =
-        matching.find((s: any) => s.value && s.value.trim() !== "") ||
-        matching[0]
+        matching.find((s: any) => hasNonEmptyValue(s.value)) || matching[0]
       if (
         chosen.group !== defSetting.group ||
         chosen.help !== defSetting.help ||
@@ -1165,6 +1187,7 @@ export const __resetDbCacheForTest = () => {
   storeBackendLoader = (env: any) => getStoreBackend(env)
   // 写前守卫状态复位（否则跨用例串味）
   dbTrusted = false
+  dbSnapshotLoaded = false
   dbLastLoadError = null
   dbWriteBlocked = false
   dbSealedReadUntrusted = false
@@ -1281,13 +1304,35 @@ const loadDb = async (envCtx?: any) => {
             "或在密钥解析前存储后端就不可用。本次读取按不可信处理并禁止写回。",
         )
         dbTrusted = false
+        dbSnapshotLoaded = true
         dbSealedReadUntrusted = true
         dbLastLoadError =
           "sealed values present but encryption key unavailable; writes blocked"
         return memoryDb
       }
       // 读取成功：内存库与持久化存储一致，允许后续写回。
-      dbTrusted = true
+      //
+      // QS-1：key 格式 + KV 族后端（kv / cfkv）的 list 是最终一致的，本次读取
+      // 可能只看到部分键（其他实例刚写入的记录暂时不可见）。此时内存库**可用但
+      // 不完整**：既不能当作「权威镜像」标记 dbTrusted（否则匿名 /init/setup 会
+      // 把它当全新库、写回时还会按差集删掉漏报的真实键），也不该丢弃（比默认
+      // 空壳更接近事实）。key.ts 的 save() 已配套改为不删除「本实例从未观察到」
+      // 的键，因此这条路径上的写回不会销毁数据。
+      const completenessProven =
+        typeof backend?.loadCompletenessProven === "function"
+          ? backend.loadCompletenessProven(activeEnv) !== false
+          : true
+      dbSnapshotLoaded = true
+      if (completenessProven) {
+        dbTrusted = true
+      } else {
+        dbTrusted = false
+        console.warn(
+          `[DB] Backend ${backend?.name ?? "storage"} uses an eventually consistent ` +
+            `list view; the loaded snapshot may be incomplete (missing keys are not ` +
+            `treated as deleted). Writes proceed without diff-based deletion.`,
+        )
+      }
       dbSealedReadUntrusted = false
       dbLastLoadError = null
       return memoryDb
@@ -1295,7 +1340,9 @@ const loadDb = async (envCtx?: any) => {
     // 后端读取成功但没有数据：可能是全新部署（首次初始化）。
     // 但若历史上曾成功读到过数据，则「读到空」极可能是最终一致性/后端切换导致的
     // 短暂不可见，此时不能把默认库当成事实，更不能让它写回存储。
-    if (dbTrusted && memoryDb) {
+    // 注意用 dbSnapshotLoaded 而不是 dbTrusted：QS-1 下 KV 族的快照本来就不被
+    // 标记为可信，但它仍然是「读到过数据」的证据，同样必须守住。
+    if (dbSnapshotLoaded && memoryDb) {
       console.warn(
         `[DB] Backend ${backend?.name ?? "storage"} returned empty while a trusted snapshot exists; ` +
           `keeping the in-memory snapshot to avoid overwriting real config.`,
@@ -1582,6 +1629,12 @@ async function getEncryptionKeyCandidates(env: any): Promise<string[]> {
  */
 async function resolveDecryptCipherChain(env: any): Promise<FieldCipher[]> {
   const cipher = readCipher(env)
+  // S-15：遗留弱 KDF（1 次迭代 + 固定 salt）格式的解密默认拒绝，仅在部署方
+  // 显式设置 DB_CIPHER_ALLOW_LEGACY=1 时放行（读取后下次保存自动迁移）。
+  setLegacyWeakKdfAllowed(
+    String(env?.DB_CIPHER_ALLOW_LEGACY ?? "") === "1" ||
+      String(env?.DB_CIPHER_ALLOW_LEGACY ?? "") === "true",
+  )
   const candidates = await getEncryptionKeyCandidates(env)
   return Promise.all(
     candidates.map((secret) => createFieldCipher(cipher, secret)),
@@ -1640,7 +1693,8 @@ export async function isEncryptionReady(envCtx?: any): Promise<boolean> {
  *   - 紧随其后的登录请求可能落在**另一个实例 I₂**，其缓存为空，
  *     重新读 KV 时 A 尚未传播 → 读到 null → `getEncryptionKey` 返回 null
  *     → `unsealDb` 跳过解密 → `password` 保持 `enc:v1:` 密文
- *     → `verifyUserPassword` 判定非 64 位 hex → **密码认证失败**。
+ *     → `verifyUserStaticHash` 判定非 64 位 hex 且非 S-03 PBKDF2 格式
+ *       → **密码认证失败**。
  *   - 等待数十秒后 KV 传播完成，又能登录（「过一会就好了」）。
  *
  * 因此这里在写入后**主动回读确认**，读不到则按指数退避重试，直到
@@ -2071,6 +2125,26 @@ async function sealDb(
       )
       if (sealed !== u.password) next = { ...next, password: sealed }
     }
+    // S-17：2FA 备用码与 WebAuthn 凭据一并加密（备用码是有效的 2FA 绕过
+    // 凭据；authn 是 WebAuthn 凭据注册数据）。u.salt 不需要加密——盐的
+    // 安全性不依赖保密。
+    if (u.otp_backup_codes) {
+      const sealed = await sealValue(
+        String(u.otp_backup_codes),
+        fieldCipher,
+        `users:${u.id ?? i}:otp_backup_codes`,
+      )
+      if (sealed !== u.otp_backup_codes)
+        next = { ...next, otp_backup_codes: sealed }
+    }
+    if (u.authn) {
+      const sealed = await sealValue(
+        String(u.authn),
+        fieldCipher,
+        `users:${u.id ?? i}:authn`,
+      )
+      if (sealed !== u.authn) next = { ...next, authn: sealed }
+    }
     if (next !== u) {
       if (!usersOut) usersOut = srcUsers.slice()
       usersOut![i] = next
@@ -2171,6 +2245,15 @@ async function unsealDb(data: any, cipherChain: FieldCipher[]): Promise<void> {
       v1Attempts++
     }
     tasks.push(async () => {
+      // F-074：give-up 判定必须在**任务执行时**进行 —— 收集阶段是同步的，
+      // v1GiveUp 只会在任务执行时才被置位，放在 scheduleUnseal 里检查时它
+      // 永远是 false（死条件），「首个 v1 解不开即跳过后续」的优化从未生效。
+      // 任务体开头补检：同批/后续批的 v1 任务在首个失败置位后直接跳过，
+      // 不再白跑 10 万轮 PBKDF2（字段保持密文，与超限跳过的行为一致）。
+      if (v1GiveUp) {
+        v1Skipped++
+        return
+      }
       const plain = await unsealValue(sealedValue, cipherChain, identity)
       if (isLegacyV1 && plain === sealedValue) v1GiveUp = true
       target[prop] = plain
@@ -2224,6 +2307,23 @@ async function unsealDb(data: any, cipherChain: FieldCipher[]): Promise<void> {
       const sealedValue = target.password
       const identity = `users:${u.id ?? i}:password`
       scheduleUnseal(target, "password", sealedValue, identity)
+    }
+    // S-17：2FA 备用码（有效的 2FA 绕过凭据）与 WebAuthn 凭据同样纳入
+    // 字段加密——旧白名单只覆盖 otp_secret/password，新增凭据字段会默认漏网。
+    if (
+      typeof u.otp_backup_codes === "string" &&
+      isSealedCiphertext(u.otp_backup_codes)
+    ) {
+      const target = u
+      const sealedValue = target.otp_backup_codes
+      const identity = `users:${u.id ?? i}:otp_backup_codes`
+      scheduleUnseal(target, "otp_backup_codes", sealedValue, identity)
+    }
+    if (typeof u.authn === "string" && isSealedCiphertext(u.authn)) {
+      const target = u
+      const sealedValue = target.authn
+      const identity = `users:${u.id ?? i}:authn`
+      scheduleUnseal(target, "authn", sealedValue, identity)
     }
   }
 
@@ -2339,20 +2439,27 @@ export const saveDb = async (
 
   // `activeEnv` 已在本函数开头解析（写前守卫也依赖它），这里只需通过可注入的
   // storeBackendLoader 取后端，便于测试统计 load/save 次数。
-  const backend = await storeBackendLoader(activeEnv)
-  const configured = backend.isConfigured
-    ? await backend.isConfigured(activeEnv)
-    : true
-  if (!configured) {
-    // No persistence configured — not a failed write, just an unpersisted
-    // deployment. Preserve the old non-throwing behavior.
-    console.warn(
-      "[DB] WARNING: No persistence backend configured! Storage configuration changes will exist only in memory!",
-    )
-    return false
-  }
+  //
+  // F-070：后端解析会抛配置类错误（UNKNOWN_DRIVER / DRIVER_UNAVAILABLE /
+  // NO_STORAGE 等），isConfigured 的健康检查也可能抛错 —— 它们必须放进 try，
+  // 否则异常直接逃逸、上面的回滚块不可达，失败的修改已经在内存/请求缓存中生效
+  //（正是本函数声称要防的「接口报错但内存已按新值运行」）。
+  // 声明放在 try 外：catch 里的错误日志与成功后的落盘日志都要引用它。
+  let backend: Awaited<ReturnType<typeof storeBackendLoader>> | null = null
 
   try {
+    backend = await storeBackendLoader(activeEnv)
+    const configured = backend.isConfigured
+      ? await backend.isConfigured(activeEnv)
+      : true
+    if (!configured) {
+      // No persistence configured — not a failed write, just an unpersisted
+      // deployment. Preserve the old non-throwing behavior.
+      console.warn(
+        "[DB] WARNING: No persistence backend configured! Storage configuration changes will exist only in memory!",
+      )
+      return false
+    }
     // 落盘前对敏感字段做静态加密（可选，见 DB_CIPHER），内存中的 data 保持明文。
     // cipher=none（默认）时直接按明文落盘，不解析密钥（也不需要密钥）。
     const cipher = readCipher(activeEnv)
@@ -2395,11 +2502,11 @@ export const saveDb = async (
       else dbCache.delete(cacheKey)
     }
     console.error(
-      `[DB] saveDb FAILED: backend=${backend.name}, error=${err?.message || err}`,
+      `[DB] saveDb FAILED: backend=${backend?.name}, error=${err?.message || err}`,
       `stack=${err?.stack?.substring(0, 500) || ""}`,
     )
     throw new Error(
-      `[DB] Failed to persist config (${backend.name}); the change was NOT saved: ${err?.message || err}`,
+      `[DB] Failed to persist config (${backend?.name || "unresolved"}); the change was NOT saved: ${err?.message || err}`,
     )
   }
 
@@ -2407,9 +2514,15 @@ export const saveDb = async (
     `[DB] Successfully persisted ${data.storages?.length || 0} storages to ${backend.name}`,
   )
 
-  // 写入成功 = 存储中的内容与内存库一致，因此内存库现在可视为可信；
-  // 这样同一 isolate 后续的写入不会被守卫误拦。
-  dbTrusted = true
+  // 写入成功 = 本实例的数据已落到存储，因此内存库现在可视为可写回；
+  // 但若后端的 list 视野无法证明完整（QS-1：key 格式 + kv/cfkv），内存库仍可能
+  // 缺少其他实例写入的键，不能标记为「持久化状态的完整镜像」。
+  dbSnapshotLoaded = true
+  dbTrusted =
+    typeof backend.loadCompletenessProven === "function" &&
+    backend.loadCompletenessProven(activeEnv) === false
+      ? false
+      : true
   dbSealedReadUntrusted = false
   dbLastLoadError = null
   return true

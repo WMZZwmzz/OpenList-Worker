@@ -1,4 +1,8 @@
-import { md5, sha1 } from "hash-wasm"
+// 纯 JS 哈希实现（hashers.ts），不使用 hash-wasm：
+// hash-wasm 依赖运行时 WebAssembly.compile()，在禁止 Wasm 代码生成的边缘
+// 运行时（Vercel Edge / EdgeOne 等）会直接抛错，导致 CAS / torrent 编解码
+// 整体不可用。hashers.ts 与 hash-wasm 的 md5/sha1 接口兼容。
+import { md5, sha1 } from "./hashers"
 import {
   CasFileEntry,
   CasPayload,
@@ -21,9 +25,37 @@ type BValue =
   | { [key: string]: BValue }
 
 const encoder = new TextEncoder()
-const decoder = new TextDecoder("utf-8", { fatal: true })
+// F-100：非 fatal 解码器。存量 torrent 常带 GBK/Big5 文件名，fatal 解码会让
+// 整份种子无法导入；非 fatal 会把这些字节替换为 U+FFFD，至少保证可解析。
+// bencode 的数字/长度等结构字段仍由后续正则严格校验，非法字节会变成普通
+// Error 而不是原始 TypeError。
+const decoder = new TextDecoder("utf-8")
 const MAX_BENCODE_DEPTH = 32
 const MAX_BENCODE_ITEMS = 100_000
+
+// F-097：CAS 的 base64 编解码不能使用裸 Node `Buffer`——ESA 浏览器构建既没有
+// Node 全局，node:buffer 也被 shim 成抛错 Proxy。这里用 Web 标准 btoa/atob
+// 配合字节转换实现，所有部署目标（Node/Workers/ESA/Deno）都有。
+const BASE64_CHUNK = 0x8000
+
+function encodeBase64(bytes: Uint8Array): string {
+  let binary = ""
+  for (let offset = 0; offset < bytes.length; offset += BASE64_CHUNK) {
+    binary += String.fromCharCode(
+      ...bytes.subarray(offset, offset + BASE64_CHUNK),
+    )
+  }
+  return btoa(binary)
+}
+
+function decodeBase64(text: string): Uint8Array {
+  const binary = atob(text)
+  const bytes = new Uint8Array(binary.length)
+  for (let index = 0; index < binary.length; index++) {
+    bytes[index] = binary.charCodeAt(index)
+  }
+  return bytes
+}
 
 function concatBytes(parts: Uint8Array[]): Uint8Array {
   const length = parts.reduce((sum, part) => sum + part.byteLength, 0)
@@ -202,6 +234,36 @@ function hexToBytes(value: string): Uint8Array {
   return result
 }
 
+/**
+ * F-098：CAS 的 slice_size 就是种子的 piece_size。多文件 payload 的顶层与每个
+ * entry 都可能携带它；各 entry 声明不一致时无法用单一 piece_size 表示，直接
+ * 报错而不是静默按 10 MiB 重算分片数（那会抛误导性的 piece count 错误）。
+ */
+function casPieceSize(entries: CasFileEntry[], topLevel?: unknown): number {
+  const declared = Array.from(
+    new Set(
+      entries
+        .map((entry) =>
+          entry?.slice_size === undefined || entry?.slice_size === null
+            ? undefined
+            : Number(entry.slice_size),
+        )
+        .filter(
+          (size): size is number => size !== undefined && Number.isFinite(size),
+        ),
+    ),
+  )
+  if (declared.length > 1) {
+    throw new Error("CAS files declare conflicting slice_size values")
+  }
+  if (declared.length === 1) return declared[0]
+  if (topLevel !== undefined && topLevel !== null && topLevel !== "") {
+    const top = Number(topLevel)
+    if (Number.isFinite(top)) return top
+  }
+  return DEFAULT_PIECE_SIZE
+}
+
 function bytesToHex(value: Uint8Array): string {
   return Array.from(value, (byte) => byte.toString(16).padStart(2, "0")).join(
     "",
@@ -249,7 +311,12 @@ export function encodeOss(seed: SharingSeed): Uint8Array {
 }
 
 export function decodeOss(data: Uint8Array): SharingSeed {
-  const value = JSON.parse(decoder.decode(data))
+  let value: any
+  try {
+    value = JSON.parse(decoder.decode(data))
+  } catch {
+    throw new Error("Invalid or incomplete OpenList sharing seed")
+  }
   if (
     value?.format !== SEED_FORMAT ||
     Number(value?.version) !== SEED_VERSION ||
@@ -326,6 +393,9 @@ export async function encodeCas(seedInput: SharingSeed): Promise<Uint8Array> {
       entries.push(entry)
       totalSize += entry.size
     }
+    // F-098：除了每个 entry 自带的 slice_size，顶层也写出 slice_size/cloud，
+    // 保证 decodeCas 多文件分支能还原 piece_size 与顶层 cloud。
+    const clouds = Array.from(new Set(entries.map((entry) => entry.cloud || "")))
     payload = {
       name: seed.name,
       size: totalSize,
@@ -333,22 +403,27 @@ export async function encodeCas(seedInput: SharingSeed): Promise<Uint8Array> {
       sliceMd5: "",
       create_time: "",
       files: entries,
+      slice_size: seed.piece_size,
+      cloud: clouds.length === 1 ? clouds[0] : "",
     }
   }
-  return encoder.encode(Buffer.from(JSON.stringify(payload)).toString("base64"))
+  return encoder.encode(encodeBase64(encoder.encode(JSON.stringify(payload))))
 }
 
 export function decodeCas(data: Uint8Array): ParsedSeed {
   const trimmed = decoder.decode(data).trim()
   let decoded = trimmed
   try {
-    decoded = Buffer.from(trimmed, "base64").toString("utf8")
+    decoded = decoder.decode(decodeBase64(trimmed))
     JSON.parse(decoded)
   } catch {
     decoded = trimmed
   }
-  const value = JSON.parse(decoded) as Partial<CasPayload> & {
-    files?: CasFileEntry[]
+  let value: Partial<CasPayload> & { files?: CasFileEntry[] }
+  try {
+    value = JSON.parse(decoded)
+  } catch {
+    throw new Error("Invalid CAS payload")
   }
 
   const fileFromEntry = (entry: CasFileEntry): SeedFile => {
@@ -407,7 +482,7 @@ export function decodeCas(data: Uint8Array): ParsedSeed {
         comment: "Imported from OpenList CAS metadata",
         created_at: new Date().toISOString(),
         created_by: "OpenList",
-        piece_size: DEFAULT_PIECE_SIZE,
+        piece_size: casPieceSize(value.files, value.slice_size),
         files,
       }),
     }
@@ -473,6 +548,16 @@ export async function encodeTorrent(
   const pieceHashes = generatedPieceHashes || torrentPieceHashes(seed)
   if (pieceHashes.some((hash) => hash.length !== 40))
     throw new Error("Torrent conversion requires SHA-1 piece hashes")
+  // F-099：与 decodeTorrent 的分片数校验对称。缺少 SHA-1 分片哈希时
+  // pieceHashes 为空数组，旧代码会静默产出 0 分片、info.length 却为真实大小
+  // 的矛盾 torrent（连自家 decodeTorrent 都拒收）。
+  const totalSize = seed.files.reduce((sum, file) => sum + file.size, 0)
+  const expectedPieces = totalSize > 0 ? Math.ceil(totalSize / seed.piece_size) : 0
+  if (pieceHashes.length !== expectedPieces) {
+    throw new Error(
+      `Torrent conversion requires SHA-1 piece hashes for all ${expectedPieces} pieces (got ${pieceHashes.length})`,
+    )
+  }
   const info: Record<string, BValue> = {
     name: seed.name,
     "piece length": seed.piece_size,
@@ -667,12 +752,34 @@ export async function parseSeed(
   if (formatHint === "oss") return { format: "oss", seed: decodeOss(data) }
   if (formatHint === "torrent") return decodeTorrent(data)
   if (formatHint === "cas") return decodeCas(data)
-  const first = decoder
-    .decode(data.subarray(0, Math.min(data.length, 32)))
-    .trimStart()[0]
-  if (first === "{") return { format: "oss", seed: decodeOss(data) }
-  if (first === "d") return decodeTorrent(data)
+  // F-100：格式嗅探直接看首个非空白字节，不做 UTF-8 解码——否则前 32 字节里
+  // 只要含 GBK 文件名等非 UTF-8 字节，嗅探就会抛原始 TypeError。
+  const first = firstSignificantByte(data)
+  if (first === 0x7b) {
+    // F-101：'{' 既可能是 OSS 种子 JSON，也可能是裸 JSON 形式的 CAS 元数据。
+    // 先按 OSS 解析，失败后回退 CAS（decodeCas 本就支持裸 JSON）。
+    try {
+      return { format: "oss", seed: decodeOss(data) }
+    } catch (ossError) {
+      try {
+        return decodeCas(data)
+      } catch {
+        throw ossError
+      }
+    }
+  }
+  if (first === 0x64) return decodeTorrent(data)
   return decodeCas(data)
+}
+
+function firstSignificantByte(data: Uint8Array): number {
+  for (const byte of data) {
+    // space / tab / LF / VT / FF / CR
+    if (byte === 0x20 || byte === 0x09 || byte === 0x0a || byte === 0x0b || byte === 0x0c || byte === 0x0d)
+      continue
+    return byte
+  }
+  return -1
 }
 
 export async function encodeSeed(

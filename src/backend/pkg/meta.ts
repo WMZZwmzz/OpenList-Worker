@@ -30,28 +30,64 @@ export interface Meta {
 }
 
 /**
+ * F-062: `getNearestMeta` 只返回「最近一条」meta，但 read_users / write_users
+ * 白名单的项目语义是「遍历**所有**覆盖该路径的 meta」（sign.ts
+ * isReadUsersRestricted 就是这么做的）。canAccess / canRead / canWrite 是同步
+ * 函数、自己无法查库，所以在 getNearestMeta 取库时把同一批 metas 关联到返回的
+ * 对象上（WeakMap：不改导出签名、不污染 Meta 结构、对象被回收即释放）。判定
+ * 函数拿到这些对象时会按 sign.ts 的口径遍历全部覆盖的 meta。
+ *
+ * 只有经由本模块 getNearestMeta 得到的 meta 才有这层关联；测试里手写的 meta
+ * 对象退化为原来的单条判定。
+ */
+const metaScope = new WeakMap<Meta, Meta[]>()
+
+function coveringMetas(meta: Meta): Meta[] {
+  const scoped = metaScope.get(meta)
+  return scoped && scoped.length > 0 ? scoped : [meta]
+}
+
+/**
  * 获取覆盖指定路径的最近祖先 meta（向上递归查找）。
  * 对齐 Go op.GetNearestMeta (internal/op/meta.go:27-65)。
+ *
+ * F-063: 路径比较必须大小写不敏感 —— 同文件的 metaCoversPath（:71）以及
+ * sign.ts 的 getNearestMeta/metaCoversPath 全部 toLowerCase，而这里曾用大小写
+ * 敏感的 `===`。在大小写不敏感的存储（Windows/macOS 本地驱动）上，配置
+ * `/Photos` 而请求 `/photos` 会取到 null → canAccess 直接放行，meta 密码与
+ * read_users 全部静默失效；/d 侧却因为用不敏感版本判定「需要签名」，同一条
+ * ACL 在两个端点给出相反结论。
  */
 export async function getNearestMeta(
   path: string,
   env?: any,
 ): Promise<Meta | null> {
   const db = await getDb(env)
-  const metas = db.metas || []
+  const metas = (db.metas || []) as Meta[]
   if (metas.length === 0) return null
 
-  const cleanPath = fixAndCleanPath(path)
-  // 直接匹配
-  const exact = metas.find((m: Meta) => fixAndCleanPath(m.path) === cleanPath)
-  if (exact) return exact
+  const cleanPath = fixAndCleanPath(path).toLowerCase()
+
+  const withScope = (meta: Meta | undefined | null): Meta | null => {
+    if (!meta) return null
+    metaScope.set(meta, metas)
+    return meta
+  }
+
+  // 直接匹配（大小写不敏感）
+  const exact = metas.find(
+    (m: Meta) => fixAndCleanPath(m.path).toLowerCase() === cleanPath,
+  )
+  if (exact) return withScope(exact)
 
   // 向上递归查找祖先
   let current = cleanPath
   while (current !== "/") {
     const parent = current.substring(0, current.lastIndexOf("/")) || "/"
-    const match = metas.find((m: Meta) => fixAndCleanPath(m.path) === parent)
-    if (match) return match
+    const match = metas.find(
+      (m: Meta) => fixAndCleanPath(m.path).toLowerCase() === parent,
+    )
+    if (match) return withScope(match)
     current = parent
   }
   return null
@@ -112,6 +148,10 @@ function timingSafeStringEqual(a: string, b: string): boolean {
 /**
  * 判断用户能否访问路径（密码 + read_users）。
  * 对齐 Go common.CanAccess (server/common/check.go:57-65)。
+ *
+ * F-062: read_users 分支不再只看传入的那一条（最近）meta，而是遍历所有覆盖
+ * 该路径的 meta（任一命中且用户不在名单即拒绝），与 sign.ts isReadUsersRestricted
+ * 同口径。密码仍只看最近 meta（密码不继承，与 Go 一致）。
  */
 export function canAccess(
   user: UserPermissionObj | null,
@@ -133,13 +173,13 @@ export function canAccess(
     if (!timingSafeStringEqual(password, meta.password)) return false
   }
 
-  // read_users 白名单：非空 + 覆盖路径 → 用户必须在列表
-  if (
-    meta.read_users &&
-    meta.read_users.length > 0 &&
-    metaCoversPath(meta.path, path, meta.read_users_sub)
-  ) {
-    if (!user || !meta.read_users.includes(user.id || 0)) return false
+  // read_users 白名单：遍历所有覆盖路径的 meta，任一命中且用户不在名单即拒绝
+  for (const m of coveringMetas(meta)) {
+    if (!m || !Array.isArray(m.read_users) || m.read_users.length === 0) {
+      continue
+    }
+    if (!metaCoversPath(m.path, path, !!m.read_users_sub)) continue
+    if (!user || !m.read_users.includes(user.id ?? 0)) return false
   }
 
   return true
@@ -148,23 +188,29 @@ export function canAccess(
 /**
  * 判断用户能否读取路径（read_users 白名单）。
  * 对齐 Go common.CanRead (server/common/check.go:21-28)。
+ *
+ * F-067: 旧实现只把 `user === null` 当系统上下文，随后直接读 `user.id`：
+ * 传入 undefined（匿名请求 c.get("user") 的常见形态）且 meta 命中 read_users
+ * 时抛 TypeError → 本应 403 的请求变成 500。这里改走可选链，undefined 按
+ * 「无权限的普通访问者」处理（与 canAccess 一致），null 仍是系统上下文。
  */
 export function canRead(
-  user: UserPermissionObj | null,
+  user: UserPermissionObj | null | undefined,
   meta: Meta | null,
   path: string,
 ): boolean {
   // nil user（内部/系统上下文）无视限制
   if (user === null) return true
   if (user && isAdmin(user)) return true
+  if (!meta) return true
 
-  if (
-    meta &&
-    meta.read_users &&
-    meta.read_users.length > 0 &&
-    metaCoversPath(meta.path, path, meta.read_users_sub)
-  ) {
-    return meta.read_users.includes(user.id || 0)
+  const uid = user?.id ?? 0
+  for (const m of coveringMetas(meta)) {
+    if (!m || !Array.isArray(m.read_users) || m.read_users.length === 0) {
+      continue
+    }
+    if (!metaCoversPath(m.path, path, !!m.read_users_sub)) continue
+    if (!user || !m.read_users.includes(uid)) return false
   }
   return true
 }
@@ -172,22 +218,25 @@ export function canRead(
 /**
  * 判断用户能否写入路径（write_users 白名单）。
  * 对齐 Go common.CanWrite (server/common/check.go:30-41)。
+ *
+ * F-067: 同 canRead，undefined 不再触发 TypeError。
  */
 export function canWrite(
-  user: UserPermissionObj | null,
+  user: UserPermissionObj | null | undefined,
   meta: Meta | null,
   path: string,
 ): boolean {
   if (user === null) return true
   if (user && isAdmin(user)) return true
+  if (!meta) return true
 
-  if (
-    meta &&
-    meta.write_users &&
-    meta.write_users.length > 0 &&
-    metaCoversPath(meta.path, path, meta.write_users_sub)
-  ) {
-    return meta.write_users.includes(user.id || 0)
+  const uid = user?.id ?? 0
+  for (const m of coveringMetas(meta)) {
+    if (!m || !Array.isArray(m.write_users) || m.write_users.length === 0) {
+      continue
+    }
+    if (!metaCoversPath(m.path, path, !!m.write_users_sub)) continue
+    if (!user || !m.write_users.includes(uid)) return false
   }
   return true
 }

@@ -56,59 +56,105 @@ interface CborReader {
   u8: Uint8Array
   i: number
 }
-function cborDecode(r: CborReader): any {
-  const b = r.u8[r.i++]
+
+/**
+ * 读取一个字节；越界立刻抛错。
+ *
+ * 安全不变量（F-033）：解码器必须把「输入已耗尽」当作硬错误。历史实现在越界后
+ * 读到 `undefined`（`undefined >> 5 === 0`、`undefined & 0x1f === 0`）仍继续
+ * 解码，不定长数组 `while (r.u8[r.i] !== 0xff)` 于是永不终止：2 字节输入
+ * `9f 01` 会迭代约 1.34 亿次并 push 上亿元素（实测 8s CPU / >1GB 堆），
+ * 任意已登录用户即可打爆 isolate。
+ */
+function readByte(r: CborReader): number {
+  if (r.i >= r.u8.length) throw new Error("unexpected end of CBOR input")
+  return r.u8[r.i++]
+}
+
+/** 断言剩余字节足够 n 个（definite-length 头必须与剩余长度做上界检查）。 */
+function requireBytes(r: CborReader, n: number): void {
+  if (!Number.isFinite(n) || n < 0) throw new Error("invalid CBOR length")
+  if (n > r.u8.length - r.i) throw new Error("CBOR length exceeds input size")
+}
+
+/** 导出供测试使用：畸形输入必须快速抛错而不是无限迭代。 */
+export function cborDecode(r: CborReader): any {
+  const b = readByte(r)
   const major = b >> 5
   const minor = b & 0x1f
   let value = minor
-  if (minor === 24) value = r.u8[r.i++]
+  if (minor === 24) value = readByte(r)
   else if (minor === 25) {
+    requireBytes(r, 2)
     value = (r.u8[r.i] << 8) | r.u8[r.i + 1]
     r.i += 2
   } else if (minor === 26) {
+    requireBytes(r, 4)
     value = (r.u8[r.i] << 24) | (r.u8[r.i + 1] << 16) | (r.u8[r.i + 2] << 8) | r.u8[r.i + 3]
     r.i += 4
   } else if (minor === 27) {
+    requireBytes(r, 8)
     let v = 0n
     for (let k = 0; k < 8; k++) v = (v << 8n) | BigInt(r.u8[r.i++])
     value = Number(v)
+  } else if (minor === 28 || minor === 29 || minor === 30) {
+    throw new Error("reserved CBOR additional information value")
   } else if (minor === 31) {
     // indefinite length
     if (major === 4) {
       const arr: any[] = []
-      while (r.u8[r.i] !== 0xff) arr.push(cborDecode(r))
-      r.i++ // skip break
-      return arr
+      while (true) {
+        // 先确认还有字节可读：缺少 0xff 终止符时必须抛错，而不是越界后无限循环
+        if (r.i >= r.u8.length) {
+          throw new Error("unterminated indefinite-length CBOR array")
+        }
+        if (r.u8[r.i] === 0xff) {
+          r.i++ // skip break
+          return arr
+        }
+        arr.push(cborDecode(r))
+      }
     } else if (major === 5) {
       const obj: Record<string, any> = {}
-      while (r.u8[r.i] !== 0xff) {
+      while (true) {
+        if (r.i >= r.u8.length) {
+          throw new Error("unterminated indefinite-length CBOR map")
+        }
+        if (r.u8[r.i] === 0xff) {
+          r.i++ // skip break
+          return obj
+        }
         const k = cborDecode(r)
         const v = cborDecode(r)
         obj[String(k)] = v
       }
-      r.i++ // skip break
-      return obj
     }
   }
   switch (major) {
     case 0: return value // uint
     case 1: return -1 - value // nint
     case 2: { // bytes
+      requireBytes(r, value)
       const out = r.u8.slice(r.i, r.i + value)
       r.i += value
       return out
     }
     case 3: { // string
+      requireBytes(r, value)
       const out = new TextDecoder().decode(r.u8.slice(r.i, r.i + value))
       r.i += value
       return out
     }
     case 4: { // array
+      // 每个元素至少占 1 字节：长度超过剩余字节数必然读不下去，提前拒绝，
+      // 避免 `new Array(1e9)` 式的超长循环。
+      requireBytes(r, value)
       const arr: any[] = []
       for (let k = 0; k < value; k++) arr.push(cborDecode(r))
       return arr
     }
     case 5: { // map
+      requireBytes(r, value * 2)
       const obj: Record<string, any> = {}
       for (let k = 0; k < value; k++) {
         const key = cborDecode(r)
@@ -271,7 +317,8 @@ function pruneLocalChallenges(): void {
   }
 }
 
-async function issueChallenge(c: any, sd: SessionData): Promise<string> {
+/** 导出供测试使用（F-036：挑战单次消费回归）。 */
+export async function issueChallenge(c: any, sd: SessionData): Promise<string> {
   const id = b64urlEncode(newChallenge())
   const exp = Date.now() + CHALLENGE_TTL_MS
 
@@ -297,7 +344,25 @@ async function issueChallenge(c: any, sd: SessionData): Promise<string> {
   return id
 }
 
-async function consumeChallenge(
+/**
+ * 作废某个 challenge 在**两份存储**里的副本（F-036）。
+ *
+ * 挑战是双写的（进程内 localChallenges + 持久化后端），历史实现命中本地只删
+ * 本地、命中持久化只写空持久化，于是同一 challenge 最多可被消费两次（一次走各
+ * 自的副本）。消费时必须把两份都清掉。
+ */
+async function invalidateChallenge(c: any, id: string): Promise<void> {
+  localChallenges.delete(id)
+  try {
+    const { writePersistedSecret } = await import("../internal/model/db")
+    await writePersistedSecret(c.env, CHALLENGE_PREFIX + id, "")
+  } catch {
+    // 无持久化后端：只有本地副本需要清理（已在上方完成）
+  }
+}
+
+/** 导出供测试使用（F-036：挑战单次消费回归）。 */
+export async function consumeChallenge(
   c: any,
   id: string,
 ): Promise<SessionData | null> {
@@ -306,7 +371,8 @@ async function consumeChallenge(
   // 1) 进程内兜底表（读取即删除 = 单次使用）
   const local = localChallenges.get(id)
   if (local) {
-    localChallenges.delete(id)
+    // 同时作废持久化副本，否则同一 (id, assertion) 还能从持久化路径再换一次 JWT
+    await invalidateChallenge(c, id)
     return local.exp < Date.now() ? null : local.data
   }
 
@@ -321,10 +387,11 @@ async function consumeChallenge(
   } catch {
     return null
   }
-  // 一次性消费：无论后续校验是否通过，都先把该挑战作废
+  // 一次性消费：无论后续校验是否通过，都先把该挑战作废（两份存储一起清）
   try {
     await writePersistedSecret(c.env, key, "")
   } catch {}
+  localChallenges.delete(id)
   if (!raw) return null
   try {
     const data = JSON.parse(String(raw))
@@ -563,7 +630,10 @@ webauthnRouter.post("/webauthn_finish_login", async (c) => {
 
     // 5. 更新 signCount（防重放，可选）
     const signCount = (authData[33] << 24) | (authData[34] << 16) | (authData[35] << 8) | authData[36]
-    if (credential.sign_count !== undefined && signCount !== 0 && signCount <= credential.sign_count) {
+    // L-07（深度审查报告）：老凭据缺 sign_count 字段时按 0 处理——旧实现的
+    // `sign_count !== undefined &&` 会让整段重放检测被跳过（缺字段 = 永不拒绝）。
+    const prevSignCount = Number(credential.sign_count ?? 0) || 0
+    if (signCount !== 0 && signCount <= prevSignCount) {
       return c.json({ code: 400, message: "stale signCount (possible replay)", data: null }, 400)
     }
     credential.sign_count = signCount

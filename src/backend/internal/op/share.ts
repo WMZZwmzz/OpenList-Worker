@@ -103,12 +103,15 @@ export function shareClientKey(c: any): string {
  * @param reqPath e.g. `/@s/abc`, `/@s/abc/sub`, or `/abc/sub` (already stripped /sd)
  * @param password share password from frontend ("" if none)
  * @param clientKey 调用方连接标识，用于口令失败计数（可选）
+ * @param requestContext 平台请求上下文（可选）。提供 `waitUntil` 时访问计数的
+ *        saveDb 会挂到 after-response 生命周期上；未提供时**显式 await**（F-041）。
  */
 export async function resolveShare(
   reqPath: string,
   password: string,
   envCtx?: any,
   clientKey?: string,
+  requestContext?: { waitUntil?: (promise: Promise<any>) => void },
 ): Promise<ShareResolveResult> {
   const clean = normalize(reqPath)
   const parts = clean.split("/").filter(Boolean)
@@ -175,10 +178,26 @@ export async function resolveShare(
    * 历史实现把 `accessed+1` 与整库 saveDb 放在所有 containment 校验之前：
    * 匿名者对 `/@s/{id}/random` 反复探测（必然 400）也会持续触发
    * 「读全库 → 序列化 → 写全库」，并提前烧完 max_accessed 配额。
+   *
+   * F-041：计数落盘不能是「未 await 且未挂 waitUntil」的浮动 Promise。
+   * Cloudflare Workers / EdgeOne 在响应返回后不保证未注册 waitUntil 的 Promise
+   * 继续执行，整库序列化 + 网络写盘很可能被中途取消；`.catch(() => {})` 还会把
+   * 失败完全吞掉。结果 `share.accessed >= share.max_accessed` 的配额不可靠。
+   *
+   * 现在：有 requestContext.waitUntil → 挂到 after-response；没有 → 显式 await
+   * （调用方拿到的结果已经是「计数已尝试落盘」的状态）。
    */
-  const recordAccess = () => {
+  const recordAccess = async (): Promise<void> => {
     share.accessed = (share.accessed || 0) + 1
-    saveDb(db, envCtx).catch(() => {})
+    const task = saveDb(db, envCtx).catch((err: any) => {
+      // 计数落盘失败不影响分享本身可用：保持内存计数并继续
+      console.warn("[Share] failed to persist access count:", err?.message || err)
+    })
+    if (typeof requestContext?.waitUntil === "function") {
+      requestContext.waitUntil(task)
+      return
+    }
+    await task
   }
 
   // FIX(C-3): containment check. Whatever normalize() produces, the result
@@ -214,7 +233,7 @@ export async function resolveShare(
       return { ok: false, error: "share is empty" }
     }
     share.files = safeFiles
-    recordAccess()
+    await recordAccess()
     return { ok: true, share, virtualList: true }
   }
 
@@ -225,22 +244,27 @@ export async function resolveShare(
     const single = normalize(share.files[0])
     if (!withinCreatorRoot(single))
       return { ok: false, error: "path not found in share" }
-    recordAccess()
+    await recordAccess()
     return { ok: true, share, realPath: single }
   }
 
   // Multi-file share, sub-path: match by basename
+  //
+  // F-095：存储侧的段必须先解码再比较。`subName` 来自 normalize → decodePathFully
+  // （完全解码），而历史数据里可能存在以百分号编码形式入库的条目（见 SEC-002 注释）。
+  // 用原始段比较时，`/u1/my%20file.txt` 既匹配不上 `my file.txt` 也匹配不上
+  // `my%20file.txt`（请求侧会被解码）—— 编码形态的分享条目其子路径永远不可访问。
   const subName = rest[0]
   const match = share.files.find((f: string) => {
     const segs = String(f).split("/").filter(Boolean)
-    return segs[segs.length - 1] === subName
+    return decodePathFully(segs[segs.length - 1] || "") === subName
   })
   if (!match) return { ok: false, error: "path not found in share" }
   const real = normalize([normalize(match), ...rest.slice(1)].join("/"))
   if (!withinShare(real) || !withinCreatorRoot(real)) {
     return { ok: false, error: "path not found in share" }
   }
-  recordAccess()
+  await recordAccess()
   return { ok: true, share, realPath: real }
 }
 

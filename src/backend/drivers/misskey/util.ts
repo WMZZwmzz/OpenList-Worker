@@ -1,6 +1,9 @@
 // Misskey drive API 客户端
 import { DriverMisskeyAddition, MisskeyFile, MisskeyFolder } from "./types"
 
+/** Misskey /api/drive/{files,folders} 的 limit 上限为 100（省略时默认只有 10） */
+export const PAGE_LIMIT = 100
+
 export class ClientMisskey {
   private endpoint: string
   private token: string
@@ -30,12 +33,49 @@ export class ClientMisskey {
     return (await resp.json().catch(() => ({}))) as T
   }
 
+  /**
+   * F-468：按 untilId 游标翻页拉全量。
+   * Misskey 无游标时按 id DESC 排序（QueryService.makePaginationQuery），
+   * untilId 语义为 id < untilId，因此下一页游标取本页最后一项的 id。
+   * 防御：不足一页、游标不前进或没有新条目即停止，避免死循环。
+   */
+  private async listAll<T extends { id: string }>(
+    path: string,
+    folderId?: string,
+  ): Promise<T[]> {
+    const all: T[] = []
+    const seen = new Set<string>()
+    let untilId: string | undefined
+    for (;;) {
+      const body: Record<string, unknown> = { limit: PAGE_LIMIT }
+      if (folderId) body.folderId = folderId
+      if (untilId) body.untilId = untilId
+      const page = await this.post<T[]>(path, body)
+      if (!Array.isArray(page) || page.length === 0) break
+      let added = 0
+      for (const item of page) {
+        if (item?.id) {
+          if (seen.has(item.id)) continue
+          seen.add(item.id)
+        }
+        all.push(item)
+        added++
+      }
+      const lastId = page[page.length - 1]?.id
+      if (page.length < PAGE_LIMIT || !lastId || added === 0 || lastId === untilId) {
+        break
+      }
+      untilId = lastId
+    }
+    return all
+  }
+
   async getFiles(folderId?: string): Promise<MisskeyFile[]> {
-    return this.post<MisskeyFile[]>("/files", folderId ? { folderId } : {})
+    return this.listAll<MisskeyFile>("/files", folderId)
   }
 
   async getFolders(folderId?: string): Promise<MisskeyFolder[]> {
-    return this.post<MisskeyFolder[]>("/folders", folderId ? { folderId } : {})
+    return this.listAll<MisskeyFolder>("/folders", folderId)
   }
 
   async showFile(fileId: string): Promise<MisskeyFile> {

@@ -204,7 +204,16 @@ export function injectCdnIntoHtml(html: string, cdn: string): string {
 const CDN_REDIRECT_FOLDERS = ["assets", "images", "streamer", "static"]
 
 /** ASSET_URLS 原文 → 最近为 HTML 解析出的 CDN 地址（含 $version 替换结果）。
- *  静态资源缺失时的 302 复用它，保证与 HTML 指向同一个版本。 */
+ *  静态资源缺失时的 302 复用它，保证与 HTML 指向同一个版本。
+ *
+ *  F-048 复核结论：这里**刻意不设 TTL**（与上方 cdnHtmlCache 的 5 分钟 TTL 不同）。
+ *  理由是两者的失效模型不同：
+ *   - HTML 注入的 cdn 每次页面导航都会重算并重写本表（getIndexHtmlWithCdn 在每次
+ *     请求都执行 resolveCdnUrl，TTL 只短路昂贵的 CDN 探测，不短路本表的写入），
+ *     所以 pin 始终跟随最近的 HTML；
+ *   - 静态资源 302 必须与「请求方浏览器手里那份 HTML」指向同一版本，按 TTL 重新
+ *     解析反而会在 DB version 变更后制造 HTML↔资产哈希错配（404）。
+ *  缓存以 ASSET_URLS 原文为 key，配置变更即天然失效。 */
 const resolvedCdnCache = new Map<string, string>()
 
 /**

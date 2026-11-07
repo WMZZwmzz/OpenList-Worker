@@ -18,9 +18,11 @@ function parseTime(s?: string): string {
 export class Driver123Open implements StorageDriver {
   private client: Client123Open
   private pathCache = new Map<string, string>()
+  private rootFolderId: string
 
   constructor(addition: Driver123OpenAddition) {
     this.client = new Client123Open(addition)
+    this.rootFolderId = addition.root_folder_id || DEFAULT_ROOT
   }
 
   async init(): Promise<void> {
@@ -50,45 +52,34 @@ export class Driver123Open implements StorageDriver {
     const parts = physicalPath.split("/").filter(Boolean)
     const rawName = parts[parts.length - 1] || "root"
     const parentPath = "/" + parts.slice(0, -1).join("/")
-    try {
-      const parentId = await this.resolveDirId(parentPath)
-      const files = await this.client.getFiles(parentId)
-      const file = files.find((f) => f.filename === rawName)
-      if (file) {
-        const item = this.fileToItem(file)
-        if (!item.is_dir) {
-          try {
-            item.raw_url = await this.client.getDownloadUrl(file.fileId)
-          } catch (e: any) {
-            item.raw_url_error = e.message
-          }
-        }
-        return item
-      }
-    } catch {}
 
-    // Fallback: 目录
-    try {
-      await this.resolveDirId(physicalPath)
-      return {
-        name: rawName,
-        size: 0,
-        is_dir: true,
-        modified: new Date().toISOString(),
-        sign: "",
-        type: 1,
-        raw_url: "",
+    // 父目录解析/列表请求的异常（网络、鉴权、限流）必须向上传播，
+    // 不得与「条目不存在」共用同一分支。
+    const parentId = await this.resolveDirId(parentPath)
+    const files = await this.client.getFiles(parentId)
+    const file = files.find((f) => f.filename === rawName)
+    if (file) {
+      const item = this.fileToItem(file)
+      if (!item.is_dir) {
+        try {
+          item.raw_url = await this.client.getDownloadUrl(file.fileId)
+        } catch (e: any) {
+          item.raw_url_error = e.message
+        }
       }
-    } catch {
-      return {
-        name: rawName,
-        size: 0,
-        is_dir: false,
-        modified: new Date().toISOString(),
-        sign: "",
-        type: 0,
-        raw_url: "",
-      }
+      return item
+    }
+
+    // 不是文件：确认是否为真实存在的目录，否则抛 not found。
+    await this.resolveDirId(physicalPath)
+    return {
+      name: rawName,
+      size: 0,
+      is_dir: true,
+      modified: new Date().toISOString(),
+      sign: "",
+      type: 1,
+      raw_url: "",
     }
   }
 
@@ -123,13 +114,21 @@ export class Driver123Open implements StorageDriver {
 
   async move(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
     const entry = await this.resolveEntry(srcPhysical)
-    const dstId = await this.resolveDirId(dstDir)
+    // dstPhysical 是目标项自身的物理路径，目标目录取去掉末段后的父目录。
+    const dstParent =
+      "/" +
+      dstPhysical
+        .split("/")
+        .filter(Boolean)
+        .slice(0, -1)
+        .join("/")
+    const dstId = await this.resolveDirId(dstParent)
     await this.client.move(entry.id, dstId)
     this.pathCache.clear()
   }
@@ -170,11 +169,11 @@ export class Driver123Open implements StorageDriver {
 
   private async resolveDirId(physicalPath: string): Promise<string> {
     const clean = physicalPath.split("/").filter(Boolean).join("/")
-    if (!clean) return DEFAULT_ROOT
+    if (!clean) return this.rootFolderId
     if (this.pathCache.has(clean)) return this.pathCache.get(clean)!
 
     const parts = clean.split("/")
-    let currentId = DEFAULT_ROOT
+    let currentId = this.rootFolderId
     for (let i = 0; i < parts.length; i++) {
       const files = await this.client.getFiles(currentId)
       const target = files.find((f) => f.type === 1 && f.filename === parts[i])

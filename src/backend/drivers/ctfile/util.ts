@@ -1,6 +1,6 @@
 // CtFile (城通网盘) OpenAPI 客户端
 // 文档: https://openapi.ctfile.com/ (CTFile REST API v1, 统一 POST JSON + session 鉴权)
-import { md5 } from "../../pkg/crypto"
+import { createMD5 } from "../../internal/seed/hashers"
 import {
   CtFileAddition,
   CtFileDownloadUrl,
@@ -116,10 +116,22 @@ export class CtFileClient {
 
       if (res.status === 429 || res.status >= 500) {
         lastError = `HTTP ${res.status}`
+        // F-232：丢弃前先 cancel 响应体，避免边缘运行时连接被未消费的
+        // body 占住直到 GC（限流场景每次调用最多 3 个）。
+        try {
+          await res.body?.cancel()
+        } catch {}
         continue
       }
 
-      const text = await res.text()
+      // F-232：res.text() 必须在 try 内，读体中途断连也要走重试与统一包装。
+      let text: string
+      try {
+        text = await res.text()
+      } catch (e: any) {
+        lastError = e?.message || String(e)
+        continue
+      }
       let data: CtFileResp
       try {
         data = JSON.parse(text) as CtFileResp
@@ -304,7 +316,8 @@ export class CtFileClient {
       "folder_id",
       folderId,
       {},
-      { prefer: "raw" },
+      // F-234：官方文档要求 folder_id 不带 d 前缀，与 fileMeta/renameFile 一致。
+      { prefer: "stripped" },
     )
     return data as CtFileFolderMeta
   }
@@ -363,7 +376,8 @@ export class CtFileClient {
       "folder_id",
       folderId,
       { name: newName, is_rename: true },
-      { prefer: "raw" },
+      // F-234：modify_meta 的 folder_id 同样要求不带 d 前缀。
+      { prefer: "stripped" },
     )
   }
 
@@ -408,7 +422,11 @@ export class CtFileClient {
     fileName: string,
     content: Uint8Array,
   ): Promise<CtFileUploadTicket> {
-    const checksum = `${md5(content)}-${content.byteLength}`
+    // F-231：用流式（纯 JS、无 WASM）MD5 直接消费 Uint8Array 视图，
+    // 不再为整文件分配 padded 拷贝。
+    const hasher = (await createMD5()).init()
+    hasher.update(content)
+    const checksum = `${hasher.digest("hex") as string}-${content.byteLength}`
     const data = await this.call(`/${this.ns()}/file/upload`, {
       folder_id: folderId || ROOT_FOLDER_ID,
       checksum,
@@ -454,10 +472,11 @@ export class CtFileClient {
 
   /** 附加服务端排序参数（new/old/az/za/big/small） */
   private withOrder(body: Record<string, any>): Record<string, any> {
+    // F-233：令牌语义即方向 —— asc 对应 small/old/az，desc 经 order 表翻转。
     const map: Record<string, string> = {
       name: "az",
-      size: "big",
-      time: "new",
+      size: "small",
+      time: "old",
     }
     const base = map[this.addition.order_by || "name"] || "az"
     const direction = this.addition.order_direction === "desc"

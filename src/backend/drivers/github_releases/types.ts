@@ -49,6 +49,8 @@ export interface GHRFileInfo {
   name: string
   size: number
   download_url: string
+  /** "file" | "dir"（GitHub /contents 返回；目录的 download_url 为 null） */
+  type?: string
 }
 
 export interface GHRFile {

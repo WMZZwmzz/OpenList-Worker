@@ -72,6 +72,11 @@ function parseS3Path(c: any): { bucket: string; key: string } {
   const pathname = new URL(c.req.url).pathname
   const p = pathname.replace(/^\/s3\/?/, "")
   const parts = p.split("/").filter(Boolean)
+  // 注意（F-047 复核结论）：bucket 段**刻意不再做百分号解码**。
+  // 下游 resolvePath() 第一步就 decodePathFully 整条虚拟路径（含 bucket），
+  // 这里再解一次会变成双层解码：`/s3/my%2520bucket` 会被误解成 `my bucket`。
+  // key 段解一次是因为 s3.ts 自身要把 key 拼回虚拟路径后同样经过 resolvePath，
+  // 而 bucket 在拼装时只会被再解一次（handler → resolvePath），层数一致。
   const bucket = parts[0] || ""
   // L-12：畸形编码不让整个请求变 500；解不开的段保留原样（后续查不到即 404）
   const key = parts
@@ -79,6 +84,16 @@ function parseS3Path(c: any): { bucket: string; key: string } {
     .map((seg) => safeDecodeComponent(seg) ?? seg)
     .join("/")
   return { bucket, key }
+}
+
+/**
+ * FileItem.modified 形态异构（多数驱动是 ISO 8601），而 Last-Modified 按
+ * RFC 9110 §5.6.7 / §13.1.2 必须是 HTTP-date（IMF-fixdate）。
+ * 解析失败时退回当前时间，绝不把 ISO 字符串原样塞进响应头（F-052）。
+ */
+export function httpDateOf(value?: string | number | Date | null): string {
+  const t = value === undefined || value === null ? NaN : new Date(value as any).getTime()
+  return new Date(Number.isFinite(t) ? t : Date.now()).toUTCString()
 }
 
 /**
@@ -263,7 +278,8 @@ s3Router.on("HEAD", "/*", async (c) => {
     const headers: Record<string, string> = {
       "Content-Length": String(item.size || 0),
       "Content-Type": String(item.type || "application/octet-stream"),
-      "Last-Modified": item.modified || new Date().toISOString(),
+      // RFC 9110：Last-Modified 必须是 HTTP-date，不能是驱动返回的 ISO 8601
+      "Last-Modified": httpDateOf(item.modified),
     }
     return new Response(null, { status: 200, headers })
   } catch {

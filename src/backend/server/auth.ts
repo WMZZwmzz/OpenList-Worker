@@ -14,7 +14,6 @@ import {
   getUserFromContext,
   revokeToken,
   isTokenRevoked,
-  generateCSRFToken,
 } from "./middlewares"
 import {
   generateTotpSecret,
@@ -38,8 +37,10 @@ import {
   passwordStampOf,
   isPasswordStampValid,
   constantTimeEqualHex,
+  isPbkdf2PasswordFormat,
+  pbkdf2PasswordHashFromStatic,
+  verifyPbkdf2Password,
 } from "../pkg/password"
-import { setCSRFToken, clearCSRFToken } from "../pkg/csrf"
 import { getAuditLogger } from "../pkg/audit"
 import {
   OTP_PENDING_TYPE,
@@ -67,10 +68,110 @@ const LOGIN_MAX_LOCK_MS = 24 * 60 * 60 * 1000 // 最长锁定 24 小时
  * 被锁者自己也无法自解（解锁只发生在登录成功时）。
  */
 const LOGIN_GLOBAL_LOCK_MS = 15 * 60 * 1000
-const loginFailures = new Map<
-  string,
-  { count: number; lockedUntil: number; attempts: number }
->()
+/**
+ * 登录失败计数的单条记录生命周期（F-034/F-037）。
+ *
+ * 取代旧实现里 KV `expirationTtl` 的语义：超过这个时间且没有锁定的记录
+ * 视为过期，读取时忽略、懒清理时回收。
+ */
+const LOGIN_FAILURE_RECORD_TTL_MS = LOGIN_MAX_LOCK_MS + 60 * 60 * 1000
+/** 内存里允许保留的最大条目数，超出后按最近更新时间淘汰。 */
+const LOGIN_FAILURE_MAX_ENTRIES = 10_000
+
+interface LoginFailureEntry {
+  count: number
+  lockedUntil: number
+  attempts: number
+  /** 最近一次更新时间（F-037：懒清理按它淘汰，而不是只回收 count === 0） */
+  updatedAt: number
+}
+
+const loginFailures = new Map<string, LoginFailureEntry>()
+
+/** 仅供测试使用：直接暴露内存失败计数表（F-037 懒清理回归）。 */
+export function __loginFailuresForTest(): Map<string, LoginFailureEntry> {
+  return loginFailures
+}
+
+/**
+ * 登录失败计数的持久化键。**必须**走 readPersistedSecret/writePersistedSecret
+ * （F-034）：旧实现直接调用 `getKvBinding().binding.get/put/delete`，但
+ * cfkv REST（mode:"api"）模式下那个 binding 是纯数据对象
+ * `{type:"cf_rest",...}`，没有任何 get/put/delete 方法——读取抛 TypeError
+ * 被外层 catch 吞掉、写入被 typeof 守卫静默跳过，多实例共享彻底失效。
+ * 现在与注销黑名单同一套存储解析（D1/MySQL/DO/KV/Blob 全支持）。
+ */
+const loginFailureKey = (key: string) => `login_fail:${key}`
+
+function normalizeLoginFailureEntry(raw: any): LoginFailureEntry | null {
+  if (!raw || typeof raw !== "object") return null
+  const count = Number(raw.count)
+  const lockedUntil = Number(raw.lockedUntil)
+  const attempts = Number(raw.attempts)
+  if (!Number.isFinite(count) || !Number.isFinite(lockedUntil)) return null
+  const storedAt = Number(raw.storedAt)
+  if (
+    Number.isFinite(storedAt) &&
+    storedAt > 0 &&
+    Date.now() - storedAt > LOGIN_FAILURE_RECORD_TTL_MS
+  ) {
+    return null
+  }
+  return {
+    count,
+    lockedUntil,
+    attempts: Number.isFinite(attempts) ? attempts : 0,
+    updatedAt: Number.isFinite(Number(raw.updatedAt))
+      ? Number(raw.updatedAt)
+      : Date.now(),
+  }
+}
+
+/** 从统一持久化后端读取失败计数；无后端/损坏数据时返回 null。 */
+async function readPersistedLoginFailure(
+  env: any,
+  key: string,
+): Promise<LoginFailureEntry | null> {
+  const { readPersistedSecret } = await import("../internal/model/db")
+  const raw = await readPersistedSecret(env, loginFailureKey(key))
+  if (!raw) return null
+  try {
+    return normalizeLoginFailureEntry(JSON.parse(raw))
+  } catch {
+    return null
+  }
+}
+
+/** 写入失败计数；后端不可用时静默降级为纯内存（与原语义一致）。 */
+async function writePersistedLoginFailure(
+  env: any,
+  key: string,
+  rec: LoginFailureEntry,
+): Promise<void> {
+  try {
+    const { writePersistedSecret } = await import("../internal/model/db")
+    await writePersistedSecret(
+      env,
+      loginFailureKey(key),
+      JSON.stringify({ ...rec, storedAt: Date.now() }),
+    )
+  } catch (err) {
+    console.warn("[Auth] Failed to persist login failure:", err)
+  }
+}
+
+/** 清除失败计数。持久化层没有 delete API，写空串即表示「不存在」。 */
+async function clearPersistedLoginFailure(
+  env: any,
+  key: string,
+): Promise<void> {
+  try {
+    const { writePersistedSecret } = await import("../internal/model/db")
+    await writePersistedSecret(env, loginFailureKey(key), "")
+  } catch (err) {
+    console.warn("[Auth] Failed to clear login failure:", err)
+  }
+}
 
 /**
  * 登录锁定用的客户端地址。统一走 clientIpFromContext：只有 Cloudflare 的
@@ -151,39 +252,30 @@ async function bumpLoginFailure(
   maxLockMs: number = LOGIN_MAX_LOCK_MS,
 ): Promise<void> {
   const now = Date.now()
-  let rec = loginFailures.get(key) || { count: 0, lockedUntil: 0, attempts: 0 }
+  let rec: LoginFailureEntry = loginFailures.get(key) || {
+    count: 0,
+    lockedUntil: 0,
+    attempts: 0,
+    updatedAt: now,
+  }
 
-  // 尝试从 KV 读取（多实例共享）
-  try {
-    const { getKvBinding } = await import("../internal/model/db")
-    const kvInfo = await getKvBinding(env)
-    if (kvInfo.mode !== "none" && kvInfo.binding) {
-      const kvKey = `login_fail:${key}`
-      let val: any = null
-      try {
-        val = await kvInfo.binding.get(kvKey, "text")
-      } catch {
-        val = await kvInfo.binding.get(kvKey)
-      }
-      if (val && typeof val.text === "function") {
-        val = await val.text()
-      }
-      if (val) {
-        try {
-          rec = JSON.parse(String(val))
-        } catch {
-          // 解析失败，使用默认值
-        }
-      }
+  // 尝试从持久化后端读取（多实例共享，F-034）
+  const persisted = await readPersistedLoginFailure(env, key)
+  if (persisted) {
+    // 只接受不落后于内存的记录，避免回读覆盖本实例更新的计数
+    if (
+      persisted.attempts >= rec.attempts ||
+      persisted.lockedUntil > rec.lockedUntil
+    ) {
+      rec = persisted
     }
-  } catch {
-    // KV 不可用，回退到内存模式
   }
 
   if (rec.lockedUntil > now) return // already locked
 
   rec.count += 1
   rec.attempts += 1
+  rec.updatedAt = now
 
   if (rec.count >= maxFailures) {
     const lockDuration = Math.min(calculateLockDuration(rec.attempts), maxLockMs)
@@ -196,22 +288,8 @@ async function bumpLoginFailure(
 
   loginFailures.set(key, rec)
 
-  // 持久化到 KV
-  try {
-    const { getKvBinding } = await import("../internal/model/db")
-    const kvInfo = await getKvBinding(env)
-    if (kvInfo.mode !== "none" && kvInfo.binding) {
-      const kvKey = `login_fail:${key}`
-      const payload = JSON.stringify(rec)
-      // 设置 TTL 为最长锁定时间 + 1 小时
-      const ttl = Math.ceil((LOGIN_MAX_LOCK_MS + 3600000) / 1000)
-      if (typeof kvInfo.binding.put === "function") {
-        await kvInfo.binding.put(kvKey, payload, { expirationTtl: ttl })
-      }
-    }
-  } catch (err) {
-    console.warn("[Auth] Failed to persist login failure to KV:", err)
-  }
+  // 持久化（多实例共享）
+  await writePersistedLoginFailure(env, key, rec)
 }
 
 export async function isLoginLocked(
@@ -219,11 +297,27 @@ export async function isLoginLocked(
   username: string,
   env: any,
 ): Promise<boolean> {
-  // 懒清理：Map 过大时清掉已过锁定期/无锁定的条目，防止无限增长
-  if (loginFailures.size > 10000) {
+  // F-037：懒清理。旧条件只回收「已达锁定且锁期已过、count===0」的条目，
+  // 而失败 1-4 次（未达阈值，lockedUntil=0，count>=1）的条目 count 只增不减，
+  // 永不满足条件 —— 攻击者用随机用户名持续打 /login 就能让 Map 无界增长。
+  // 现在按最近更新时间淘汰，并在淘汰后仍超限时按最旧记录做硬上限裁剪。
+  if (loginFailures.size > LOGIN_FAILURE_MAX_ENTRIES) {
     const now = Date.now()
     for (const [k, v] of loginFailures) {
-      if (v.lockedUntil < now && v.count === 0) loginFailures.delete(k)
+      const idle = now - (v.updatedAt || 0)
+      if (
+        v.lockedUntil < now &&
+        (v.count === 0 || idle > LOGIN_FAILURE_RECORD_TTL_MS)
+      ) {
+        loginFailures.delete(k)
+      }
+    }
+    if (loginFailures.size > LOGIN_FAILURE_MAX_ENTRIES) {
+      const overflow = [...loginFailures.entries()].sort(
+        (a, b) => (a[1].updatedAt || 0) - (b[1].updatedAt || 0),
+      )
+      const drop = loginFailures.size - LOGIN_FAILURE_MAX_ENTRIES
+      for (const [k] of overflow.slice(0, drop)) loginFailures.delete(k)
     }
   }
 
@@ -237,37 +331,18 @@ export async function isLoginLocked(
   let rec = ipKey ? loginFailures.get(ipKey) : undefined
   let grec = loginFailures.get(globalKey)
 
-  // 尝试从 KV 读取（多实例共享）
-  try {
-    const { getKvBinding } = await import("../internal/model/db")
-    const kvInfo = await getKvBinding(env)
-    if (kvInfo.mode !== "none" && kvInfo.binding) {
-      for (const key of keys) {
-        const kvKey = `login_fail:${key}`
-        let val: any = null
-        try {
-          val = await kvInfo.binding.get(kvKey, "text")
-        } catch {
-          val = await kvInfo.binding.get(kvKey)
-        }
-        if (val && typeof val.text === "function") {
-          val = await val.text()
-        }
-        if (val) {
-          try {
-            const data = JSON.parse(String(val))
-            if (key === ipKey) rec = data
-            if (key === globalKey) grec = data
-            // 同步到内存缓存
-            loginFailures.set(key, data)
-          } catch {
-            // 解析失败
-          }
-        }
-      }
+  // 从统一持久化后端读取（多实例共享，F-034）
+  for (const key of keys) {
+    try {
+      const data = await readPersistedLoginFailure(env, key)
+      if (!data) continue
+      if (key === ipKey) rec = data
+      if (key === globalKey) grec = data
+      // 同步到内存缓存（保留持久化里的 updatedAt，供懒清理判断）
+      loginFailures.set(key, data)
+    } catch {
+      // 持久化不可用：使用内存数据
     }
-  } catch {
-    // KV 不可用，使用内存数据
   }
 
   if (rec && rec.lockedUntil > now) return true
@@ -305,20 +380,9 @@ export async function clearLoginFailures(
 
   for (const key of keys) loginFailures.delete(key)
 
-  // 从 KV 中删除
-  try {
-    const { getKvBinding } = await import("../internal/model/db")
-    const kvInfo = await getKvBinding(env)
-    if (kvInfo.mode !== "none" && kvInfo.binding) {
-      for (const key of keys) {
-        const kvKey = `login_fail:${key}`
-        if (typeof kvInfo.binding.delete === "function") {
-          await kvInfo.binding.delete(kvKey)
-        }
-      }
-    }
-  } catch (err) {
-    console.warn("[Auth] Failed to clear login failures from KV:", err)
+  // 从统一持久化后端删除（F-034：不再只探测 KV binding）
+  for (const key of keys) {
+    await clearPersistedLoginFailure(env, key)
   }
 }
 
@@ -333,29 +397,35 @@ export async function hashPasswordSHA256(
 /**
  * 校验前端提交的静态哈希是否匹配该用户（等价 Go User.ValidatePwdStaticHash）。
  *
- * 只接受 Go 双层格式：password === saltedHash(inputStatic, user.salt)。
+ * 接受两种存储格式：
+ *   - S-03 PBKDF2 新格式（`$olpbkdf2-sha256$...`，setUserPassword 的写入值）；
+ *   - Go 双层格式（password === saltedHash(inputStatic, user.salt)，64 位 hex）。
  *
- * 历史遗留格式（bcrypt / 无 salt 的单层 SHA256）不再被支持，也不再在登录成功
- * 后自动升级为双层格式 —— 与 Go 行为完全一致：没有 salt 的存储值一律不可验证。
- * 遗留账号请通过 ADMIN_PASS 显式重置，或由管理员在后台改密。
+ * 历史遗留格式（bcrypt）不再被支持。无 salt 的单层 SHA256 保留读兼容，
+ * 登录成功后由调用方迁移到 PBKDF2 新格式。
  */
 export async function verifyUserStaticHash(
   user: any,
   inputStatic: string,
 ): Promise<boolean> {
-  const stored = String(user?.password || "")
-    .trim()
-    .toLowerCase()
+  const stored = String(user?.password || "").trim()
   const input = String(inputStatic || "")
     .trim()
     .toLowerCase()
-  if (!stored || !isHex64(input) || !isHex64(stored)) return false
+  if (!stored || !isHex64(input)) return false
+
+  // S-03：PBKDF2 新格式（盐/迭代数内嵌于存储值）
+  const pbkdf2Result = await verifyPbkdf2Password(stored, input)
+  if (pbkdf2Result !== null) return pbkdf2Result
+
+  const storedLower = stored.toLowerCase()
+  if (!isHex64(storedLower)) return false
   if (user?.salt) {
     const expect = (await saltedHash(input, String(user.salt))).toLowerCase()
-    return constantTimeEqualHex(stored, expect)
+    return constantTimeEqualHex(storedLower, expect)
   }
-  // 历史单层 sha256（无 salt 字段）：读兼容，登录成功后由调用方迁移到双层。
-  return constantTimeEqualHex(stored, input)
+  // 历史单层 sha256（无 salt 字段）：读兼容，登录成功后由调用方迁移到新格式。
+  return constantTimeEqualHex(storedLower, input)
 }
 
 /**
@@ -759,6 +829,12 @@ authRouter.post("/otp/login", async (c) => {
     id: user.id,
     username: user.username,
     role: user.role,
+    // F-031：与 /login、/login/hash、WebAuthn、SSO 四个签发点保持一致。
+    // 鉴权入口（authUserFromReq / resolveUserFromContext / checkAdminAuth）
+    // 都会用 isPasswordStampValid 比对 pwd_ts 与数据库当前的 pwd_update_at；
+    // 缺这个 claim 时，所有真实用户（pwd_update_at 非空）兑换出的 7 天令牌
+    // 在第一次 API 调用就会被判为密码指纹不符而 401。
+    pwd_ts: passwordStampOf(user),
     iss: JWT_ISSUER,
     aud: JWT_AUDIENCE,
     exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 7,
@@ -768,13 +844,13 @@ authRouter.post("/otp/login", async (c) => {
   }
   const secret = await getJwtSecret(c)
   const token = await sign(fullPayload, secret)
-  const csrfToken = setCSRFToken(c)
   await getAuditLogger().logLoginSuccess(c, user.username)
 
   return c.json({
     code: 200,
     message: "success",
-    data: { token, csrf_token: csrfToken },
+    // S-18：会话只走 Bearer 头，传统 CSRF 不成立，csrf_token 已随死代码移除。
+    data: { token },
   })
 })
 
@@ -809,13 +885,17 @@ authRouter.post("/login", async (c) => {
     const isPasswordValid = await verifyUserPassword(matchedUser, rawPassword)
 
     if (isPasswordValid) {
-      // 遗留格式（bcrypt / 无盐单层 SHA256）登录成功后自动升级为 Go 双层哈希
+      // 遗留格式（bcrypt / 无盐单层 SHA256 / Go 双层 SHA256）登录成功后
+      // 自动升级为 S-03 PBKDF2 新格式。透明迁移不刷新 pwd_update_at：
+      // pwd_ts 指纹保持一致，既有令牌不因迁移而被登出。
       const stored = String(matchedUser.password || "").trim()
       const needsMigrate =
-        /^\$2[aby]\$/.test(stored) || (!matchedUser.salt && isHex64(stored))
+        /^\$2[aby]\$/.test(stored) || !isPbkdf2PasswordFormat(stored)
       if (needsMigrate) {
         console.log(`[Auth] Upgrading password hash for user: ${username}`)
+        const prevStamp = matchedUser.pwd_update_at
         await setUserPassword(matchedUser, rawPassword)
+        if (prevStamp !== undefined) matchedUser.pwd_update_at = prevStamp
         await saveDb(db, c.env)
       }
 
@@ -849,9 +929,6 @@ authRouter.post("/login", async (c) => {
       const secret = await getJwtSecret(c)
       const token = await sign(payload, secret)
 
-      // 生成 CSRF Token
-      const csrfToken = setCSRFToken(c)
-
       // 记录审计日志
       const auditLogger = getAuditLogger()
       await auditLogger.logLoginSuccess(c, username)
@@ -859,7 +936,8 @@ authRouter.post("/login", async (c) => {
       return c.json({
         code: 200,
         message: "success",
-        data: { token, csrf_token: csrfToken },
+        // S-18：csrf_token 已随死代码移除（会话只走 Bearer 头）。
+        data: { token },
       })
     }
   }
@@ -904,12 +982,21 @@ authRouter.post("/login/hash", async (c) => {
     const isHashValid = await verifyUserStaticHash(matchedUser, inputHash)
 
     if (isHashValid) {
-      // 无盐单层 SHA256 旧数据 -> 升级为 Go 双层哈希（无需明文）
+      // 无盐单层 SHA256 旧数据 -> 升级为 Go 双层哈希（无需明文，保留原有
+      // 「升级即刷新 pwd_update_at」的语义）
       if (!matchedUser.salt) {
         console.log(`[Auth] Upgrading password hash for user: ${username}`)
         matchedUser.salt = generateSalt()
         matchedUser.password = await saltedHash(inputHash, matchedUser.salt)
         matchedUser.pwd_update_at = new Date().toISOString()
+        await saveDb(db, c.env)
+      } else if (!isPbkdf2PasswordFormat(matchedUser.password)) {
+        // S-03：Go 双层 SHA256 -> PBKDF2 新格式。/login/hash 只拿得到
+        // StaticHash(pwd)，新格式恰以它为密钥材料，可直接迁移；不改
+        // pwd_update_at（透明迁移不登出既有会话）。
+        console.log(`[Auth] Upgrading password hash for user: ${username}`)
+        matchedUser.salt = generateSalt()
+        matchedUser.password = await pbkdf2PasswordHashFromStatic(inputHash)
         await saveDb(db, c.env)
       }
 
@@ -943,9 +1030,6 @@ authRouter.post("/login/hash", async (c) => {
       const secret = await getJwtSecret(c)
       const token = await sign(payload, secret)
 
-      // 生成 CSRF Token
-      const csrfToken = setCSRFToken(c)
-
       // 记录审计日志
       const auditLogger = getAuditLogger()
       await auditLogger.logLoginSuccess(c, username)
@@ -953,7 +1037,8 @@ authRouter.post("/login/hash", async (c) => {
       return c.json({
         code: 200,
         message: "success",
-        data: { token, csrf_token: csrfToken },
+        // S-18：csrf_token 已随死代码移除（会话只走 Bearer 头）。
+        data: { token },
       })
     }
   }
@@ -1063,8 +1148,7 @@ export const logoutHandler = async (c: any) => {
     }
   }
 
-  // 清除 CSRF Token
-  clearCSRFToken(c)
+  // S-18：CSRF Token 已随死代码移除（会话只走 Bearer 头，无 Cookie 会话 CSRF 面）。
 
   // 记录审计日志
   const auditLogger = getAuditLogger()
@@ -1080,22 +1164,8 @@ export const logoutHandler = async (c: any) => {
 authRouter.get("/logout", logoutHandler)
 authRouter.post("/logout", logoutHandler)
 
-// GET /api/auth/csrf — 获取 CSRF token（添加日期: 2026-09-05）
-authRouter.get("/csrf", async (c) => {
-  try {
-    const token = await generateCSRFToken(c)
-    return c.json({
-      code: 200,
-      message: "success",
-      data: { csrf_token: token },
-    })
-  } catch (err: any) {
-    return c.json(
-      { code: 500, message: "Failed to generate CSRF token", data: null },
-      500,
-    )
-  }
-})
+// S-18：GET /api/auth/csrf 端点已删除 —— 两套 CSRF 实现均为未挂载的死代码，
+// 且 token 不绑定会话；当前会话只走 Bearer 头，传统 CSRF 不成立。
 
 // POST /api/auth/2fa/generate — returns a fresh TOTP secret + QR image
 authRouter.post("/2fa/generate", async (c) => {

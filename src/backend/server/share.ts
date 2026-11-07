@@ -73,6 +73,27 @@ shareRouter.get("/get", async (c) => {
   return c.json({ code: 200, message: "success", data: share })
 })
 
+/**
+ * /create 的进程内互斥。
+ *
+ * F-043：自定义 share id 的「查重 → push → saveDb」是 read-modify-write，
+ * 整库覆盖写下（saveDb 序列化整个 db）。虽然当前临界区内没有 await，后续任何
+ * 一次改动（例如插入校验 await）都会重新引入并发窗口。所有创建请求串行通过
+ * 这把锁，并在锁内**重新查重**，保证同一 isolate 内不会出现重复 id 或丢更新。
+ */
+let shareCreateLock: Promise<void> = Promise.resolve()
+async function withShareCreateLock<T>(fn: () => Promise<T>): Promise<T> {
+  const prev = shareCreateLock
+  let release!: () => void
+  shareCreateLock = new Promise<void>((resolve) => (release = resolve))
+  await prev
+  try {
+    return await fn()
+  } finally {
+    release()
+  }
+}
+
 // Create a new share (requires logged-in user with SHARE permission; admins always allowed)
 shareRouter.post("/create", async (c) => {
   const user = await getUserFromContext(c)
@@ -86,7 +107,6 @@ shareRouter.post("/create", async (c) => {
   }
 
   const body = await c.req.json().catch(() => ({}))
-  const db = await getDb(c.env)
 
   // 校验并清理分享路径
   let files: string[] = []
@@ -139,17 +159,6 @@ shareRouter.post("/create", async (c) => {
 
   const shareId = rawId || generateShareId()
 
-  if ((db.shares || []).some((s: any) => s.id === shareId)) {
-    return c.json(
-      {
-        code: 400,
-        message: "share id already exists",
-        data: null,
-      },
-      400,
-    )
-  }
-
   const newShare = {
     id: shareId,
     new_id: body.new_id || shareId,
@@ -179,10 +188,25 @@ shareRouter.post("/create", async (c) => {
     header: body.header || "",
   }
 
-  if (!db.shares) db.shares = []
-  db.shares.push(newShare)
-  await saveDb(db, c.env)
-  return c.json({ code: 200, message: "success", data: newShare })
+  // 唯一性检查与写入必须在同一把锁内（并在锁内重新查重），否则并发创建同一
+  // 自定义 id 会同时通过检查（F-043）。
+  return await withShareCreateLock(async () => {
+    const latestDb = await getDb(c.env)
+    if ((latestDb.shares || []).some((s: any) => s.id === shareId)) {
+      return c.json(
+        {
+          code: 400,
+          message: "share id already exists",
+          data: null,
+        },
+        400,
+      )
+    }
+    if (!latestDb.shares) latestDb.shares = []
+    latestDb.shares.push(newShare)
+    await saveDb(latestDb, c.env)
+    return c.json({ code: 200, message: "success", data: newShare })
+  })
 })
 
 /** Generate a random 16-char share id using Web Crypto (Workers-compatible) */

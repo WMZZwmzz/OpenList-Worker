@@ -1,18 +1,30 @@
 /* =====================================================================
  * 密码哈希模块 (Password Hashing)
  *
- * 存储方案：Go (OpenList/AList) 兼容双层 SHA256
- *   对齐 OpenList/internal/model/user.go：
- *     StaticHash(pwd)          = sha256(`${pwd}-${STATIC_HASH_SALT}`) —— 前端 /login/hash 提交值
- *     saltedHash(static, salt) = sha256(`${static}-${salt}`)          —— per-user 盐二次哈希
- *     PwdHash = saltedHash(StaticHash(pwd), salt)                     —— 数据库存储值
+ * 存储方案（S-03 渐进迁移后的新格式）：
+ *   `$olpbkdf2-sha256$<iterations>$<saltHex>$<dkHex>`
+ *   dk = PBKDF2-SHA256(StaticHash(pwd), salt, iterations, 256bit)
+ *   —— 第一层仍对齐 Go StaticHash（/login/hash 通道兼容），第二层由
+ *   单轮 SHA-256 升级为 PBKDF2 慢哈希，库泄露后的离线爆破成本提高约
+ *   10⁵ 倍。迭代数取 100_000：与本项目 config 加密的 PBKDF2 一致，是
+ *   Cloudflare Workers CPU 预算内可承受的上限（报告建议的 210k 在
+ *   free tier 会超时）。
  *
- * 存储字段：user.password（64位 hex）+ user.salt（16位随机）。
- * 历史格式兼容（读兼容，登录成功后自动迁移到本格式）：
- *   - 单层 sha256（无 salt 字段，早期 TSWorker）：password 直接等于 StaticHash(pwd)
+ * 历史格式（读兼容，登录成功后自动迁移到新格式，见 auth.ts 登录钩子）：
+ *   - Go 兼容双层 SHA256：PwdHash = sha256(`${StaticHash(pwd)}-${salt}`)，
+ *     对齐 OpenList/internal/model/user.go；
+ *   - 单层 sha256（无 salt 字段，早期 TSWorker）：password 直接等于 StaticHash(pwd)。
+ *
+ * 存储字段：user.password（新格式串或 64 位 hex）+ user.salt（16 位随机，
+ * 仍会写入以保持 Go 导出兼容；新格式的盐内嵌在 password 串里）。
  * ===================================================================== */
 
 export const STATIC_HASH_SALT = "https://github.com/alist-org/alist"
+
+/** S-03：PBKDF2 迭代数（新格式写入值） */
+export const PBKDF2_PASSWORD_ITERATIONS = 100000
+
+const PBKDF2_PASSWORD_PREFIX = "$olpbkdf2-sha256$"
 
 async function sha256Hex(input: string): Promise<string> {
   const buf = await crypto.subtle.digest(
@@ -29,7 +41,7 @@ export async function staticHash(plain: string): Promise<string> {
   return sha256Hex(`${plain}-${STATIC_HASH_SALT}`)
 }
 
-/** 静态哈希 + 用户盐 -> 最终存储值（对应 Go HashPwd） */
+/** 静态哈希 + 用户盐 -> 最终存储值（对应 Go HashPwd，历史格式） */
 export async function saltedHash(
   staticHex: string,
   salt: string,
@@ -37,12 +49,105 @@ export async function saltedHash(
   return sha256Hex(`${staticHex}-${salt}`)
 }
 
-/** 明文 + 用户盐 -> 最终存储值（对应 Go TwoHashPwd / SetPassword） */
+/** 明文 + 用户盐 -> 最终存储值（对应 Go TwoHashPwd / SetPassword，历史格式） */
 export async function twoStepHash(
   plain: string,
   salt: string,
 ): Promise<string> {
   return saltedHash(await staticHash(plain), salt)
+}
+
+function hexToBytes(hex: string): Uint8Array<ArrayBuffer> {
+  const out = new Uint8Array(new ArrayBuffer(hex.length / 2))
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16)
+  return out
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("")
+}
+
+/** 是否为 S-03 PBKDF2 新格式存储值 */
+export function isPbkdf2PasswordFormat(value: string): boolean {
+  return String(value || "").startsWith(PBKDF2_PASSWORD_PREFIX)
+}
+
+/**
+ * PBKDF2 慢哈希（新格式核心）：以 StaticHash(pwd) 为密钥材料派生 256bit。
+ */
+async function pbkdf2Hex(
+  secret: string,
+  saltHex: string,
+  iterations: number,
+): Promise<string> {
+  const baseKey = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    "PBKDF2",
+    false,
+    ["deriveBits"],
+  )
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", hash: "SHA-256", salt: hexToBytes(saltHex), iterations },
+    baseKey,
+    256,
+  )
+  return bytesToHex(new Uint8Array(bits))
+}
+
+/**
+ * 生成 S-03 新格式存储值：`$olpbkdf2-sha256$<iter>$<saltHex>$<dkHex>`。
+ * saltHex 省略时生成 16 字节随机盐。
+ */
+export async function pbkdf2PasswordHash(
+  plain: string,
+  saltHex?: string,
+): Promise<string> {
+  return pbkdf2PasswordHashFromStatic(await staticHash(plain), saltHex)
+}
+
+/**
+ * 同上，但直接以 StaticHash(pwd)（/login/hash 通道的输入）为密钥材料 ——
+ * 该通道拿不到明文，迁移时无需明文。
+ */
+export async function pbkdf2PasswordHashFromStatic(
+  staticHex: string,
+  saltHex?: string,
+): Promise<string> {
+  const salt =
+    saltHex || bytesToHex(crypto.getRandomValues(new Uint8Array(16)))
+  const dk = await pbkdf2Hex(staticHex, salt, PBKDF2_PASSWORD_ITERATIONS)
+  return `${PBKDF2_PASSWORD_PREFIX}${PBKDF2_PASSWORD_ITERATIONS}$${salt}$${dk}`
+}
+
+/**
+ * 校验 S-03 新格式存储值。`staticHex` 为前端 /login/hash 通道提交的
+ * StaticHash(pwd)（与历史验证入口同源）。非新格式返回 null（交由历史路径）。
+ */
+export async function verifyPbkdf2Password(
+  stored: string,
+  staticHex: string,
+): Promise<boolean | null> {
+  if (!isPbkdf2PasswordFormat(stored)) return null
+  const parts = stored.slice(PBKDF2_PASSWORD_PREFIX.length).split("$")
+  if (parts.length !== 3) return false
+  const iterations = Number(parts[0])
+  const salt = parts[1]
+  const expect = parts[2]
+  if (
+    !Number.isInteger(iterations) ||
+    iterations < 1 ||
+    iterations > 10_000_000 ||
+    !/^[0-9a-f]+$/i.test(salt) ||
+    salt.length < 16 ||
+    !/^[0-9a-f]{64}$/i.test(expect)
+  ) {
+    return false
+  }
+  const dk = await pbkdf2Hex(staticHex, salt, iterations)
+  return constantTimeEqualHex(dk.toLowerCase(), expect.toLowerCase())
 }
 
 /** 生成用户盐（16 位 [A-Za-z0-9]，对应 Go random.String(16)） */
@@ -62,11 +167,12 @@ export function isHex64(value: string): boolean {
 
 /**
  * 统一写入口令（对应 Go User.SetPassword）：
- * 生成新盐并写入双层哈希。调用方负责 saveDb 持久化。
+ * 写入 S-03 PBKDF2 新格式（盐内嵌）。user.salt 仍生成并保留（历史数据比对
+ * 与 Go 导出兼容）。调用方负责 saveDb 持久化。
  */
 export async function setUserPassword(user: any, plain: string): Promise<void> {
   user.salt = generateSalt()
-  user.password = await twoStepHash(plain, user.salt)
+  user.password = await pbkdf2PasswordHash(plain)
   user.pwd_update_at = new Date().toISOString()
 }
 

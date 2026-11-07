@@ -37,11 +37,10 @@ export class Pan123ShareDriver implements StorageDriver {
     for (const part of parts) {
       const files = await this.client.getFiles(currentId)
       const folder = files.find((f) => f.Type === 1 && f.FileName === part)
-      if (folder) {
-        currentId = String(folder.FileId)
-      } else {
-        break
+      if (!folder) {
+        throw new Error(`[123Share] Folder not found: ${part}`)
       }
+      currentId = String(folder.FileId)
     }
 
     return currentId

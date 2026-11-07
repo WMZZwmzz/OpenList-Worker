@@ -26,6 +26,7 @@ import {
   SpaceTypeFamily,
   SpaceTypePersonal,
 } from "./consts"
+import { randomAlnum } from "../rand"
 import { WoPanCrypto } from "./crypto"
 import {
   AppQueryUserData,
@@ -43,13 +44,11 @@ import {
 } from "./types"
 
 function randomChars(length: number): string {
-  const charset =
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-  let res = ""
-  for (let i = 0; i < length; i++) {
-    res += charset.charAt(Math.floor(Math.random() * charset.length))
-  }
-  return res
+  // S-04 同类清单：改用 CSPRNG（原 Math.random）。
+  return randomAlnum(
+    length,
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+  )
 }
 
 function formatDateToBatchNo(d: Date = new Date()): string {
@@ -62,6 +61,9 @@ function formatDateToBatchNo(d: Date = new Date()): string {
   const s = pad(d.getSeconds())
   return `${y}${m}${day}${h}${min}${s}`
 }
+
+/** access_token 最短长度：短于 16 字符无法作为合法 AES 密钥（F-216） */
+const MIN_ACCESS_TOKEN_LEN = 16
 
 export class WoPanClient {
   private addition: WoPanAddition
@@ -78,7 +80,13 @@ export class WoPanClient {
     onTokenUpdate?: (accessToken: string, refreshToken: string) => void,
   ) {
     this.addition = addition
-    this.accessToken = addition.access_token || ""
+    // F-216：过短的 access_token 视为无效（不能静默用非法 AES 密钥），
+    // 交给 initData 用 refresh_token 刷新。
+    this.accessToken =
+      addition.access_token &&
+      addition.access_token.length >= MIN_ACCESS_TOKEN_LEN
+        ? addition.access_token
+        : ""
     this.refreshTokenValue = addition.refresh_token || ""
     this.onTokenUpdate = onTokenUpdate
     this.crypto = new WoPanCrypto(this.accessToken)
@@ -93,8 +101,14 @@ export class WoPanClient {
   }
 
   setAccessToken(token: string): void {
-    this.accessToken = token
-    this.crypto.setAccessToken(token)
+    // F-216：过短 token 置空，绝不作为 AES 密钥使用。
+    if (token && token.length < MIN_ACCESS_TOKEN_LEN) {
+      this.accessToken = ""
+      this.crypto.setAccessToken("")
+      return
+    }
+    this.accessToken = token || ""
+    this.crypto.setAccessToken(this.accessToken)
   }
 
   setRefreshToken(token: string): void {
@@ -175,17 +189,34 @@ export class WoPanClient {
       if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
         trimmed = trimmed.slice(1, -1)
       }
+      // DATA 可能本来就是明文 JSON（部分接口不加密）：优先按明文解析。
+      let plainError: unknown
       try {
-        const decrypted = this.crypto.decrypt(trimmed, channel)
-        if (decrypted) {
-          return JSON.parse(decrypted) as T
-        }
+        return JSON.parse(trimmed) as T
+      } catch (err) {
+        plainError = err
+      }
+      // 否则按密文处理。F-215：解密失败/产物非 JSON 必须抛错，
+      // 绝不能把 base64 密文原样当作业务数据返回（否则列表静默变空）。
+      let decrypted: string
+      try {
+        decrypted = this.crypto.decrypt(trimmed, channel)
+      } catch (err: any) {
+        throw new Error(
+          `[WoPan] 响应解密失败 (${key}): ${err?.message || String(err)}`,
+        )
+      }
+      if (!decrypted) {
+        throw new Error(
+          `[WoPan] 响应解密失败 (${key}): 解密结果为空（密钥不匹配？）`,
+        )
+      }
+      try {
+        return JSON.parse(decrypted) as T
       } catch {
-        try {
-          return JSON.parse(trimmed) as T
-        } catch {
-          return trimmed as unknown as T
-        }
+        throw new Error(
+          `[WoPan] 响应解密后不是有效 JSON (${key}): ${String(plainError || "")}`,
+        )
       }
     }
 
@@ -227,6 +258,13 @@ export class WoPanClient {
     const resp = await this.appRefreshToken()
     if (!resp.access_token) {
       throw new Error("[WoPan] Failed to refresh token: empty access_token")
+    }
+    // F-216：刷新结果同样必须满足 AES 密钥长度，否则配置会进入无自愈的
+    // 静默失败状态。
+    if (resp.access_token.length < MIN_ACCESS_TOKEN_LEN) {
+      throw new Error(
+        `[WoPan] Failed to refresh token: access_token shorter than ${MIN_ACCESS_TOKEN_LEN} chars`,
+      )
     }
     this.setAccessToken(resp.access_token)
     if (resp.refresh_token) {
@@ -299,7 +337,12 @@ export class WoPanClient {
   }
 
   async initData(): Promise<void> {
-    if (!this.accessToken && this.refreshTokenValue) {
+    // F-216：过短（1-15 字符）的 token 与空 token 一样必须刷新。
+    if (
+      (!this.accessToken ||
+        this.accessToken.length < MIN_ACCESS_TOKEN_LEN) &&
+      this.refreshTokenValue
+    ) {
       await this.refreshToken()
     }
     await this.initPhone().catch(() => {})

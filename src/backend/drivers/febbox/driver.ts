@@ -6,6 +6,14 @@ import {
 import { DriverFebBoxAddition, FebBoxFile } from "./types"
 import { ClientFebBox } from "./util"
 
+/** 物理路径的父目录（根为 "/"），F-435 */
+export function parentPath(physicalPath: string): string {
+  const parts = String(physicalPath || "")
+    .split("/")
+    .filter(Boolean)
+  return parts.length > 1 ? "/" + parts.slice(0, -1).join("/") : "/"
+}
+
 function fileToItem(f: FebBoxFile): FileItem {
   const isDir = f.is_dir === 1
   return {
@@ -25,6 +33,7 @@ function fileToItem(f: FebBoxFile): FileItem {
 export class DriverFebBox implements StorageDriver {
   private client: ClientFebBox
   private userIp: string
+  private rootId: string
   private pathCache = new Map<string, string>()
 
   constructor(
@@ -33,6 +42,7 @@ export class DriverFebBox implements StorageDriver {
   ) {
     this.client = new ClientFebBox(addition, persist)
     this.userIp = addition.user_ip || ""
+    this.rootId = addition.root_folder_id || "0"
   }
 
   async init(): Promise<void> {
@@ -50,28 +60,40 @@ export class DriverFebBox implements StorageDriver {
     const rawName = parts[parts.length - 1] || "root"
     const parentPath = "/" + parts.slice(0, -1).join("/")
 
-    try {
-      const parentId = await this.pathToId(parentPath)
-      const files = await this.client.getFilesList(parentId)
-      const target = files.find((f) => f.file_name === rawName)
-      if (target) {
-        const item = fileToItem(target)
-        if (!item.is_dir) {
-          try {
-            item.raw_url = await this.client.getDownloadLink(
-              item.sign,
-              this.userIp,
-            )
-          } catch {
-            item.raw_url_error = "[FebBox] failed to resolve download url"
-          }
-        }
-        return item
+    if (parts.length === 0) {
+      return {
+        name: "root",
+        size: 0,
+        is_dir: true,
+        modified: new Date().toISOString(),
+        sign: this.rootId,
+        type: 1,
+        raw_url: "",
       }
-    } catch {
-      // fall through
     }
 
+    // pathToId/getFilesList 的网络、鉴权等异常必须向上传播；
+    // 只有「列表成功且确无该名字」才允许进入目录兜底/not found。
+    const parentId = await this.pathToId(parentPath)
+    const files = await this.client.getFilesList(parentId)
+    const target = files.find((f) => f.file_name === rawName)
+    if (target) {
+      const item = fileToItem(target)
+      if (!item.is_dir) {
+        try {
+          item.raw_url = await this.client.getDownloadLink(
+            item.sign,
+            this.userIp,
+          )
+        } catch {
+          item.raw_url_error = "[FebBox] failed to resolve download url"
+        }
+      }
+      return item
+    }
+
+    // 不是文件：确认是否为真实存在的目录，否则 pathToId 抛 not found。
+    await this.pathToId(physicalPath)
     return {
       name: rawName,
       size: 0,
@@ -113,25 +135,28 @@ export class DriverFebBox implements StorageDriver {
 
   async move(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
+    // F-435：pathToId 从账号根 "0" 逐段按名称解析，必须喂物理路径；
+    // 虚拟 dstDir 在子路径挂载/root_folder_path 下必然解析失败或移错目录。
     const entry = await this.resolveEntry(srcPhysical)
-    await this.client.move(entry.id, await this.pathToId(dstDir))
+    await this.client.move(entry.id, await this.pathToId(parentPath(dstPhysical)))
     this.pathCache.clear()
   }
 
   async copy(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
+    // F-435：同 move，目标父目录取物理路径。
     const entry = await this.resolveEntry(srcPhysical)
-    await this.client.copy(entry.id, await this.pathToId(dstDir))
+    await this.client.copy(entry.id, await this.pathToId(parentPath(dstPhysical)))
     this.pathCache.clear()
   }
 
@@ -152,14 +177,14 @@ export class DriverFebBox implements StorageDriver {
     return { id: String(target.fid), isDir: target.is_dir === 1 }
   }
 
-  /** 物理路径 → 目录 ID（根目录返回 "0"） */
+  /** 物理路径 → 目录 ID（根目录为 root_folder_id，默认 "0"） */
   private async pathToId(physicalPath: string): Promise<string> {
     const clean = physicalPath.split("/").filter(Boolean).join("/")
-    if (!clean) return "0"
+    if (!clean) return this.rootId
     if (this.pathCache.has(clean)) return this.pathCache.get(clean)!
 
     const parts = clean.split("/")
-    let currentId = "0"
+    let currentId = this.rootId
     for (let i = 0; i < parts.length; i++) {
       const files = await this.client.getFilesList(currentId)
       const target = files.find(
@@ -169,7 +194,7 @@ export class DriverFebBox implements StorageDriver {
         throw new Error(`[FebBox] Directory '${parts[i]}' not found`)
       }
       currentId = String(target.fid)
-      const subPath = "/" + parts.slice(0, i + 1).join("/")
+      const subPath = parts.slice(0, i + 1).join("/")
       this.pathCache.set(subPath, currentId)
     }
     return currentId

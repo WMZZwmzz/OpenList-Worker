@@ -61,7 +61,8 @@ export class ClientCnbReleases {
 
   /** 路径里是 release 名称（TS 链路不传 Go 对象 ID），需先解析出 ID 再调 API */
   async findRelease(idOrName: string): Promise<CNBRelease | null> {
-    const releases = await this.listReleases().catch(() => [] as CNBRelease[])
+    // API/网络/鉴权错误必须向上传播，不能吞成「release 不存在」。
+    const releases = await this.listReleases()
     if (!Array.isArray(releases)) return null
     return (
       releases.find((r) => r.id === idOrName) ||
@@ -73,9 +74,10 @@ export class ClientCnbReleases {
 
   /** 兼容按资产名称或 ID 查找 */
   findAsset(release: CNBRelease, idOrName: string): CNBAsset | null {
+    const assets = release.assets || []
     return (
-      release.assets.find((a) => a.id === idOrName) ||
-      release.assets.find((a) => a.name === idOrName) ||
+      assets.find((a) => a.id === idOrName) ||
+      assets.find((a) => a.name === idOrName) ||
       null
     )
   }

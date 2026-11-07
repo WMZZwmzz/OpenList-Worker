@@ -20,15 +20,24 @@ import {
   unixOrNow,
 } from "./util"
 
+/** 数字配置归一化（F-226）：null/''/NaN 统一回落默认值并夹在合理区间 */
+function toInt(value: unknown, fallback: number, min: number, max: number): number {
+  if (value === undefined || value === null || value === "") return fallback
+  const num = Math.floor(Number(value))
+  if (!Number.isFinite(num)) return fallback
+  return Math.min(max, Math.max(min, num))
+}
+
 export function normalizeGuangYaPanAddition(a: any): GuangYaPanAddition {
   const norm = { ...(a || {}) } as any
   norm.client_id = (norm.client_id || "").trim()
   norm.device_id = normalizeDeviceID(norm.device_id || "")
   if (!norm.device_id) norm.device_id = randomDeviceID()
-  norm.device_sign = (norm.device_sign || "").trim() || "wdi10." + norm.device_id
-  norm.page_size = Number(norm.page_size || 100)
-  norm.order_by = Number(norm.order_by === undefined ? 3 : norm.order_by)
-  norm.sort_type = Number(norm.sort_type === undefined ? 1 : norm.sort_type)
+  norm.device_sign =
+    (norm.device_sign || "").trim() || "wdi10." + norm.device_id
+  norm.page_size = toInt(norm.page_size, 100, 1, 1000)
+  norm.order_by = toInt(norm.order_by, 3, 0, 99)
+  norm.sort_type = toInt(norm.sort_type, 1, 0, 99)
   norm.root_folder_path = (norm.root_folder_path || "").trim()
   norm.access_token = (norm.access_token || "").trim()
   norm.refresh_token = (norm.refresh_token || "").trim()
@@ -56,7 +65,8 @@ function gypFileToItem(f: GypFileItem): FileItem {
 function normalizeOSSEndpoint(endpoint: string, bucket: string): string {
   let ep = (endpoint || "").trim()
   if (!ep) return ep
-  if (!ep.startsWith("http://") && !ep.startsWith("https://")) ep = "https://" + ep
+  if (!ep.startsWith("http://") && !ep.startsWith("https://"))
+    ep = "https://" + ep
   let u: URL
   try {
     u = new URL(ep)
@@ -64,7 +74,8 @@ function normalizeOSSEndpoint(endpoint: string, bucket: string): string {
     return ep
   }
   let host = u.host
-  if (bucket && host.startsWith(bucket + ".")) host = host.slice(bucket.length + 1)
+  if (bucket && host.startsWith(bucket + "."))
+    host = host.slice(bucket.length + 1)
   u.host = host
   return u.toString().replace(/\/+$/, "")
 }
@@ -73,12 +84,18 @@ export class GuangYaPanDriver implements StorageDriver {
   private addition: GuangYaPanAddition
   private client: GuangYaPanClient
   private idCache = new Map<string, string>()
+  /** F-228：随机生成的 device_id 需要在 init 时回写存储，避免设备身份漂移 */
+  private deviceIdNeedsPersist: boolean
+  /** 单次 list/解析最多翻页数（防止服务端异常时打爆子请求配额） */
+  private static readonly MAX_LIST_PAGES = 200
 
   constructor(
     addition: any,
     onStateChanged?: (changes: GuangYaPanStateChanges) => Promise<void>,
   ) {
     this.addition = normalizeGuangYaPanAddition(addition)
+    this.deviceIdNeedsPersist =
+      !normalizeDeviceID(String(addition?.device_id || "").trim())
     this.client = new GuangYaPanClient(this.addition)
     this.client.onStateChanged = onStateChanged
     this.onStateChanged = onStateChanged
@@ -89,6 +106,23 @@ export class GuangYaPanDriver implements StorageDriver {
 
   async init(): Promise<void> {
     if (!this.addition.client_id) throw new Error("client_id is required")
+
+    // F-228：缺失 device_id 时生成的值必须持久化，否则 isolate/驱动缓存重建后
+    // 设备身份漂移，已保存的 token 可能被服务端按设备维度拒绝。
+    if (this.deviceIdNeedsPersist && this.onStateChanged) {
+      try {
+        await this.onStateChanged({
+          device_id: this.addition.device_id,
+          device_sign: this.addition.device_sign,
+        })
+        this.deviceIdNeedsPersist = false
+      } catch (e: any) {
+        console.warn(
+          "[GuangYaPan] failed to persist device_id:",
+          e?.message || e,
+        )
+      }
+    }
 
     // 认证优先级与 Go 版一致：access_token -> refresh_token -> 短信登录
     if (this.addition.access_token) {
@@ -151,6 +185,52 @@ export class GuangYaPanDriver implements StorageDriver {
     return parent === "/" ? `/${name}` : `${parent}/${name}`
   }
 
+  private get pageSize(): number {
+    const n = Math.floor(Number(this.addition.page_size) || 100)
+    return Math.min(1000, Math.max(1, n))
+  }
+
+  /**
+   * 逐页查找某个父目录下的子项（F-220）。
+   * 旧实现只看第一页（page 恒为 0），目录超过 page_size 时深层路径解析
+   * 会误报 "folder not found"；这里按服务端 total 与短页终止，并用
+   * fileId 去重防止服务端忽略 page 参数时无限翻页。
+   */
+  private async findChild(
+    parentId: string,
+    match: (item: GypFileItem) => boolean,
+  ): Promise<GypFileItem | undefined> {
+    const pageSize = this.pageSize
+    const seen = new Set<string>()
+    for (let page = 0; page < GuangYaPanDriver.MAX_LIST_PAGES; page++) {
+      const resp = await this.client.getFileList(
+        parentId,
+        pageSize,
+        this.addition.order_by,
+        this.addition.sort_type,
+        page,
+      )
+      const list = resp.data?.list || []
+      const found = list.find(match)
+      if (found) return found
+
+      let fresh = 0
+      for (const item of list) {
+        const id = item.fileId || item.fileName
+        if (seen.has(id)) continue
+        seen.add(id)
+        fresh++
+      }
+      const total = Number(resp.data?.total) || 0
+      if (list.length < pageSize) return undefined
+      if (total > 0 && (page + 1) * pageSize >= total) return undefined
+      // 服务端忽略 page 参数（返回内容与上一页完全重复）时立即停止，
+      // 避免空转上万次子请求。
+      if (fresh === 0) return undefined
+    }
+    return undefined
+  }
+
   private async resolveId(path: string): Promise<string> {
     const clean = this.cleanPath(path)
     if (clean === "/") return "" // 光亚盘根目录 ID 为空串
@@ -161,13 +241,8 @@ export class GuangYaPanDriver implements StorageDriver {
     let curId = ""
     let curPath = "/"
     for (const seg of segs) {
-      const resp = await this.client.getFileList(
+      const found = await this.findChild(
         curId,
-        this.addition.page_size,
-        this.addition.order_by,
-        this.addition.sort_type,
-      )
-      const found = resp.data?.list?.find(
         (i) => i.fileName === seg && i.resType === 2,
       )
       if (!found) throw new Error(`folder not found: ${seg}`)
@@ -179,46 +254,62 @@ export class GuangYaPanDriver implements StorageDriver {
   }
 
   /** 解析任意条目（文件或文件夹）的 ID，末段不限定为文件夹 */
-  private async resolveItemId(path: string): Promise<string> {
+  private async resolveItemId(path: string, fresh = false): Promise<string> {
     const clean = this.cleanPath(path)
     if (clean === "/") return ""
-    const cached = this.idCache.get(clean)
-    if (cached) return cached
+    if (fresh) {
+      // 破坏性操作（rename/remove/move/copy/put）前清空缓存：驱动实例
+      // 跨请求复用，旧路径→ID 映射可能已指向改名/移动前的对象（F-221）。
+      this.idCache.clear()
+    } else {
+      const cached = this.idCache.get(clean)
+      if (cached) return cached
+    }
 
     const parentPath = clean.split("/").slice(0, -1).join("/") || "/"
     const name = clean.split("/").pop() || ""
     const parentId = await this.resolveId(parentPath)
-    const resp = await this.client.getFileList(
-      parentId,
-      this.addition.page_size,
-      this.addition.order_by,
-      this.addition.sort_type,
-    )
-    const found = resp.data?.list?.find((i) => i.fileName === name)
+    const found = await this.findChild(parentId, (i) => i.fileName === name)
     if (!found) throw new Error(`item not found: ${name}`)
     this.idCache.set(clean, found.fileId)
     return found.fileId
+  }
+
+  /** 任何改变云端目录结构的操作后失效路径→ID 缓存（F-221） */
+  private invalidateIdCache(): void {
+    this.idCache.clear()
   }
 
   async list(virtualPath: string, physicalPath: string): Promise<FileItem[]> {
     const id = await this.resolveId(physicalPath)
     const clean = this.cleanPath(physicalPath)
     const result: FileItem[] = []
+    const seen = new Set<string>()
+    const pageSize = this.pageSize
 
-    for (let page = 0; page < 10000; page++) {
+    for (let page = 0; page < GuangYaPanDriver.MAX_LIST_PAGES; page++) {
       const resp = await this.client.getFileList(
         id,
-        this.addition.page_size,
+        pageSize,
         this.addition.order_by,
         this.addition.sort_type,
+        page,
       )
       const list = resp.data?.list || []
+      let fresh = 0
       for (const f of list) {
+        const dedupeKey = f.fileId || this.joinPath(clean, f.fileName)
+        if (seen.has(dedupeKey)) continue
+        seen.add(dedupeKey)
+        fresh++
         this.idCache.set(this.joinPath(clean, f.fileName), f.fileId)
         result.push(gypFileToItem(f))
       }
-      if (list.length < this.addition.page_size) break
-      if (resp.data?.total > 0 && result.length >= resp.data.total) break
+      const total = Number(resp.data?.total) || 0
+      if (list.length < pageSize) break
+      if (total > 0 && result.length >= total) break
+      // 服务端忽略 page（重复返回同一页）时停止，避免 10000 次空转
+      if (fresh === 0) break
     }
 
     return sortFileItems(result, "name", "asc")
@@ -240,13 +331,7 @@ export class GuangYaPanDriver implements StorageDriver {
 
     const parentPath = clean.split("/").slice(0, -1).join("/") || "/"
     const parentId = await this.resolveId(parentPath)
-    const resp = await this.client.getFileList(
-      parentId,
-      this.addition.page_size,
-      this.addition.order_by,
-      this.addition.sort_type,
-    )
-    const found = resp.data?.list?.find((i) => i.fileName === name)
+    const found = await this.findChild(parentId, (i) => i.fileName === name)
     if (!found) throw new Error("file not found")
 
     const isDir = found.resType === 2
@@ -271,6 +356,7 @@ export class GuangYaPanDriver implements StorageDriver {
       parentId,
       dirName,
     })
+    this.invalidateIdCache()
   }
 
   async rename(
@@ -278,11 +364,13 @@ export class GuangYaPanDriver implements StorageDriver {
     physicalPath: string,
     newName: string,
   ): Promise<void> {
-    const id = await this.resolveItemId(physicalPath)
+    // 破坏性操作强制重新解析，避免命中陈旧 ID（F-221）
+    const id = await this.resolveItemId(physicalPath, true)
     await this.client.postAPI("/nd.bizuserres.s/v1/file/rename", {
       fileId: id,
       newName,
     })
+    this.invalidateIdCache()
   }
 
   async move(
@@ -292,7 +380,7 @@ export class GuangYaPanDriver implements StorageDriver {
     srcPhys: string,
     dstPhys: string,
   ): Promise<void> {
-    const srcId = await this.resolveItemId(srcPhys)
+    const srcId = await this.resolveItemId(srcPhys, true)
     const dstParent =
       this.cleanPath(dstPhys).split("/").slice(0, -1).join("/") || "/"
     const dstId = await this.resolveId(dstParent)
@@ -301,6 +389,7 @@ export class GuangYaPanDriver implements StorageDriver {
       { fileIds: [srcId], parentId: dstId },
     )
     if (out?.data?.taskId) await this.client.waitTaskDone(out.data.taskId)
+    this.invalidateIdCache()
   }
 
   async copy(
@@ -310,7 +399,7 @@ export class GuangYaPanDriver implements StorageDriver {
     srcPhys: string,
     dstPhys: string,
   ): Promise<void> {
-    const srcId = await this.resolveItemId(srcPhys)
+    const srcId = await this.resolveItemId(srcPhys, true)
     const dstParent =
       this.cleanPath(dstPhys).split("/").slice(0, -1).join("/") || "/"
     const dstId = await this.resolveId(dstParent)
@@ -319,6 +408,7 @@ export class GuangYaPanDriver implements StorageDriver {
       { fileIds: [srcId], parentId: dstId },
     )
     if (out?.data?.taskId) await this.client.waitTaskDone(out.data.taskId)
+    this.invalidateIdCache()
   }
 
   async remove(
@@ -326,12 +416,14 @@ export class GuangYaPanDriver implements StorageDriver {
     physicalPath: string,
     names: string[],
   ): Promise<void> {
-    const id = await this.resolveItemId(physicalPath)
+    // 破坏性操作强制重新解析，绝不能凭缓存删错对象（F-221）
+    const id = await this.resolveItemId(physicalPath, true)
     const out = await this.client.postAPI<{ data?: { taskId?: string } }>(
       "/nd.bizuserres.s/v1/file/delete_file",
       { fileIds: [id] },
     )
     if (out?.data?.taskId) await this.client.waitTaskDone(out.data.taskId)
+    this.invalidateIdCache()
   }
 
   async put(
@@ -359,6 +451,7 @@ export class GuangYaPanDriver implements StorageDriver {
     if (alreadyDone) {
       if (!taskId) throw new Error("instant upload returns empty task id")
       await this.client.waitUploadTaskInfo(taskId)
+      this.invalidateIdCache()
       return
     }
 
@@ -367,7 +460,8 @@ export class GuangYaPanDriver implements StorageDriver {
     // 上传一律抛 "upload token is incomplete"。这里优先取 creds，并保留平铺回退。
     const creds = token?.creds || ({} as any)
     const accessKeyID = creds.accessKeyID || token?.accessKeyID || ""
-    const secretAccessKey = creds.secretAccessKey || token?.secretAccessKey || ""
+    const secretAccessKey =
+      creds.secretAccessKey || token?.secretAccessKey || ""
     const sessionToken = creds.sessionToken || token?.sessionToken || ""
 
     if (
@@ -382,16 +476,22 @@ export class GuangYaPanDriver implements StorageDriver {
 
     // 单次 PUT 上传（<5GB）；大文件分片上传未在本移植版本中实现
     const endpoint = normalizeOSSEndpoint(token.endPoint, token.bucketName)
-    const uploadURL = `https://${token.bucketName}.${new URL(endpoint).host}/${token.objectPath.replace(/^\/+/, "")}`
+    // F-223：objectPath 通常内嵌文件名，# / ? 会被 URL 解析成 fragment/query
+    // 导致请求路径与签名不一致。URL 用逐段编码值，签名仍用 OSS 规范的原始路径。
+    const objectPath = token.objectPath.replace(/^\/+/, "")
+    const encodedObjectPath = objectPath
+      .split("/")
+      .map((seg) => encodeURIComponent(seg))
+      .join("/")
+    const uploadURL = `https://${token.bucketName}.${new URL(endpoint).host}/${encodedObjectPath}`
 
     const dateStr = new Date().toUTCString()
     const contentType = "application/octet-stream"
     const ossHeaders = sessionToken
       ? `x-oss-security-token:${sessionToken}\n`
       : ""
-    const canonicalizedResource = `/${token.bucketName}/${token.objectPath.replace(/^\/+/, "")}`
-    const stringToSign =
-      `PUT\n\n${contentType}\n${dateStr}\n${ossHeaders}${canonicalizedResource}`
+    const canonicalizedResource = `/${token.bucketName}/${objectPath}`
+    const stringToSign = `PUT\n\n${contentType}\n${dateStr}\n${ossHeaders}${canonicalizedResource}`
     const signature = await hmacSha1Base64(stringToSign, secretAccessKey)
     const authorization = `OSS ${accessKeyID}:${signature}`
 
@@ -413,6 +513,12 @@ export class GuangYaPanDriver implements StorageDriver {
       throw new Error(`OSS upload failed: ${res.status} ${await res.text()}`)
     }
 
-    if (taskId) await this.client.waitUploadTaskInfo(taskId)
+    if (!taskId) {
+      // F-227：字节已写入 OSS 但没有 taskId 就无法确认后端登记，不能静默
+      // 返回成功（否则网盘里看不到文件）；与秒传路径保持一致直接报错。
+      throw new Error("real upload returns empty task id")
+    }
+    await this.client.waitUploadTaskInfo(taskId)
+    this.invalidateIdCache()
   }
 }

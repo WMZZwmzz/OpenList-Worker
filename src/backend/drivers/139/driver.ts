@@ -106,7 +106,9 @@ export class Yun139Driver implements StorageDriver {
         size: isNaN(sizeNum) ? 0 : sizeNum,
         is_dir: false,
         modified: f.updateTime || f.createTime || new Date().toISOString(),
-        sign: f.contentID || name,
+        // 缺 id 时保持空串：回退为文件名会把文件名当 fileId 发给 /file/update
+        // 等接口（不同命名空间，必然失败且报错难以理解）。
+        sign: f.contentID || "",
         type: calcFileType(name, false),
         thumb: f.thumbnailURL || f.bigThumbnailURL,
         raw_url: "",
@@ -180,7 +182,7 @@ export class Yun139Driver implements StorageDriver {
           foundFile.updateTime ||
           foundFile.createTime ||
           new Date().toISOString(),
-        sign: foundFile.contentID || name,
+        sign: foundFile.contentID || "",
         type: calcFileType(name, false),
         thumb: foundFile.thumbnailURL || foundFile.bigThumbnailURL,
         raw_url: rawUrl,
@@ -199,7 +201,17 @@ export class Yun139Driver implements StorageDriver {
       throw new Error(`Cannot get link for folder: ${physicalPath}`)
     }
 
-    const url = await this.client.getDownloadUrl(item.sign)
+    // get() 命中文件时已经取过一次直链（item.raw_url），直接复用，
+    // 只有它为空（getDownloadUrl 失败被吞）时才兜底再请求一次。
+    let url = item.raw_url || ""
+    if (!url) {
+      if (!item.sign) {
+        throw new Error(
+          `[139] entry "${item.name}" has no content id; cannot resolve download url`,
+        )
+      }
+      url = await this.client.getDownloadUrl(item.sign)
+    }
     return {
       url,
       headers: {
@@ -225,7 +237,13 @@ export class Yun139Driver implements StorageDriver {
     newName: string,
   ): Promise<void> {
     const item = await this.get(virtualPath, physicalPath)
-    await this.client.rename(item.sign, newName)
+    if (!item.sign) {
+      throw new Error(
+        `[139] entry "${item.name}" has no id in the listing; cannot rename it`,
+      )
+    }
+    // legacy 账号文件/目录走不同端点，重命名需要把 is_dir 一并传下去
+    await this.client.rename(item.sign, newName, item.is_dir)
   }
 
   async remove(

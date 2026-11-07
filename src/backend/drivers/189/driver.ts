@@ -49,6 +49,22 @@ function decodeUploadSession(token: string): Cloud189UploadSession {
   }
 }
 
+/**
+ * 计算上游协议要求的 sliceMd5（对应 OpenList Go drivers/189/util.go）：
+ *   - 单分片：sliceMd5Hex = fileMd5Hex（小写）；
+ *   - 多分片：把每个分片 MD5 **转大写**后按 "\n" 连接，再对整个字符串取
+ *     MD5，结果保持小写（GetMD5EncodeStr 输出小写）。
+ * 旧实现用「小写分片拼接后取 MD5 再 toUpperCase」，与上游双重不一致，
+ * 所有 >10MiB 文件提交的校验值必然错误。
+ */
+function computeSliceMd5(partMd5s: string[], fileMd5: string): string {
+  const normalized = partMd5s
+    .map((part) => String(part || "").trim().toLowerCase())
+    .filter((part) => /^[a-f0-9]{32}$/.test(part))
+  if (normalized.length <= 1) return fileMd5
+  return md5Hex(normalized.map((part) => part.toUpperCase()).join("\n"))
+}
+
 function parse189Date(dateStr: string): string {
   if (!dateStr) return new Date().toISOString()
   try {
@@ -100,8 +116,6 @@ export class Cloud189Driver implements StorageDriver {
   private addition: Cloud189Addition
   /** cache: physical path -> folderId (string) */
   private pathIdCache = new Map<string, string>()
-  /** CF Workers subrequest budget */
-  private budget = { used: 0, limit: SUBREQUEST_LIMIT }
 
   constructor(
     addition: Cloud189Addition,
@@ -109,6 +123,39 @@ export class Cloud189Driver implements StorageDriver {
   ) {
     this.addition = normalizeCloud189Addition(addition)
     this.client = new Pan189Client(this.addition, onCookieUpdate)
+  }
+
+  /**
+   * F-137：每个公开方法持有独立的子请求预算对象。
+   *
+   * 驱动实例被 storage 层跨请求缓存复用，旧实现的 `this.budget.used = 0`
+   * 会在并发请求间相互清零，导致每个请求都以为自己拥有完整 45 次预算，
+   * 合计子请求数可超出 Workers 上限并抛 "Too many subrequests"。
+   */
+  private newBudget(): { used: number; limit: number } {
+    return { used: 0, limit: SUBREQUEST_LIMIT }
+  }
+
+  /**
+   * 失效 pathIdCache 中 path 自身及其所有后代的条目（F-136）。
+   */
+  private invalidatePathCache(physicalPath: string): void {
+    const clean =
+      "/" +
+      String(physicalPath || "")
+        .split("/")
+        .filter(Boolean)
+        .join("/")
+    if (clean === "/") {
+      this.pathIdCache.clear()
+      return
+    }
+    const prefix = `${clean}/`
+    for (const key of Array.from(this.pathIdCache.keys())) {
+      if (key === clean || key.startsWith(prefix)) {
+        this.pathIdCache.delete(key)
+      }
+    }
   }
 
   async init(): Promise<void> {
@@ -128,7 +175,10 @@ export class Cloud189Driver implements StorageDriver {
    * 将 physicalPath 解析为对应的 folderId。
    * 逐级向下解析并缓存路径 ID 映射。
    */
-  private async resolveFolderId(physicalPath: string): Promise<string> {
+  private async resolveFolderId(
+    physicalPath: string,
+    budget: { used: number; limit: number },
+  ): Promise<string> {
     const rootId = this.client.getRootId()
     const clean =
       "/" +
@@ -137,7 +187,9 @@ export class Cloud189Driver implements StorageDriver {
         .filter(Boolean)
         .join("/")
 
-    if (clean === "/" || clean === `/${rootId}`) {
+    // F-139：只保留唯一的根判定；旧实现把「路径末段 === root_folder_id
+    // 字符串」也当成根，导致网盘中真实的同名文件夹（默认 "-11"）无法访问。
+    if (clean === "/") {
       return rootId
     }
 
@@ -171,7 +223,7 @@ export class Cloud189Driver implements StorageDriver {
       const { folders } = await this.client.getFiles(parentId, {
         findName: decodedName,
         findIsDir: true,
-        budget: this.budget,
+        budget,
       })
 
       const folder = folders.find(
@@ -196,7 +248,10 @@ export class Cloud189Driver implements StorageDriver {
   /**
    * 将 physicalPath 解析为对应的文件对象及其父目录 ID
    */
-  private async resolveFile(physicalPath: string): Promise<{
+  private async resolveFile(
+    physicalPath: string,
+    budget: { used: number; limit: number },
+  ): Promise<{
     file: FileItem189 | FolderItem189
     parentId: string
     isDir: boolean
@@ -215,11 +270,11 @@ export class Cloud189Driver implements StorageDriver {
       }
     })()
     const parentPath = "/" + segs.slice(0, segs.length - 1).join("/")
-    const parentId = await this.resolveFolderId(parentPath)
+    const parentId = await this.resolveFolderId(parentPath, budget)
 
     const { files, folders } = await this.client.getFiles(parentId, {
       findName: decodedName,
-      budget: this.budget,
+      budget,
     })
 
     const file = files.find(
@@ -248,10 +303,10 @@ export class Cloud189Driver implements StorageDriver {
   }
 
   async list(_virtualPath: string, physicalPath: string): Promise<FileItem[]> {
-    this.budget.used = 0
-    const folderId = await this.resolveFolderId(physicalPath)
+    const budget = this.newBudget()
+    const folderId = await this.resolveFolderId(physicalPath, budget)
     const { files, folders } = await this.client.getFiles(folderId, {
-      budget: this.budget,
+      budget,
     })
 
     const items: FileItem[] = [
@@ -271,15 +326,13 @@ export class Cloud189Driver implements StorageDriver {
   }
 
   async get(_virtualPath: string, physicalPath: string): Promise<FileItem> {
-    this.budget.used = 0
+    const budget = this.newBudget()
     const segs = String(physicalPath || "")
       .split("/")
       .filter(Boolean)
 
-    if (
-      segs.length === 0 ||
-      segs[segs.length - 1] === this.client.getRootId()
-    ) {
+    // F-139：根判定只看空路径，不再按「末段名 === root_folder_id」猜测
+    if (segs.length === 0) {
       const rootId = this.client.getRootId()
       return {
         name: rootId,
@@ -292,7 +345,7 @@ export class Cloud189Driver implements StorageDriver {
       }
     }
 
-    const { file, isDir } = await this.resolveFile(physicalPath)
+    const { file, isDir } = await this.resolveFile(physicalPath, budget)
     if (isDir) {
       return pan189FolderToFileItem(file as FolderItem189)
     }
@@ -308,14 +361,16 @@ export class Cloud189Driver implements StorageDriver {
   }
 
   async mkdir(_virtualPath: string, physicalPath: string): Promise<void> {
-    this.budget.used = 0
+    const budget = this.newBudget()
     const segs = String(physicalPath || "")
       .split("/")
       .filter(Boolean)
     const dirName = segs.pop() || "新文件夹"
     const parentPath = "/" + segs.join("/")
-    const parentId = await this.resolveFolderId(parentPath)
+    const parentId = await this.resolveFolderId(parentPath, budget)
     await this.client.mkdir(parentId, dirName)
+    // F-136：同名目录可能残留旧 ID（删除后重建），新建后失效缓存
+    this.invalidatePathCache("/" + [...segs, dirName].join("/"))
   }
 
   async rename(
@@ -323,9 +378,16 @@ export class Cloud189Driver implements StorageDriver {
     physicalPath: string,
     newName: string,
   ): Promise<void> {
-    this.budget.used = 0
-    const { file, isDir } = await this.resolveFile(physicalPath)
+    const budget = this.newBudget()
+    const { file, isDir } = await this.resolveFile(physicalPath, budget)
     await this.client.rename(String(file.id), isDir, newName)
+    // F-136：目录改名后旧路径不应再命中缓存
+    this.invalidatePathCache(physicalPath)
+    if (isDir) {
+      const segs = String(physicalPath || "").split("/").filter(Boolean)
+      segs.pop()
+      this.invalidatePathCache("/" + [...segs, newName].join("/"))
+    }
   }
 
   async remove(
@@ -333,9 +395,11 @@ export class Cloud189Driver implements StorageDriver {
     physicalPath: string,
     _names: string[],
   ): Promise<void> {
-    this.budget.used = 0
-    const { file, isDir } = await this.resolveFile(physicalPath)
+    const budget = this.newBudget()
+    const { file, isDir } = await this.resolveFile(physicalPath, budget)
     await this.client.remove(String(file.id), isDir, file.name)
+    // F-136：删除后连同子树一起失效，避免同名重建命中已删除的 ID
+    this.invalidatePathCache(physicalPath)
   }
 
   async move(
@@ -345,11 +409,15 @@ export class Cloud189Driver implements StorageDriver {
     srcPhysical: string,
     _dstPhysical: string,
   ): Promise<void> {
-    this.budget.used = 0
-    const { file, isDir } = await this.resolveFile(srcPhysical)
+    const budget = this.newBudget()
+    const { file, isDir } = await this.resolveFile(srcPhysical, budget)
     const dstParts = String(dstDir).split("/").filter(Boolean)
-    const targetParentId = await this.resolveFolderId("/" + dstParts.join("/"))
+    const targetParentId = await this.resolveFolderId(
+      "/" + dstParts.join("/"),
+      budget,
+    )
     await this.client.move(String(file.id), isDir, file.name, targetParentId)
+    this.invalidatePathCache(srcPhysical)
   }
 
   async copy(
@@ -359,11 +427,15 @@ export class Cloud189Driver implements StorageDriver {
     srcPhysical: string,
     _dstPhysical: string,
   ): Promise<void> {
-    this.budget.used = 0
-    const { file, isDir } = await this.resolveFile(srcPhysical)
+    const budget = this.newBudget()
+    const { file, isDir } = await this.resolveFile(srcPhysical, budget)
     const dstParts = String(dstDir).split("/").filter(Boolean)
-    const targetParentId = await this.resolveFolderId("/" + dstParts.join("/"))
+    const targetParentId = await this.resolveFolderId(
+      "/" + dstParts.join("/"),
+      budget,
+    )
     await this.client.copy(String(file.id), isDir, file.name, targetParentId)
+    this.invalidatePathCache(srcPhysical)
   }
 
   async put(
@@ -377,12 +449,21 @@ export class Cloud189Driver implements StorageDriver {
     const fileName = parts.pop()
     if (!fileName) throw new Error("[189Cloud] 上传路径无效")
     const parentPath = "/" + parts.join("/")
+    const fileMd5 = md5Hex(content)
+    // 缓冲里有完整内容 → 在建会话前就能算出真实的 sliceMd5（上游行为）
+    const slicePartMd5s: string[] = []
+    for (let off = 0; off < content.length; off += UPLOAD_CHUNK_SIZE) {
+      const end = Math.min(off + UPLOAD_CHUNK_SIZE, content.length)
+      slicePartMd5s.push(md5Hex(content.subarray(off, end)))
+    }
+    if (slicePartMd5s.length === 0) slicePartMd5s.push(fileMd5)
     const info = await this.createUploadSession(
       parentPath,
       parentPath,
       fileName,
       content.length,
-      md5Hex(content),
+      fileMd5,
+      computeSliceMd5(slicePartMd5s, fileMd5),
     )
     if (info.reuse) return
 
@@ -407,6 +488,7 @@ export class Cloud189Driver implements StorageDriver {
     fileName: string,
     size: number,
     md5: string,
+    sliceMd5?: string,
   ): Promise<{
     reuse: boolean
     requiresMd5?: boolean
@@ -429,24 +511,33 @@ export class Cloud189Driver implements StorageDriver {
         session: "",
       }
     }
+    // 调用方未提供真实 sliceMd5（分片流式上传在 init 阶段拿不到全量内容）时
+    // 退回 fileMd5；提交阶段仍会按实际分片重新计算正确值。
+    const normalizedSlice = String(sliceMd5 || "")
+      .trim()
+      .toLowerCase()
+    const effectiveSliceMd5 = /^[a-f0-9]{32}$/.test(normalizedSlice)
+      ? normalizedSlice
+      : normalizedMd5
 
-    this.budget.used = 0
+    const budget = this.newBudget()
     const partCount = Math.max(
       1,
       Math.ceil(Math.max(0, Number(size) || 0) / chunkSize),
     )
-    const parentFolderId = await this.resolveFolderId(physicalDir || "/")
+    const parentFolderId = await this.resolveFolderId(physicalDir || "/", budget)
     const upload = await this.client.createMultiUpload(
       parentFolderId,
       fileName,
       Math.max(0, Number(size) || 0),
       normalizedMd5,
+      effectiveSliceMd5,
     )
     if (upload.fileDataExists) {
       await this.client.commitMultiUpload(
         upload.uploadFileId,
         normalizedMd5,
-        normalizedMd5,
+        effectiveSliceMd5,
       )
       return { reuse: true, partCount: 0, chunkSize, session: "" }
     }
@@ -527,10 +618,8 @@ export class Cloud189Driver implements StorageDriver {
     if (normalizedParts.length !== session.partCount) {
       throw new Error("[189Cloud] 分片校验信息不完整，无法提交上传")
     }
-    const sliceMd5 =
-      session.partCount === 1
-        ? session.fileMd5
-        : md5Hex(normalizedParts.join("\n")).toUpperCase()
+    // 与上游一致：分片 MD5 转大写拼接后取 MD5，结果保持小写
+    const sliceMd5 = computeSliceMd5(normalizedParts, session.fileMd5)
     await this.client.commitMultiUpload(
       session.uploadFileId,
       session.fileMd5,

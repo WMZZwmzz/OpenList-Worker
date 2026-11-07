@@ -1,4 +1,12 @@
-import { createMD5, createSHA1, createSHA256, IHasher, md5 } from "hash-wasm"
+// 纯 JS 哈希实现（hashers.ts），不使用 hash-wasm。
+//
+// 为什么不能用 hash-wasm：它在运行时通过 WebAssembly.compile() 编译内置
+// WASM，而 Cloudflare Workers / Vercel Edge / EdgeOne 等边缘运行环境可能
+// 禁止 Wasm 代码生成（"Wasm code generation disallowed by embedder"），
+// 导致 seed 功能在这些受支持的目标上整体不可用。hashers.ts 提供同名、
+// 同接口的纯 JS 实现，本文件与 codec.ts 必须从它导入。
+import { createMD5, createSHA1, createSHA256, md5 } from "./hashers"
+import type { IHasher } from "./hashers"
 import { SeedHashes } from "./types"
 
 interface HashSet {
@@ -84,6 +92,9 @@ export async function hashReadableStream(
   torrentHasher?: TorrentPieceHasher,
 ): Promise<{ size: number; hashes: SeedHashes }> {
   if (!Number.isSafeInteger(expectedSize) || expectedSize < 0 || expectedSize > maxBytes) {
+    // F-102：这里还没 getReader()，但流同样会保持未消费状态（fetch 响应体/
+    // 连接不释放），主动 cancel 掉上游。
+    void cancelStream(stream)
     throw new Error(`File exceeds the hashing limit of ${maxBytes} bytes`)
   }
   const whole = await createHashSet()
@@ -119,6 +130,11 @@ export async function hashReadableStream(
         }
       }
     }
+  } catch (error) {
+    // F-102：出错时流通常只读了一部分（尺寸超限、读取异常），仅 releaseLock
+    // 不会终止上游（典型为 fetch 的响应体/下载连接），必须 cancel。
+    await cancelReader(reader)
+    throw error
   } finally {
     reader.releaseLock()
   }
@@ -130,6 +146,24 @@ export async function hashReadableStream(
     pieces.sha256.push(digest.sha256)
   }
   return { size, hashes: { ...digestSet(whole), pieces } }
+}
+
+async function cancelStream(stream: ReadableStream<Uint8Array>): Promise<void> {
+  try {
+    await stream.cancel()
+  } catch {
+    // 上游可能已关闭/已取消；取消失败不影响向调用方抛出的原始错误。
+  }
+}
+
+async function cancelReader(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+): Promise<void> {
+  try {
+    await reader.cancel()
+  } catch {
+    // 同上：cancel 只是尽力而为的资源回收。
+  }
 }
 
 export async function calculateCasSliceMd5(hashes: string[], fileMd5: string): Promise<string> {

@@ -27,9 +27,48 @@ function quarkFileToFileItem(f: QuarkFile): FileItem {
 export class QuarkDriver implements StorageDriver {
   private client: QuarkClient
   private pathFileIdCache = new Map<string, string>()
+  /** F-322：客户端刷新的 cookie，等待 op 层 flushPendingDriverState 持久化 */
+  private pendingCookie: string | null = null
 
   constructor(addition: QuarkAddition) {
-    this.client = new QuarkClient(addition)
+    // F-322：接上 onCookieUpdate，夸克轮换 __puus/__pus 后由
+    // consumePendingCookie() 交给 op 层写回存储配置。此前回调无人接线，
+    // 无状态运行时上新 isolate 只能拿到 DB 里的旧 cookie（全面 401）。
+    this.client = new QuarkClient(addition, (newCookie) => {
+      this.pendingCookie = newCookie
+      addition.cookie = newCookie
+    })
+  }
+
+  /** 由 op 层 flushPendingDriverState 调用；返回并清空待持久化的 cookie */
+  consumePendingCookie(): string | null {
+    const cookie = this.pendingCookie
+    this.pendingCookie = null
+    return cookie
+  }
+
+  /**
+   * F-321：rename/remove/move 成功后按路径前缀失效 pathFileIdCache。
+   * 驱动实例被 op 层跨请求缓存复用（storage.ts driverCache），缓存一旦陈旧，
+   * 旧路径会持续解析到已删除/已改名的 fid。
+   */
+  private invalidatePath(physicalPath: string): void {
+    const clean = String(physicalPath || "")
+      .split("/")
+      .filter(Boolean)
+      .join("/")
+    if (!clean) {
+      // 根路径操作影响整棵树
+      this.pathFileIdCache.clear()
+      return
+    }
+    const prefix = clean + "/"
+    for (const key of Array.from(this.pathFileIdCache.keys())) {
+      const norm = key.replace(/^\/+/, "")
+      if (norm === clean || norm.startsWith(prefix)) {
+        this.pathFileIdCache.delete(key)
+      }
+    }
   }
 
   async init(): Promise<void> {
@@ -117,6 +156,7 @@ export class QuarkDriver implements StorageDriver {
     const parentPath = "/" + parts.join("/")
     const parentId = await this.resolveFileId(parentPath)
     await this.client.mkdir(parentId, name)
+    this.invalidatePath(physicalPath)
   }
 
   async rename(
@@ -126,6 +166,7 @@ export class QuarkDriver implements StorageDriver {
   ): Promise<void> {
     const fileId = await this.resolveFileId(physicalPath)
     await this.client.rename(fileId, newName)
+    this.invalidatePath(physicalPath)
   }
 
   async remove(
@@ -135,30 +176,47 @@ export class QuarkDriver implements StorageDriver {
   ): Promise<void> {
     const fileId = await this.resolveFileId(physicalPath)
     await this.client.remove([fileId])
+    this.invalidatePath(physicalPath)
+  }
+
+  /**
+   * dstPhys 是目标项自身的物理路径（已含文件名），目标父目录取其 dirname。
+   * dstDir 是用户视角的虚拟路径（含挂载点 / base_path 前缀），不能直接当作
+   * 夸克盘内的相对路径逐段解析。
+   */
+  private parentPhysicalPath(physicalPath: string): string {
+    const segs = String(physicalPath || "")
+      .split("/")
+      .filter(Boolean)
+    segs.pop()
+    return "/" + segs.join("/")
   }
 
   async move(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
     const fileId = await this.resolveFileId(srcPhysical)
-    const dstId = await this.resolveFileId(dstDir)
+    const dstId = await this.resolveFileId(this.parentPhysicalPath(dstPhysical))
     await this.client.move([fileId], dstId)
+    this.invalidatePath(srcPhysical)
+    this.invalidatePath(dstPhysical)
   }
 
   async copy(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
     const fileId = await this.resolveFileId(srcPhysical)
-    const dstId = await this.resolveFileId(dstDir)
+    const dstId = await this.resolveFileId(this.parentPhysicalPath(dstPhysical))
     await this.client.copy([fileId], dstId)
+    this.invalidatePath(dstPhysical)
   }
 
   async put(

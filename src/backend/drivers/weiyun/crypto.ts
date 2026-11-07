@@ -1,5 +1,6 @@
 // Pure TypeScript cryptographic helpers for Tencent Weiyun
 // 100% compatible with Cloudflare Workers (V8 Isolates), EdgeOne, and Node.js.
+import { randomAlnum } from "../rand"
 
 export function getHash33(str: string): string {
   let hash = 0
@@ -10,7 +11,8 @@ export function getHash33(str: string): string {
 }
 
 export function randomT(): string {
-  return Math.random().toFixed(16)
+  // S-04 同类清单：签名随机量改用 CSPRNG（原 Math.random）。
+  return "0." + randomAlnum(16, "0123456789")
 }
 
 function rotl(n: number, s: number): number {

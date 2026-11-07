@@ -32,6 +32,11 @@ async function seedUser(env: any) {
           base_path: "/",
           disabled: false,
           otp_secret: secret,
+          // F-031：真实建号路径（setUserPassword / user.ts / sso.ts / 安装向导）
+          // 都会写 pwd_update_at。这里必须覆盖这种「stamp 非空」的真实形态：
+          // 旧 seed 没有该字段（"" === "" 碰巧相等），兑换出的无 pwd_ts 令牌
+          // 因此被误判为可用，掩盖了生产环境必然 401 的缺陷。
+          pwd_update_at: "2026-01-01T00:00:00.000Z",
         },
       ],
       storages: [],

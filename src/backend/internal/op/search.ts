@@ -1,8 +1,34 @@
 import { listItems } from "./storage"
+import { getDb } from "../model/db"
 import { FileItem } from "../driver/base"
 import { canAccess, getNearestMeta } from "../../pkg/meta"
 import type { Meta } from "../../pkg/meta"
 import type { UserPermissionObj } from "../../pkg/permission"
+
+/**
+ * 某个虚拟目录下由「其他存储挂载」产生的虚拟目录名（F-092）。
+ *
+ * 与 `listItems` 的挂载合并逻辑同源（storage.ts：mount_path 归一化后取
+ * 当前目录下的第一段，跳过自身与根）。返回空集表示该目录下没有挂载点。
+ */
+export function virtualMountNamesAt(db: any, dirPath: string): Set<string> {
+  const cleanListedPath =
+    "/" + String(dirPath || "").split("/").filter(Boolean).join("/")
+  const names = new Set<string>()
+  const storages = Array.isArray(db?.storages) ? db.storages : []
+  const prefix = cleanListedPath === "/" ? "/" : cleanListedPath + "/"
+
+  for (const s of storages) {
+    if (s?.disabled) continue
+    const mount = "/" + String(s?.mount_path || "").split("/").filter(Boolean).join("/")
+    // 与 storage.ts 一致：不把当前目录自身、根挂载当作子挂载
+    if (mount === cleanListedPath || mount === "/") continue
+    if (!mount.startsWith(prefix)) continue
+    const name = mount.slice(prefix.length).split("/").filter(Boolean)[0]
+    if (name) names.add(name)
+  }
+  return names
+}
 
 export interface SearchOptions {
   parent?: string
@@ -85,6 +111,22 @@ export async function search(
       }
     }
 
+    // 本目录下由存储挂载合并出的虚拟目录名（F-092）。
+    //
+    // 历史实现用 `isDir && !item.sign` 识别挂载点，但绝大多数驱动对真实目录
+    // 同样返回空 sign（local / google_drive / onedrive / webdav / aliyundrive_open…），
+    // 于是这些驱动下**所有真实文件夹**都被当作挂载点从结果里剔除：目录名永远
+    // 搜不到，scope=1（仅文件夹）恒为空。改为按 db.storages 计算当前目录下的
+    // 挂载点名集合，只排除这些确实由 storage.ts 合并出来的虚拟项。
+    let mountNames = new Set<string>()
+    if (items.length > 0) {
+      try {
+        mountNames = virtualMountNamesAt(await getDb(env), dirPath)
+      } catch {
+        mountNames = new Set<string>()
+      }
+    }
+
     for (const item of items) {
       if (matches.length >= maxResults) break
 
@@ -107,9 +149,9 @@ export async function search(
       if (opts.isVisible && !(await opts.isVisible(dirPath, item))) continue
 
       const nameMatch = !keyword || item.name.toLowerCase().includes(keyword)
-      // 挂载点虚拟文件夹（storage.ts 合并虚拟子挂载时 sign 为空），
+      // 挂载点虚拟文件夹（其他存储挂载到本目录下时由 listItems 合并出的项），
       // 本身不显示，但仍需递归进入搜索其内部文件
-      const isMountPoint = isDir && !item.sign
+      const isMountPoint = isDir && mountNames.has(item.name)
 
       let scopeMatch = true
       if (scope === 1 && !isDir) scopeMatch = false

@@ -6,6 +6,7 @@
  */
 
 import { z } from "zod"
+import { UserRole } from "./permission"
 
 // ============ 通用验证器 ============
 
@@ -80,22 +81,27 @@ export const loginRequestSchema = z.object({
 
 /**
  * 用户创建请求验证
+ *
+ * F-068: role 必须与运行时 UserRole 枚举（permission.ts:7-11）同源。
+ * 旧注释把 0/1/2/3 说成「超管/管理员/普通用户/访客」，与真实枚举
+ * （GENERAL=0、GUEST=1、ADMIN=2）正好错位：按旧语义传 role=2（"普通用户"）
+ * 落库后就是 ADMIN，传 0（"超管"）反而是 GENERAL。现在直接用 nativeEnum 约束。
  */
 export const createUserRequestSchema = z.object({
   username: usernameSchema,
   password: passwordSchema,
-  role: z.number().int().min(0).max(3).default(1), // 0=超级管理员, 1=管理员, 2=普通用户, 3=访客
+  role: z.nativeEnum(UserRole).default(UserRole.GENERAL), // 0=普通用户, 1=访客, 2=管理员
   permission: z.number().int().min(0).default(0),
   disabled: z.boolean().optional().default(false),
   base_path: pathSchema.optional(),
 })
 
 /**
- * 用户更新请求验证
+ * 用户更新请求验证（role 语义同 createUserRequestSchema，F-068）
  */
 export const updateUserRequestSchema = z.object({
   password: passwordSchema.optional(),
-  role: z.number().int().min(0).max(3).optional(),
+  role: z.nativeEnum(UserRole).optional(),
   permission: z.number().int().min(0).optional(),
   disabled: z.boolean().optional(),
   base_path: pathSchema.optional(),
@@ -124,7 +130,7 @@ export const settingsUpdateRequestSchema = z.object({
   site_title: z.string().max(100).optional(),
   logo_url: z.string().url().max(500).optional(),
   allow_signup: z.boolean().optional(),
-  default_role: z.number().int().min(0).max(3).optional(),
+  default_role: z.nativeEnum(UserRole).optional(), // 同 UserRole 枚举（F-068）
   session_timeout: z.number().int().min(300).max(86400).optional(), // 5 分钟 ~ 24 小时
 })
 

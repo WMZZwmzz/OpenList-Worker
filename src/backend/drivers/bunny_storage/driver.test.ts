@@ -72,3 +72,58 @@ test("BunnyStorageDriver instantiation", () => {
   })
   assert.ok(driver)
 })
+
+function stubFetch(probeResponse: () => Response) {
+  const calls: Array<{ method: string; url: string }> = []
+  const original = globalThis.fetch
+  globalThis.fetch = (async (input: any, init?: any) => {
+    const method = init?.method || "GET"
+    calls.push({ method, url: String(input) })
+    if (method === "DELETE") return new Response("", { status: 200 })
+    return probeResponse()
+  }) as any
+  return {
+    calls,
+    restore: () => {
+      globalThis.fetch = original
+    },
+  }
+}
+
+test("F-403: remove() deletes files without a trailing slash", async () => {
+  const driver = new BunnyStorageDriver({
+    storage_zone_name: "zone1",
+    access_key: "ak",
+    endpoint: "storage.bunnycdn.com",
+  })
+  const stub = stubFetch(() => new Response("not found", { status: 404 }))
+  try {
+    await driver.remove("/", "/a/b.txt", ["b.txt"])
+  } finally {
+    stub.restore()
+  }
+  const del = stub.calls.find((c) => c.method === "DELETE")
+  assert.ok(del)
+  assert.equal(del!.url, "https://storage.bunnycdn.com/zone1/a/b.txt")
+  assert.ok(!del!.url.endsWith("/"))
+})
+
+test("F-403: remove() keeps directory semantics (trailing slash) for directories", async () => {
+  const driver = new BunnyStorageDriver({
+    storage_zone_name: "zone1",
+    access_key: "ak",
+    endpoint: "storage.bunnycdn.com",
+  })
+  const stub = stubFetch(
+    () => new Response(JSON.stringify([]), { status: 200 }),
+  )
+  try {
+    await driver.remove("/", "/a/dir", ["dir"])
+  } finally {
+    stub.restore()
+  }
+  const del = stub.calls.find((c) => c.method === "DELETE")
+  assert.ok(del)
+  assert.equal(del!.url, "https://storage.bunnycdn.com/zone1/a/dir/")
+  assert.ok(del!.url.endsWith("/"))
+})

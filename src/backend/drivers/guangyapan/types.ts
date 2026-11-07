@@ -77,6 +77,9 @@ export interface GuangYaPanStateChanges {
   verify_code?: string
   verification_id?: string
   send_code?: boolean
+  /** 首次生成后需要持久化的设备身份（F-228） */
+  device_id?: string
+  device_sign?: string
 }
 
 /** POST /v1/auth/verification 的响应：下发短信并返回 verification_id */

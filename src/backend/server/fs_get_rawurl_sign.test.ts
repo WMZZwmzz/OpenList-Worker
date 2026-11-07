@@ -138,6 +138,76 @@ test("fs/get: 不需要签名时不追加 sign（保持公开直链语义）", a
   )
 })
 
+/**
+ * F-016 回归：/fs/get 分享分支的 raw_url 必须逐段百分号编码。
+ *
+ * 历史缺陷：subPath 是解码后的规范路径，直接拼进 `/api/sd/{shareId}{subPath}`，
+ * 文件名含 `?`/`#` 时被浏览器截断成 query/fragment，含裸 `%`（如 "100%.txt"）
+ * 时 raw.ts 的 decodeURIComponent 抛 URIError 返回 400。普通路径分支早就用
+ * encodeDownloadPath 逐段编码（/fs/link、op 层 getItem 的 rawUrl），分享分支漏掉。
+ */
+test("fs/get: 分享分支 raw_url 对特殊文件名逐段编码，且可直接下载（F-016）", async () => {
+  const env: any = {}
+  const root = makeLocalRoot()
+  fs.writeFileSync(path.join(root, "100%.txt"), "PCT")
+  fs.writeFileSync(path.join(root, "a#b.txt"), "HASH")
+  await saveDb(
+    {
+      ...dbWith(root),
+      shares: [
+        {
+          id: "f016share",
+          files: ["/local/100%.txt", "/local/a#b.txt"],
+          creator: "guest",
+          pwd: "",
+          disabled: false,
+        },
+      ],
+    },
+    env,
+  )
+
+  const app = new Hono()
+  app.route("/api/fs", fsRouter)
+  app.route("/api/sd", rawRouter)
+
+  const res = await app.request("/api/fs/get", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: "/@s/f016share/100%.txt" }),
+  })
+  const body: any = await res.json()
+  assert.equal(body.code, 200, `fs/get failed: ${JSON.stringify(body)}`)
+
+  const rawUrl: string = body.data.raw_url
+  // `%` 必须编码为 %25，否则浏览器/URL 解析直接损坏
+  // （subPath 是分享命名空间内的子路径，/sd 端会映射回真实存储路径）
+  assert.equal(rawUrl, "/api/sd/f016share/100%25.txt")
+  // URL 视图里路径段完整（pathname 保留已编码形态），没有被 ? / # 截断
+  assert.equal(
+    new URL(rawUrl, "http://localhost").pathname,
+    "/api/sd/f016share/100%25.txt",
+  )
+
+  // 端到端：修复前裸 % 会让 raw.ts 的 decodeURIComponent 抛 URIError → 400
+  const hit = await app.request(rawUrl, { method: "GET" })
+  assert.equal(hit.status, 200, `share download failed: ${hit.status}`)
+  assert.equal(await hit.text(), "PCT")
+
+  // `#` 同理：不编码会被当 fragment 截断
+  const res2 = await app.request("/api/fs/get", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: "/@s/f016share/a#b.txt" }),
+  })
+  const body2: any = await res2.json()
+  assert.equal(body2.code, 200, `fs/get failed: ${JSON.stringify(body2)}`)
+  assert.equal(body2.data.raw_url, "/api/sd/f016share/a%23b.txt")
+  const hit2 = await app.request(body2.data.raw_url, { method: "GET" })
+  assert.equal(hit2.status, 200, `share download failed: ${hit2.status}`)
+  assert.equal(await hit2.text(), "HASH")
+})
+
 test("/p 幂等：raw_url 中的签名被篡改即 401（对照，证明断言有效）", async () => {
   const env: any = {}
   const root = makeLocalRoot()

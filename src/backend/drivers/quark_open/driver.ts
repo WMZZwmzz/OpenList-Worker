@@ -103,7 +103,7 @@ export class DriverQuarkOpen implements StorageDriver {
     physicalPath: string,
     newName: string,
   ): Promise<void> {
-    const fid = await this.resolveDirId(physicalPath)
+    const fid = await this.resolveAnyId(physicalPath)
     await this.client.rename(fid, newName)
     this.pathCache.clear()
   }
@@ -113,22 +113,34 @@ export class DriverQuarkOpen implements StorageDriver {
     physicalPath: string,
     _names: string[],
   ): Promise<void> {
-    const fid = await this.resolveDirId(physicalPath)
+    const fid = await this.resolveAnyId(physicalPath)
     await this.client.remove(fid)
     this.pathCache.clear()
   }
 
   async move(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
-    const fid = await this.resolveDirId(srcPhysical)
-    const dstId = await this.resolveDirId(dstDir)
+    // F-397：源条目既可能是文件也可能是目录，必须按任意类型解析。
+    // 目标目录取 dstPhysical 的父级（dstDir 是含挂载前缀的虚拟路径，
+    // 不能直接当作账号内路径逐段解析）。
+    const fid = await this.resolveAnyId(srcPhysical)
+    const dstId = await this.resolveDirId(this.parentPhysicalPath(dstPhysical))
     await this.client.move(fid, dstId)
     this.pathCache.clear()
+  }
+
+  /** 目标项物理路径的父目录（物理路径不含挂载前缀） */
+  private parentPhysicalPath(physicalPath: string): string {
+    const segs = String(physicalPath || "")
+      .split("/")
+      .filter(Boolean)
+    segs.pop()
+    return "/" + segs.join("/")
   }
 
   async copy(): Promise<void> {
@@ -169,6 +181,40 @@ export class DriverQuarkOpen implements StorageDriver {
 
   async put(): Promise<void> {
     throw new Error("[QuarkOpen] upload not supported in stateless environment")
+  }
+
+  /**
+   * F-397：按「中间段必须是目录、末段可以是文件或目录」解析物理路径。
+   *
+   * rename/remove/move 传入的是条目**自身**路径，末段对文件来说是
+   * file_type "1"；此前复用只匹配目录的 resolveDirId，文件级操作全部抛
+   * "Directory not found"。
+   */
+  private async resolveAnyId(physicalPath: string): Promise<string> {
+    const clean = physicalPath.split("/").filter(Boolean).join("/")
+    if (!clean) return DEFAULT_ROOT
+    if (this.pathCache.has(clean)) return this.pathCache.get(clean)!
+
+    const parts = clean.split("/")
+    let currentId = DEFAULT_ROOT
+    for (let i = 0; i < parts.length; i++) {
+      const isLast = i === parts.length - 1
+      const files = await this.client.getFiles(currentId)
+      const target = files.find(
+        (f) => (isLast || f.file_type === "0") && f.filename === parts[i],
+      )
+      if (!target) {
+        throw new Error(
+          `[QuarkOpen] Path '${parts[i]}' not found in folder '${currentId}'`,
+        )
+      }
+      currentId = target.fid
+      if (!isLast) {
+        const subPath = "/" + parts.slice(0, i + 1).join("/")
+        this.pathCache.set(subPath, currentId)
+      }
+    }
+    return currentId
   }
 
   private async resolveDirId(physicalPath: string): Promise<string> {

@@ -26,7 +26,11 @@ export interface BaiduPhotoFile {
 
 export interface BaiduPhotoAlbum {
   album_id: string
-  tid: number
+  /**
+   * 相册 tid 是 18 位 int64（超出 Number.MAX_SAFE_INTEGER），
+   * 全链路必须以字符串承载，避免 JSON 解析/Number() 舍入（F-300）。
+   */
+  tid: string
   title: string
   join_time?: number
   create_time: number
@@ -35,7 +39,8 @@ export interface BaiduPhotoAlbum {
 
 export interface BaiduPhotoAlbumFile extends BaiduPhotoFile {
   album_id: string
-  tid: number
+  /** 同上：18 位 int64，必须用字符串承载（F-300）。 */
+  tid: string
   uk: number
 }
 

@@ -82,7 +82,8 @@ export interface BatchTaskInfo {
 }
 
 export interface CreateUploadFileResp {
-  uploadFileId?: number
+  /** int64 上传会话 ID：解析层已把超长整数保留为字符串，避免精度丢失 */
+  uploadFileId?: string | number
   fileUploadUrl?: string
   fileCommitUrl?: string
   fileDataExists?: number

@@ -20,6 +20,24 @@
 const JWT_SECRET_KV_KEY = "openlist_jwt_secret"
 const ADMIN_ROLE = 2
 
+/**
+ * 与后端主链路一致的持久化键（F-121）。
+ *
+ * - `openlist_revoked_tokens`：登出/OTP 兑换后写入的 jti 注销名单
+ *   （middlewares.ts 的 REVOKED_KV_KEY，格式 [{ jti, exp }]）。
+ * - `openlist_config`：DB_FORMAT=map 时整库 JSON 所在的键；用户表里的
+ *   `token_epoch` 是改密 / 关闭 2FA 后的令牌版本号（M-3）。
+ *
+ * 本文件是 /kv-* 数据面的唯一鉴权点。历史上它只校验签名/exp/角色，
+ * 于是管理员改密或登出后，被泄露的旧 token 打主站 API 会被 epoch/注销名单
+ * 拦住，直接打 /kv-get、/kv-put 却仍可通过（最长 7 天），可整库读写并窃取
+ * JWT_SECRET。边缘本来就有 KV 读能力，这两项完全可以复核。
+ */
+const REVOKED_KV_KEY = "openlist_revoked_tokens"
+const CONFIG_KV_KEY = "openlist_config"
+/** 整库快照的短 TTL 缓存：一条用户 token 的 /kv-* 请求通常不会连发多次 */
+const DB_SNAPSHOT_TTL_MS = 5000
+
 /* ─────────────────────────── KV 绑定解析 ─────────────────────────── */
 
 /**
@@ -53,9 +71,13 @@ function isKvLike(v) {
  * @returns {Promise<string|null>}
  */
 export async function getJwtSecret(env) {
-  // 1) 环境变量（长度需 >= 16，与 Node 侧一致）
+  // 1) 环境变量。F-123：只要求**非空**，与 Node 侧 driver/kv.ts 的 getProxySecret
+  //    保持一致（"长度 >= 16" 是运维建议，不是程序可以替用户决定的门槛）。
+  //    历史实现要求 >= 16：当 JWT_SECRET 为 1-15 字符时，Node 侧判定「配置合法 →
+  //    选中代理驱动」，边缘侧却取不到密钥 → 所有 /kv-* 永久 401 "invalid internal
+  //    call"，且报错完全不提长度问题。同一变量在两处有两种阈值是纯粹的缺陷。
   const envSecret = env?.JWT_SECRET || globalThis?.JWT_SECRET
-  if (typeof envSecret === "string" && envSecret.length >= 16) {
+  if (typeof envSecret === "string" && envSecret.trim().length > 0) {
     return envSecret
   }
 
@@ -64,7 +86,7 @@ export async function getJwtSecret(env) {
     const kv = resolveKv(env)
     if (kv) {
       const val = await kv.get(JWT_SECRET_KV_KEY, { type: "text" })
-      if (typeof val === "string" && val.length >= 16) {
+      if (typeof val === "string" && val.trim().length > 0) {
         return val
       }
     }
@@ -73,6 +95,119 @@ export async function getJwtSecret(env) {
   }
 
   return null
+}
+
+/* ─────────────────────────── 吊销校验（F-121） ─────────────────────────── */
+
+/**
+ * 读取一个 KV 文本值（兼容两种 get 签名），失败返回 null。
+ * 鉴权路径上的辅助读取：任何异常都按「读不到」处理，不阻断。
+ */
+async function readKvText(env, key) {
+  const kv = resolveKv(env)
+  if (!kv) return null
+  try {
+    const val = await kv.get(key, { type: "text" })
+    if (val === null || val === undefined) return null
+    if (typeof val === "string") return val
+    if (typeof val?.text === "function") return await val.text()
+    return String(val)
+  } catch {
+    try {
+      const val = await kv.get(key)
+      if (val === null || val === undefined) return null
+      if (typeof val === "string") return val
+      if (typeof val?.text === "function") return await val.text()
+      return String(val)
+    } catch {
+      return null
+    }
+  }
+}
+
+/** 整库快照缓存（仅用于 epoch 复核，5s TTL）。 */
+let dbSnapshotCache = { ts: 0, db: null }
+
+/**
+ * 读取持久化库快照（DB_FORMAT=map 时整库在 `openlist_config`）。
+ *
+ * 取不到（键不存在 / 驱动不是 KV / 解析失败）返回 null —— 此时无法复核 epoch，
+ * 保持与修复前一致的行为（放行），绝不因为边缘读不到库而拒绝全部请求。
+ */
+async function readDbSnapshot(env) {
+  const now = Date.now()
+  if (dbSnapshotCache.db && now - dbSnapshotCache.ts < DB_SNAPSHOT_TTL_MS) {
+    return dbSnapshotCache.db
+  }
+  const raw = await readKvText(env, CONFIG_KV_KEY)
+  if (!raw) return null
+  try {
+    const parsed = JSON.parse(raw)
+    if (parsed && typeof parsed === "object" && Array.isArray(parsed.users)) {
+      dbSnapshotCache = { ts: now, db: parsed }
+      return parsed
+    }
+  } catch {
+    // 不是整库 JSON（key 格式的标记键等）：无法复核
+  }
+  return null
+}
+
+/**
+ * 令牌是否仍然有效：jti 注销名单 + token epoch（改密 / 关 2FA 后失效）。
+ *
+ * 与后端主链路对齐：
+ *   - middlewares.ts 的 REVOKED_KV_KEY（登出时写入 [{ jti, exp }]）；
+ *   - pkg/permission.ts 的 `payloadEpoch !== userEpoch → 拒绝`。
+ *
+ * 边缘拿不到用户表时（D1/MySQL/DO 部署），epoch 复核自动跳过（fail-open），
+ * 这与修复前的行为一致、不会误伤；KV 部署下则能真正拦住改密后的旧 token。
+ */
+async function isTokenStillValid(env, payload) {
+  const now = Math.floor(Date.now() / 1000)
+
+  // 1) jti 注销名单
+  if (payload.jti) {
+    const raw = await readKvText(env, REVOKED_KV_KEY)
+    if (raw) {
+      try {
+        const list = JSON.parse(raw)
+        if (
+          Array.isArray(list) &&
+          list.some(
+            (item) =>
+              item &&
+              item.jti === payload.jti &&
+              Number(item.exp) > now, // 过期条目自然失效
+          )
+        ) {
+          return { ok: false, reason: "token has been revoked" }
+        }
+      } catch {
+        // 名单损坏：不阻断（与主链路 ensureRevokedLoaded 的降级一致）
+      }
+    }
+  }
+
+  // 2) token epoch（历史 token 没有该 claim，跳过）
+  if (payload.epoch !== undefined) {
+    const db = await readDbSnapshot(env)
+    if (db) {
+      const users = Array.isArray(db.users) ? db.users : []
+      const user =
+        users.find(
+          (u) => u && payload.id !== undefined && String(u.id) === String(payload.id),
+        ) || users.find((u) => u && u.username === payload.username)
+      if (user) {
+        const userEpoch = Number(user.token_epoch ?? 0) || 0
+        if (Number(payload.epoch) !== userEpoch) {
+          return { ok: false, reason: "token epoch mismatch" }
+        }
+      }
+    }
+  }
+
+  return { ok: true }
 }
 
 /* ─────────────────────────── 鉴权 ─────────────────────────── */
@@ -242,6 +377,13 @@ export async function authorize(request, env) {
     // 管理员角色校验：KV 为数据面，仅管理员可读写
     if (Number(payload.role) !== ADMIN_ROLE) {
       return { ok: false, mode: "user", reason: "admin role required" }
+    }
+
+    // F-121：吊销旁路封堵 —— 与主链路一致地校验 jti 注销名单与 token epoch。
+    // 边缘取不到用户表时（D1/MySQL/DO 部署）epoch 复核会跳过，见 isTokenStillValid。
+    const stillValid = await isTokenStillValid(env, payload)
+    if (!stillValid.ok) {
+      return { ok: false, mode: "user", reason: stillValid.reason || "token revoked" }
     }
 
     return { ok: true, mode: "user" }

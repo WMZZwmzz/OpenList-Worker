@@ -1,5 +1,6 @@
 // 网易云音乐 API 加密（weapi / linuxapi）
 // 参考 Go drivers/netease_music/crypto.go
+import { randomAlnum } from "../rand"
 
 const PRESET_KEY = "0CoJUm6Qyw8W8jud"
 const LINUXAPI_KEY = "rFgB&h#%2?^eDg:Q"
@@ -56,6 +57,18 @@ async function aesCbcEncrypt(
       Buffer.concat([cipher.update(Buffer.from(src)), cipher.final()]),
     )
   }
+  return aesCbcEncryptWebCrypto(src, key, iv)
+}
+
+/**
+ * WebCrypto AES-CBC 分支。WebCrypto 自身恒做一次 PKCS7 padding，
+ * 因此绝不能预先 pkcs7Pad（否则会多出一个填充块，服务端只剥一次）。
+ */
+async function aesCbcEncryptWebCrypto(
+  src: Uint8Array,
+  key: Uint8Array,
+  iv: Uint8Array,
+): Promise<Uint8Array> {
   const keyMat = await crypto.subtle.importKey(
     "raw",
     key as any,
@@ -63,11 +76,10 @@ async function aesCbcEncrypt(
     false,
     ["encrypt"],
   )
-  const padded = pkcs7Pad(src)
   const cipherBuf = await crypto.subtle.encrypt(
     { name: "AES-CBC", iv: iv as any },
     keyMat,
-    padded as any,
+    src as any,
   )
   return new Uint8Array(cipherBuf)
 }
@@ -78,13 +90,27 @@ async function aesEcbEncrypt(
   key: Uint8Array,
 ): Promise<Uint8Array> {
   if (isNode) {
-    const { createCipheriv } = await import("node:crypto")
-    const cipher = createCipheriv("aes-128-ecb", Buffer.from(key), null)
-    return new Uint8Array(
-      Buffer.concat([cipher.update(Buffer.from(src)), cipher.final()]),
-    )
+    try {
+      const { createCipheriv } = await import("node:crypto")
+      const cipher = createCipheriv("aes-128-ecb", Buffer.from(key), null)
+      return new Uint8Array(
+        Buffer.concat([cipher.update(Buffer.from(src)), cipher.final()]),
+      )
+    } catch {
+      // workerd/edge 的 node:crypto 兼容层不支持 null-IV ECB，退化到 WebCrypto
+    }
   }
-  // Workers: Web Crypto 无 ECB，逐 block 用 AES-CBC + zero IV 模拟
+  return aesEcbEncryptWebCrypto(src, key)
+}
+
+/**
+ * Web Crypto 无 ECB：逐 16 字节块用 AES-CBC + zero IV 模拟。
+ * 注意 CBC 会给 16 字节输入补出第二个块，必须只取前 16 字节。
+ */
+async function aesEcbEncryptWebCrypto(
+  src: Uint8Array,
+  key: Uint8Array,
+): Promise<Uint8Array> {
   const keyMat = await crypto.subtle.importKey(
     "raw",
     key as any,
@@ -102,7 +128,9 @@ async function aesEcbEncrypt(
       keyMat,
       block as any,
     )
-    out.set(new Uint8Array(enc), i)
+    // WebCrypto CBC always appends a full padding block for a 16-byte input:
+    // keeping the first 16 bytes yields the raw ECB ciphertext of the block.
+    out.set(new Uint8Array(enc).subarray(0, 16), i)
   }
   return out
 }
@@ -150,11 +178,14 @@ export function rsaRawEncrypt(secretKey: Uint8Array): Uint8Array {
 }
 
 function getSecretKey(): { key: Uint8Array; reversed: Uint8Array } {
+  // weapi 的 secretKey 参与 AES-CBC 对称加密，必须用 CSPRNG：
+  // Math.random（xorshift128+）可被预测，多请求共享 isolate 时还可能碰撞
+  // （2026-10-31 深度安全审查报告 S-04）。
+  const s = randomAlnum(16, STD_CHARS)
   const key = new Uint8Array(16)
   const reversed = new Uint8Array(16)
   for (let i = 0; i < 16; i++) {
-    const idx = Math.floor(Math.random() * STD_CHARS.length)
-    const code = STD_CHARS.charCodeAt(idx)
+    const code = s.charCodeAt(i)
     key[i] = code
     reversed[15 - i] = code
   }
@@ -167,13 +198,22 @@ export async function weapi(
 ): Promise<Record<string, string>> {
   const text = textEncoder(JSON.stringify(data))
   const { key: secretKey, reversed } = getSecretKey()
+  // 测试钩子：记录最近一次使用的 reversed 密钥（CSPRNG 后密钥不可预测，
+  // 测试用它解密验证双层 AES 链）。
+  __lastWeapiReversedKey = reversed
 
   const first = await aesCbcEncrypt(
     text,
     textEncoder(PRESET_KEY),
     textEncoder(IV),
   )
-  const second = await aesCbcEncrypt(first, reversed, textEncoder(IV))
+  // 协议要求第二层 AES 的明文是第一层密文的 base64 ASCII 字符串：
+  // 服务端解密链为 base64-decode(params) -> AES -> base64-decode -> AES。
+  const second = await aesCbcEncrypt(
+    textEncoder(bytesToBase64(first)),
+    reversed,
+    textEncoder(IV),
+  )
 
   return {
     params: bytesToBase64(second),
@@ -191,9 +231,15 @@ export async function linuxapi(
 }
 
 // 导出供测试使用
+let __lastWeapiReversedKey: Uint8Array | null = null
 export const __internal = {
   aesCbcEncrypt,
+  aesCbcEncryptWebCrypto,
   aesEcbEncrypt,
+  aesEcbEncryptWebCrypto,
   rsaRawEncrypt,
   N_HEX,
+  get lastWeapiReversedKey() {
+    return __lastWeapiReversedKey
+  },
 }

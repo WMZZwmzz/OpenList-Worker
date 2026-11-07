@@ -17,6 +17,7 @@ import {
   getSignExpiresIn,
 } from "../pkg/sign"
 import { safeErrorMessage } from "../pkg/errs"
+import { clientIpFromContext } from "../pkg/client-ip"
 import { secureLog, secureWarn, secureError } from "../pkg/secure-log"
 import { encodeDownloadPath } from "../pkg/path"
 import { assertLocalPathInsideRoot } from "../pkg/local-fs-guard"
@@ -70,16 +71,21 @@ async function initNodeModules() {
 export const rawRouter = new Hono()
 
 const getStorageRequestContext = (c: any) => {
+  // F-405：clientIp 一并进 op 层（CDN 防盗链签名驱动按请求 IP 计算 token）。
+  const clientIp = clientIpFromContext(c)
   try {
     const executionCtx = c.executionCtx
     if (!executionCtx || typeof executionCtx.waitUntil !== "function") {
-      return undefined
+      // 无 executionCtx 时仍返回仅带 clientIp 的上下文（link 缓存与
+      // 驱动签名仍需要它）。
+      return { clientIp }
     }
     return {
       waitUntil: (promise: Promise<unknown>) => executionCtx.waitUntil(promise),
+      clientIp,
     }
   } catch {
-    return undefined
+    return { clientIp }
   }
 }
 
@@ -118,6 +124,11 @@ export async function safeProxyFetch(
 
     const location = res.headers.get("location")
     if (res.status >= 300 && res.status < 400 && location) {
+      // F-042：中间跳转的响应体不会有人消费。不取消会让上游连接/流滞留到 GC
+      // （Node/undici 下占住 socket，阻止 keep-alive 复用）。
+      try {
+        await res.body?.cancel()
+      } catch {}
       current = new URL(location, current).toString()
       const next: Record<string, string> = {}
       for (const [k, v] of Object.entries(currentHeaders)) {
@@ -247,6 +258,12 @@ async function proxyUpstream(
     secureWarn(
       `[rawRouter] Upstream ignored/refused Range (status=${upstreamRes.status}) for '${logPath(reqPath)}', retrying without Range header...`,
     )
+    // F-042：旧响应即将被覆盖，先把它的 body 取消。否则「上游忽略 Range 回
+    // 200」时那份完整文件流会一直挂到 GC（Node/undici 下占住 socket）。
+    // 与下方二次载荷校验分支的 `upstreamRes.body?.cancel()` 同一契约。
+    try {
+      await upstreamRes.body?.cancel()
+    } catch {}
     delete headers["Range"]
     upstreamRes = await safeProxyFetch(fileItem.raw_url, headers, trustedHosts)
   }
@@ -569,14 +586,21 @@ rawRouter.get("/*", async (c) => {
           let driver: any = null
           if (!fileItem) {
             driver = await getDriver(resolved.storage.driver, resolved.storage)
+            const s3ctx = getStorageRequestContext(c)
             try {
-              fileItem = await driver.get(reqPath, resolved.physical)
+              // F-405：bunny 等 CDN 防盗链驱动按请求 IP 计算 token（unknown
+              // 时退回无 IP 签名，与 op 层 getItemResolved 同一策略）。
+              const clientIp = s3ctx?.clientIp
+              fileItem =
+                clientIp && clientIp !== "unknown"
+                  ? await driver.get(reqPath, resolved.physical, clientIp)
+                  : await driver.get(reqPath, resolved.physical)
             } finally {
               await flushPendingDriverState(
                 resolved.storage.driver,
                 resolved.storage,
                 driver,
-                getStorageRequestContext(c),
+                s3ctx,
               )
             }
             await setCachedLink(cacheTarget, fileItem, c.env)

@@ -48,8 +48,14 @@ export interface TeraboxPrecreateResp {
   path: string
   uploadid: string
   return_type: number
-  block_list: number[]
+  block_list: string[]
   errno: number
+}
+
+export interface TeraboxSuperfileResp {
+  errno?: number
+  md5?: string
+  request_id?: string
 }
 
 export interface TeraboxCheckLoginResp {

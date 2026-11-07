@@ -63,7 +63,7 @@ test("Observability: /api/healthz returns 503 on serverless without storage", as
   // Serverless / Worker runtimes (multi-instance, short-lived) must never
   // silently fall back to memory: writes would vanish while the UI reports
   // success. Such a deployment is unhealthy until storage is configured.
-  const env: any = { __requestOrigin: "https://example.edgeone.cool" }
+  const env: any = { __requestContext: { platform: "edgeone" }, __requestOrigin: "https://example.edgeone.cool" }
   const res = await buildApp().request("/api/healthz", { method: "GET" }, env)
   assert.equal(
     res.status,
@@ -93,7 +93,7 @@ test("Observability: /api/health is left untouched as a liveness-only marker", a
 test("Env check: reports config, storage, jwt and blocks unready envs", async () => {
   // 1) Serverless without storage and without JWT_SECRET must be reported as
   //    not ready, with actionable issues carrying doc links.
-  const bad: any = { __requestOrigin: "https://example.edgeone.cool" }
+  const bad: any = { __requestContext: { platform: "edgeone" }, __requestOrigin: "https://example.edgeone.cool" }
   const resBad = await buildApp().request(
     "/api/public/env_check",
     { method: "GET" },
@@ -150,7 +150,7 @@ test("Env check: serverless with JWT_SECRET but no storage is still not ready", 
   // Guards the dangerous case: key is fine but writes would vanish.
   const env: any = {
     JWT_SECRET: "0123456789abcdef0123456789abcdef",
-    __requestOrigin: "https://example.edgeone.cool",
+    __requestContext: { platform: "edgeone" }, __requestOrigin: "https://example.edgeone.cool",
   }
   const res = await buildApp().request(
     "/api/public/env_check",

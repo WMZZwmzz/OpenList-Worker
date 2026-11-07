@@ -6,6 +6,14 @@ import {
 import { DriverIpfsAddition } from "./types"
 import { ClientIpfs } from "./util"
 
+/** 物理路径的父目录（根为 "/"），F-467 */
+export function parentPath(physicalPath: string): string {
+  const parts = String(physicalPath || "")
+    .split("/")
+    .filter(Boolean)
+  return parts.length > 1 ? "/" + parts.slice(0, -1).join("/") : "/"
+}
+
 export class DriverIpfs implements StorageDriver {
   private client: ClientIpfs
   private addition: DriverIpfsAddition
@@ -32,9 +40,10 @@ export class DriverIpfs implements StorageDriver {
 
   async list(_virtualPath: string, physicalPath: string): Promise<FileItem[]> {
     const rawPath = this.fullPath(physicalPath)
+    // F-469：resolveIpfsPath 在 ipfs/ipns 模式下可能返回 /ipfs/... 或 /ipns/...，
+    // ls() 两种前缀都接受，不能再只剥 /ipfs/ 再把裸串拼回 /ipfs/。
     const ipfsPath = await this.client.resolveIpfsPath(rawPath)
-    const cid = ipfsPath.replace(/^\/ipfs\//, "")
-    const resp = await this.client.ls(cid)
+    const resp = await this.client.ls(ipfsPath)
     const links = resp.Objects?.[0]?.Links || []
     return links.map((l) => ({
       name: l.Name,
@@ -51,6 +60,9 @@ export class DriverIpfs implements StorageDriver {
     const rawPath = this.fullPath(physicalPath)
     const parts = rawPath.split("/").filter(Boolean)
     const name = parts[parts.length - 1] || "root"
+    // 注意：list() 内部会再次应用 fullPath，因此这里必须传「物理路径」而不是 rawPath。
+    const segs = String(physicalPath || "").split("/").filter(Boolean)
+    const parentPhysicalPath = "/" + segs.slice(0, -1).join("/")
 
     if (this.isMfs()) {
       try {
@@ -70,22 +82,22 @@ export class DriverIpfs implements StorageDriver {
       } catch {}
     }
 
-    // ipfs/ipns 模式：通过父目录 list 找到
-    const parentPath = "/" + parts.slice(0, -1).join("/")
-    try {
-      const files = await this.list(_virtualPath, parentPath)
-      const entry = files.find((f) => f.name === name)
-      if (entry) {
-        if (!entry.is_dir) {
-          entry.raw_url = this.client.downloadUrl(entry.sign, name)
-        }
-        return entry
+    // ipfs/ipns 模式：通过父目录 list 找到。父目录列表失败（节点不可达/
+    // CID 无法解析）必须向上抛，不能降级成伪造条目。
+    const files = await this.list(_virtualPath, parentPhysicalPath)
+    const entry = files.find((f) => f.name === name)
+    if (entry) {
+      if (!entry.is_dir) {
+        entry.raw_url = this.client.downloadUrl(entry.sign, name)
       }
-    } catch {}
+      return entry
+    }
 
-    // Fallback: 目录
+    // F-469：未命中时做真实探活（列目标自身），只有列成功才确认是目录。
+    // 之前用 resolveIpfsPath 作判据，而它在 ipfs/ipns 模式下只是字符串拼接、
+    // 永不失败，任何不存在的路径都会被当成目录。
     try {
-      await this.client.resolveIpfsPath(rawPath)
+      await this.list(_virtualPath, physicalPath)
       return {
         name,
         size: 0,
@@ -96,15 +108,7 @@ export class DriverIpfs implements StorageDriver {
         raw_url: "",
       }
     } catch {
-      return {
-        name,
-        size: 0,
-        is_dir: false,
-        modified: new Date().toISOString(),
-        sign: "",
-        type: 0,
-        raw_url: "",
-      }
+      throw new Error(`[IPFS] '${rawPath}' not found`)
     }
   }
 
@@ -121,7 +125,9 @@ export class DriverIpfs implements StorageDriver {
     if (!this.isMfs()) throw new Error("[IPFS] only write in mfs mode")
     const full = this.fullPath(physicalPath)
     const parts = full.split("/").filter(Boolean)
-    const dst = "/" + parts.slice(0, -1).join("/") + "/" + newName
+    const parent = parts.slice(0, -1).join("/")
+    // F-473：顶层项（parent 为空）不能拼出 "//新名"，与 kodbox 的防护一致。
+    const dst = parent ? `/${parent}/${newName}` : `/${newName}`
     await this.client.filesMv(full, dst)
   }
 
@@ -136,29 +142,32 @@ export class DriverIpfs implements StorageDriver {
 
   async move(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
     if (!this.isMfs()) throw new Error("[IPFS] only write in mfs mode")
+    // F-467：MFS files/mv 的目标是「父目录」，必须由物理路径派生
+    // （虚拟 dstDir 会被 fullPath 再拼一层 root_path，指向不存在的目录）。
     const src = this.fullPath(srcPhysical)
-    const dst = this.fullPath(dstDir)
+    const dst = this.fullPath(parentPath(dstPhysical))
     await this.client.filesMv(src, dst)
   }
 
   async copy(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
     if (!this.isMfs()) throw new Error("[IPFS] only write in mfs mode")
+    // F-467：同 move，目标父目录取物理路径。
     const srcFull = this.fullPath(srcPhysical)
     const stat = await this.client.filesStat(srcFull)
     const srcIpfs = `/ipfs/${stat.Hash}`
-    const dst = this.fullPath(dstDir)
+    const dst = this.fullPath(parentPath(dstPhysical))
     await this.client.filesCp(srcIpfs, dst)
   }
 

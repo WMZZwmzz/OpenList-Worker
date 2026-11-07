@@ -2,6 +2,8 @@ export interface ThunderAddition {
   root_folder_id?: string
   username?: string
   password?: string
+  /** onPersistToken 持久化的刷新令牌（F-280：冷启动优先复用） */
+  refresh_token?: string
   captcha_token?: string
   credit_key?: string
   device_id?: string

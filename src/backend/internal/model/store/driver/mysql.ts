@@ -32,26 +32,61 @@ function getMysqlConfig(env: any): any | null {
 
 let _pool: any = null
 let _poolKey: string | null = null
+/** 并发首调共享的同一次建池（F-086：避免两个请求各建一个池、弃其一泄漏）。 */
+let _poolPending: Promise<any> | null = null
+let _poolPendingKey: string | null = null
 
 async function getPool(env: any): Promise<any | null> {
   const config = getMysqlConfig(env)
   if (!config) return null
   const key = JSON.stringify(config)
   if (_pool && _poolKey === key) return _pool
-  
-  // 动态 import，避免打包到 Workers
-  const specifier = "mysql2/promise"
-  const { createPool } = await import(specifier)
-  _pool = createPool(config)
-  _poolKey = key
-  return _pool
+  if (_poolPending && _poolPendingKey === key) return _poolPending
+
+  const pending = (async () => {
+    // 动态 import，避免打包到 Workers
+    const specifier = "mysql2/promise"
+    const { createPool } = await import(specifier)
+    const pool = createPool(config)
+    const previous = _pool
+    _pool = pool
+    _poolKey = key
+    // F-086：被替换的旧池必须显式关闭，否则 mysql2 默认 connectionLimit=10 的
+    // 空闲连接会随池对象一直存活到进程结束。旧池上的在途查询由它自己收尾，
+    // end() 只会阻止新连接并关闭空闲连接。
+    if (previous && typeof previous.end === "function") {
+      Promise.resolve()
+        .then(() => previous.end())
+        .catch(() => {})
+    }
+    return pool
+  })()
+
+  _poolPending = pending
+  _poolPendingKey = key
+  try {
+    return await pending
+  } finally {
+    if (_poolPending === pending) {
+      _poolPending = null
+      _poolPendingKey = null
+    }
+  }
 }
 
-let _schemaInitedPrefix: string | null = null
+/**
+ * schema 初始化标记：以**池对象**为键（F-086）。
+ *
+ * 历史实现只按表前缀去重（`_schemaInitedPrefix`），而连接池按完整配置键控：
+ * 同进程内换一套 MySQL 配置（另一个库）会拿到新池、却因为前缀没变而跳过建表，
+ * 之后所有查询都报 table doesn't exist。与 d1.ts 用 WeakMap 以绑定对象为键
+ * 的做法对齐：一个池 = 一次 DDL 执行。
+ */
+const schemaInitedByPool = new WeakMap<object, string>()
 
 async function ensureSchema(pool: any, env?: any): Promise<void> {
   const prefix = getTablePrefix(env)
-  if (_schemaInitedPrefix === prefix) return
+  if (schemaInitedByPool.get(pool) === prefix) return
   // KV 表（map/key 格式）+ 列式表（sql 格式）+ singleflight 协调表一并创建
   for (const ddl of [
     ...KV_SCHEMA_MYSQL,
@@ -60,7 +95,7 @@ async function ensureSchema(pool: any, env?: any): Promise<void> {
   ]) {
     await pool.query(ddl)
   }
-  _schemaInitedPrefix = prefix
+  schemaInitedByPool.set(pool, prefix)
 }
 
 export const mysqlDriver: Driver = {

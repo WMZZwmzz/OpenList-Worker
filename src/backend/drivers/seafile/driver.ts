@@ -12,6 +12,8 @@ export class SeafileDriver implements StorageDriver {
   private client: SeafileApiClient
   private repoId?: string
   private rootPath: string = "/"
+  /** F-358：repo_id 形态下是否已确认过库的加密状态 */
+  private repoChecked = false
 
   constructor(
     addition: SeafileAddition,
@@ -37,6 +39,29 @@ export class SeafileDriver implements StorageDriver {
     return s === "/" ? "/" : s
   }
 
+  /**
+   * 确保配置了 repo_id 的加密资料库已完成解密（F-358）。
+   *
+   * 只在每个驱动实例内探测一次库信息；解密结果由 SeafileApiClient 再做
+   * 30 分钟缓存。库信息探测失败时不阻塞操作（保持原有失败行为），
+   * 但一旦确认库是加密的就必须解密成功，否则后续请求必然 440。
+   */
+  private async ensureRepoDecrypted(repoId: string): Promise<void> {
+    if (this.repoChecked) return
+    let repo: SeafileLibraryItem
+    try {
+      repo = await this.client.getLibraryInfo(repoId)
+    } catch (e: any) {
+      // 探测失败（网络/权限）不应把原本可用的操作变成失败
+      console.warn(`[Seafile] failed to inspect library ${repoId}:`, e?.message)
+      return
+    }
+    if (repo?.encrypted) {
+      await this.client.decryptLibrary(repo)
+    }
+    this.repoChecked = true
+  }
+
   private async resolveRepoAndPath(physicalPath: string): Promise<{
     repoId: string
     innerPath: string
@@ -45,6 +70,9 @@ export class SeafileDriver implements StorageDriver {
     const clean = this.cleanPath(physicalPath)
 
     if (this.repoId) {
+      // F-358：repo_id 是最常用的配置形态，加密资料库同样必须先解密，
+      // 否则 Seafile 对未解锁库的 dir/file 接口直接返回 440。
+      await this.ensureRepoDecrypted(this.repoId)
       return {
         repoId: this.repoId,
         innerPath: clean,
@@ -189,41 +217,56 @@ export class SeafileDriver implements StorageDriver {
     const parentDir = innerPath.split("/").slice(0, -1).join("/") || "/"
     const fileName = innerPath.split("/").pop() || ""
 
+    // F-359：父目录列表是判断「存在/类型」的唯一可靠来源。
+    // 只有列表成功且命中时才构造条目；列表成功但没命中 → 真实 404。
+    let siblings: SeafileRepoItem[] | null = null
+    let listingError: unknown = null
     try {
-      const siblings = await this.client.request<SeafileRepoItem[]>(
+      siblings = await this.client.request<SeafileRepoItem[]>(
         `/api2/repos/${encodeURIComponent(repoId)}/dir/`,
         {
           params: { p: parentDir },
         },
       )
-      const found = siblings.find((s) => s.name === fileName)
-      if (found) {
-        const isDir = found.type === "dir"
-        return {
-          name: found.name,
-          size: found.size || 0,
-          is_dir: isDir,
-          modified: found.mtime
-            ? new Date(found.mtime * 1000).toISOString()
-            : new Date().toISOString(),
-          sign: found.id,
-          type: calcFileType(found.name, isDir),
-          raw_url: downloadUrl,
-        }
-      }
-    } catch {
-      // Fallback below
+    } catch (e) {
+      listingError = e
     }
 
-    return {
-      name,
-      size: 0,
-      is_dir: !downloadUrl,
-      modified: new Date().toISOString(),
-      sign: "",
-      type: calcFileType(name, !downloadUrl),
-      raw_url: downloadUrl,
+    if (siblings) {
+      const found = siblings.find((s) => s.name === fileName)
+      if (!found) {
+        throw new Error(`[Seafile] object not found: ${innerPath}`)
+      }
+      const isDir = found.type === "dir"
+      return {
+        name: found.name,
+        size: found.size || 0,
+        is_dir: isDir,
+        modified: found.mtime
+          ? new Date(found.mtime * 1000).toISOString()
+          : new Date().toISOString(),
+        sign: found.id,
+        type: calcFileType(found.name, isDir),
+        raw_url: isDir ? "" : downloadUrl,
+      }
     }
+
+    // 列表不可用：直链成功即证明这是一个文件，其余情况一律按上游错误抛出，
+    // 不再用 `is_dir: !downloadUrl` 把任意失败伪造成目录。
+    if (downloadUrl) {
+      return {
+        name,
+        size: 0,
+        is_dir: false,
+        modified: new Date().toISOString(),
+        sign: "",
+        type: calcFileType(name, false),
+        raw_url: downloadUrl,
+      }
+    }
+    throw listingError instanceof Error
+      ? listingError
+      : new Error(`[Seafile] object not found: ${innerPath}`)
   }
 
   async mkdir(virtualPath: string, physicalPath: string): Promise<void> {

@@ -22,24 +22,18 @@ export const TaskStatusFailed = 5
 export const DefaultChunkSize = 10 * 1024 * 1024 // 10MB
 export const DefaultUploadThreads = 3
 
-export function createDefaultDeviceInfo(): string {
-  const randomId = () =>
-    Array.from({ length: 16 }, () =>
-      Math.floor(Math.random() * 16).toString(16),
-    ).join("")
+import { randomHex } from "../rand"
 
+export function createDefaultDeviceInfo(): string {
+  // S-04 同类清单：设备指纹随机段改用 CSPRNG（原 Math.random）。
   const deviceInfo = {
     appVersion: "8.0.0",
     brand: DefaultBrand,
-    deviceId: randomId(),
+    deviceId: randomHex(16),
     deviceName: DefaultModel,
-    imei: randomId(),
-    imsi: randomId(),
-    mac: Array.from({ length: 6 }, () =>
-      Math.floor(Math.random() * 256)
-        .toString(16)
-        .padStart(2, "0"),
-    ).join(":"),
+    imei: randomHex(16),
+    imsi: randomHex(16),
+    mac: randomHex(12).replace(/(..)/g, "$1:").replace(/:$/, ""),
     mno: "46000",
     model: DefaultModel,
     mpVersion: DefaultMpVersion,

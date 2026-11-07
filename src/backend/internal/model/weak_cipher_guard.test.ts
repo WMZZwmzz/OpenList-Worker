@@ -38,5 +38,6 @@ test("M-13: 强算法与 none 不受影响", () => {
   assert.equal(readCipher({ DB_CIPHER: "aes-256-gcm" }), "aes-256-gcm")
   assert.equal(readCipher({ DB_CIPHER: "chacha20-poly1305" }), "chacha20-poly1305")
   assert.equal(readCipher({ DB_CIPHER: "none" }), "none")
-  assert.equal(readCipher({}), "none")
+  // S-01：缺省改为 aes-256-gcm（默认加密落库）
+  assert.equal(readCipher({}), "aes-256-gcm")
 })

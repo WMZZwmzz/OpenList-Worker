@@ -16,7 +16,26 @@ export interface Driver115Addition {
 
 // --- 115 Open API 响应类型 ---
 
-/** Open API 文件对象（大写字段） */
+/**
+ * Open API 返回的原始文件对象：115 开放平台的 JSON 字段全部是小写
+ * （fid/fn/fc/fs/pc/upt/pid，见 115-sdk-go fs.go GetFilesResp_File）。
+ * 客户端负责把它归一化成下方内部的 Cloud115File（大写字段）。
+ */
+export interface Cloud115RawFile {
+  fid?: string
+  fn?: string
+  /** "0" = 文件夹，"1" = 文件 */
+  fc?: string | number
+  fs?: number
+  sha1?: string
+  pc?: string
+  thumb?: string
+  upt?: number
+  pid?: string
+  [key: string]: any
+}
+
+/** 归一化后的文件对象（驱动内部统一使用大写字段） */
 export interface Cloud115File {
   Fid: string
   Fn: string
@@ -32,28 +51,47 @@ export interface Cloud115File {
 }
 
 export interface Cloud115ListResp {
-  state: boolean
+  /** Open API 信封：{ state, code, message, data } */
+  state?: boolean
+  code?: number
+  message?: string
   errcode?: number
   errno?: number
   error?: string
   count?: number
   offset?: number
   page_size?: number
-  data?: Cloud115File[]
-  // 旧格式（小写字段）兼容
+  /** 实际响应格式：{ data: [ {fid, fn, fc, fs, ...} ] } */
+  data?: Cloud115RawFile[]
+  // 旧格式（files 数组）兼容
   files?: any[]
 }
 
 export interface Cloud115UserInfoResp {
-  state: boolean
+  state?: boolean
+  code?: number
+  message?: string
   data?: {
     user_id: string | number
     user_name: string
   }
 }
 
+/** downurl 响应条目：url 是嵌套两层的 { url: { url } }（SDK fs.go DownURLResp） */
+export interface Cloud115DownEntry {
+  file_name?: string
+  file_size?: number
+  pick_code?: string
+  sha1?: string
+  url?: { url?: string } | string
+}
+
 export interface Cloud115DownResp {
-  state: boolean
+  state?: boolean
+  code?: number
+  message?: string
+  /** 兼容个别历史形态 */
   url?: string
-  data?: { url?: string }
+  /** 真实形态：{ data: { [fid]: { url: { url } } } } */
+  data?: Record<string, Cloud115DownEntry>
 }

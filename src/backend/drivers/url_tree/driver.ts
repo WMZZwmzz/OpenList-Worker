@@ -11,7 +11,7 @@ import {
   calcFileType,
 } from "../../internal/driver/base"
 import { sortFileItems } from "../../internal/driver/sort"
-import { assertSafeUrl } from "../../pkg/http"
+import { assertSafeUrl, safeRedirectUrl } from "../../pkg/http"
 import { UrlTreeAddition, UrlTreeNode } from "./types"
 
 // ---- 树构建 ----
@@ -19,7 +19,9 @@ import { UrlTreeAddition, UrlTreeNode } from "./types"
 function parseFileLine(line: string): UrlTreeNode {
   const httpIdx = line.indexOf("http://")
   const httpsIdx = line.indexOf("https://")
-  let idx = httpIdx >= 0 ? httpIdx : httpsIdx
+  // 取两者中更早出现的下标：`https://x/?u=http://y` 的 https 才是 URL 起点。
+  const candidates = [httpIdx, httpsIdx].filter((i) => i >= 0)
+  const idx = candidates.length > 0 ? Math.min(...candidates) : -1
   if (idx < 0) {
     throw new Error(`invalid line: ${line}, because url is required for file`)
   }
@@ -113,6 +115,12 @@ function buildTree(text: string): UrlTreeNode {
   return root
 }
 
+/** 递归重设节点及其全部子孙的 level（stringifyTree 依赖绝对 level 生成缩进） */
+function setLevelRecursive(node: UrlTreeNode, level: number): void {
+  node.level = level
+  for (const child of node.children) setLevelRecursive(child, level + 1)
+}
+
 function calcSize(node: UrlTreeNode): number {
   if (node.url) return node.size
   let size = 0
@@ -172,10 +180,24 @@ function getNodeByPath(root: UrlTreeNode, path: string): UrlTreeNode | null {
 async function getSizeFromUrl(url: string): Promise<number> {
   try {
     assertSafeUrl(url, "UrlTree head_size")
-    const res = await fetch(url, { method: "HEAD" })
-    if (!res.ok) return 0
-    const len = parseInt(res.headers.get("Content-Length") || "0", 10)
-    return Number.isFinite(len) ? len : 0
+    // redirect:follow 会绕过 assertSafeUrl（只校验初始 URL），
+    // 必须手动跟随并用 safeRedirectUrl 校验每一跳目标。
+    let current = url
+    for (let hop = 0; hop < 5; hop++) {
+      const res = await fetch(current, { method: "HEAD", redirect: "manual" })
+      if (res.status >= 300 && res.status < 400) {
+        const location = res.headers.get("Location")
+        if (!location) return 0
+        const next = safeRedirectUrl(location, current)
+        if (!next) return 0
+        current = next
+        continue
+      }
+      if (!res.ok) return 0
+      const len = parseInt(res.headers.get("Content-Length") || "0", 10)
+      return Number.isFinite(len) ? len : 0
+    }
+    return 0
   } catch {
     return 0
   }
@@ -315,7 +337,9 @@ export class UrlTreeDriver implements StorageDriver {
       const idx = srcParent.children.findIndex((c) => c.name === name)
       if (idx < 0) continue
       const [node] = srcParent.children.splice(idx, 1)
-      node.level = dstParent.level + 1
+      // 子孙节点也必须同步重设 level：持久化文本按 node.level 缩进，
+      // 只改自身会让子项缩进停留在旧深度，重新加载后挂到错误的父级。
+      setLevelRecursive(node, dstParent.level + 1)
       dstParent.children.push(node)
     }
     calcSize(this.root)
@@ -359,11 +383,23 @@ export class UrlTreeDriver implements StorageDriver {
     )
     if (!parent || parent.url) throw new Error("[UrlTree] parent not found")
     const name = physicalPath.split("/").filter(Boolean).pop() || "file"
+    // 覆盖上传：同名文件必须原地替换（putItem 语义是上传/覆盖），
+    // 追加新节点会让 getNodeByPath 继续命中旧节点、覆盖静默失效并污染树。
+    const existing = parent.children.find((c) => c.name === name)
+    if (existing && !existing.url) {
+      throw new Error(`[UrlTree] cannot overwrite directory: ${physicalPath}`)
+    }
     const node = parseFileLine(`${name}:${line}`)
     node.level = parent.level + 1
-    parent.children.push(node)
     if (this.addition.head_size) {
       node.size = await getSizeFromUrl(node.url)
+    }
+    if (existing) {
+      existing.url = node.url
+      existing.size = node.size
+      existing.modified = node.modified
+    } else {
+      parent.children.push(node)
     }
     calcSize(this.root)
     this.persist()

@@ -7,6 +7,13 @@ import { sortFileItems } from "../../internal/driver/sort"
 import { AliyundriveShareAddition } from "./types"
 import { AliyundriveShareApiClient } from "./util"
 
+/** 阿里云盘分享直链要求的下载头（F-426：必须随 get() 的 raw_url 一起返回） */
+const SHARE_DOWNLOAD_HEADERS: Record<string, string> = {
+  Referer: "https://www.aliyundrive.com/",
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+}
+
 export class AliyundriveShareDriver implements StorageDriver {
   private addition: AliyundriveShareAddition
   private client: AliyundriveShareApiClient
@@ -37,11 +44,14 @@ export class AliyundriveShareDriver implements StorageDriver {
     for (const part of parts) {
       const files = await this.client.getFiles(currentId)
       const folder = files.find((f) => f.type === "folder" && f.name === part)
-      if (folder) {
-        currentId = folder.file_id
-      } else {
-        break
+      if (!folder) {
+        // F-423：路径段不存在时必须报错，不能静默返回上级目录 ID——
+        // 那会让 list/get 把错误目录（甚至根目录）的内容当成请求路径返回。
+        throw new Error(
+          `[AliyundriveShare] Directory '${part}' not found in ${currentId}`,
+        )
       }
+      currentId = folder.file_id
     }
 
     return currentId
@@ -121,6 +131,9 @@ export class AliyundriveShareDriver implements StorageDriver {
       type: calcFileType(found.name, isDir),
       thumb: found.thumbnail,
       raw_url: rawUrl,
+      // F-426：下载链路走 get()，Referer/UA 必须在 raw_url_headers 上返回，
+      // 否则只存在于死代码 link() 里的头永远不会生效。
+      ...(rawUrl ? { raw_url_headers: SHARE_DOWNLOAD_HEADERS } : {}),
     }
   }
 

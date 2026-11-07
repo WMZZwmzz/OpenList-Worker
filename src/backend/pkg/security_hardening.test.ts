@@ -161,11 +161,10 @@ test("SEC-012: settings.token 不再作为管理令牌；api_token 需足够长"
   assert.notEqual(ok.status, 401, "独立的 api_token 应能作为管理令牌")
 })
 import {
-  exceedsUploadLimit,
   getUploadSizeLimit,
-  overLimitResponse,
-  readBodyBytesLimited,
-} from "./body_limit"
+  readBodyWithinLimit,
+  tooLargeResponse,
+} from "./upload-limit"
 
 /** 只带 header/json 的最小 Hono 上下文替身 */
 function fakeCtx(
@@ -179,32 +178,53 @@ function fakeCtx(
   } as any
 }
 
-test("上传体积限制在无 Content-Length 时仍按实际字节数生效", () => {
+/** 带一个 total 字节 chunked body（无 Content-Length）的上下文替身 */
+function makeStreamCtx(
+  total: number,
+  env: Record<string, any> = {},
+  headers: Record<string, string> = {},
+) {
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new Uint8Array(total))
+      controller.close()
+    },
+  })
+  return {
+    env,
+    req: {
+      header: (k: string) => (k in headers ? headers[k] : null),
+      raw: { body },
+    },
+  } as any
+}
+
+test("上传体积限制在无 Content-Length 时仍按实际字节数生效", async () => {
   const max = getUploadSizeLimit(fakeCtx({}, { MAX_UPLOAD: "1000" }))
   assert.equal(max, 1000)
-  // 有 Content-Length：可预判
-  assert.equal(
-    exceedsUploadLimit(
-      fakeCtx({ "Content-Length": "2000" }, { MAX_UPLOAD: "1000" }),
-    ),
-    1000,
+  // 有 Content-Length：预检直接拦截（F-057：exceedsUploadLimit 是 upload-limit
+  // 的内部函数，刻意不导出；预检行为经由 readBodyWithinLimit 观察）
+  const declared = await readBodyWithinLimit(
+    fakeCtx({ "Content-Length": "2000" }, { MAX_UPLOAD: "1000" }) as any,
   )
-  assert.equal(
-    exceedsUploadLimit(
-      fakeCtx({ "Content-Length": "500" }, { MAX_UPLOAD: "1000" }),
-    ),
-    null,
+  assert.ok(!declared.ok && declared.limit === 1000)
+  const underLimitResult = await readBodyWithinLimit(
+    makeStreamCtx(400, { MAX_UPLOAD: "1000" }),
   )
-  // 无 Content-Length（分块传输）：预判失效，但读完后必须仍能拦下
-  const noLength = fakeCtx({}, { MAX_UPLOAD: "1000" })
-  assert.equal(exceedsUploadLimit(noLength), null)
-  assert.equal(overLimitResponse(noLength, 1500)?.status, 413)
-  assert.equal(overLimitResponse(noLength, 900), null)
-  assert.equal(overLimitResponse(noLength, 1001)?.status, 413)
+  assert.ok(underLimitResult.ok)
+  // 无 Content-Length（分块传输）：预判失效，但读取过程中必须仍能拦下
+  const noLength = makeStreamCtx(1400, { MAX_UPLOAD: "1000" })
+  const streamed = await readBodyWithinLimit(noLength)
+  assert.ok(!streamed.ok && streamed.limit === 1000)
+  // 超限响应体（生产入口统一走 tooLargeResponse）
+  assert.equal(tooLargeResponse(fakeCtx({}, {}) as any, 1000).status, 413)
+  assert.equal(
+    tooLargeResponse(fakeCtx({}, {}) as any, 1000, "Part").body.message,
+    "Part too large (max 1000 bytes)",
+  )
   // 分片走独立上限
   const partCtx = fakeCtx({}, { MAX_UPPART: "10" })
   assert.equal(getUploadSizeLimit(partCtx, true), 10)
-  assert.equal(overLimitResponse(partCtx, 11, true)?.status, 413)
 })
 
 test("SEC-021: 无 Content-Length 的 chunked body 在读取过程中被截断", async () => {
@@ -223,9 +243,8 @@ test("SEC-021: 无 Content-Length 的 chunked body 在读取过程中被截断",
       raw: { body: makeStream() },
     },
   }
-  const result = await readBodyBytesLimited(fake)
-  assert.equal(result.tooLarge, 1000)
-  assert.equal(result.bytes.byteLength, 0)
+  const result = await readBodyWithinLimit(fake)
+  assert.ok(!result.ok && result.limit === 1000)
 
   const small: any = {
     env: { MAX_UPLOAD: "1000" },
@@ -241,9 +260,9 @@ test("SEC-021: 无 Content-Length 的 chunked body 在读取过程中被截断",
       },
     },
   }
-  const ok = await readBodyBytesLimited(small)
-  assert.equal(ok.tooLarge, null)
-  assert.equal(ok.bytes.byteLength, 400)
+  const ok = await readBodyWithinLimit(small)
+  assert.ok(ok.ok)
+  assert.ok(ok.ok && ok.buffer.byteLength === 400)
 })
 
 test("SEC-055: 解压条目超过上限时被拒绝", async () => {
@@ -268,7 +287,10 @@ test("SEC-055: 解压条目超过上限时被拒绝", async () => {
 test("decodePathFully 与 resolvePath 一样看穿多重编码", () => {
   assert.equal(decodePathFully("/a/%2e%2e/b"), "/a/../b")
   assert.equal(decodePathFully("/a/%252e%252e/b"), "/a/../b")
-  assert.equal(decodePathFully("/a/....b"), "/a/..b")
+  // F-075：整段全是点仍按 ".." 折叠（resolvePath 只认字面 ".."），
+  // 但段内连续点属于合法文件名，必须原样保留。
+  assert.equal(decodePathFully("/a/.../b"), "/a/../b")
+  assert.equal(decodePathFully("/a/....b"), "/a/....b")
   assert.equal(decodePathFully("/a%2fb"), "/a/b")
   // 非法百分号序列不抛错，原样返回
   assert.equal(decodePathFully("/100%.txt"), "/100%.txt")

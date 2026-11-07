@@ -27,7 +27,7 @@ import {
   ProtonUserURL,
   ProtonWebDriveAV,
 } from "./consts"
-import { computeSRPClientProof } from "./srp"
+import { computeSRPClientProof, proofsEqual } from "./srp"
 import {
   KeyRing,
   deriveSaltedKeyPass,
@@ -68,9 +68,13 @@ export class ProtonDriveClient {
       "X-Pm-Drive-Sdk-Version": ProtonSDKVersion,
       "User-Agent": ProtonUserAgent,
     }
+    // The 2FA handshake happens before an access token exists; Proton binds
+    // the pending SRP session to the UID header, not to the bearer token.
+    if (this.uid) {
+      h["X-Pm-Uid"] = this.uid
+    }
     if (this.accessToken) {
       h.Authorization = `Bearer ${this.accessToken}`
-      h["X-Pm-Uid"] = this.uid
     }
     return h
   }
@@ -128,7 +132,7 @@ export class ProtonDriveClient {
       throw new Error("invalid auth info response")
     }
 
-    // 2. SRP client proof
+    // 2. SRP client proof (auth v3/v4; the modulus is PGP-verified)
     const proof = await computeSRPClientProof(
       this.addition.email,
       this.addition.password,
@@ -148,6 +152,9 @@ export class ProtonDriveClient {
 
     // 4. 2FA if required
     if (auth.Code === 1001 || auth.TwoFactor?.Enabled) {
+      // The pending SRP session is addressed by the UID from the 1001
+      // response; without this header the server cannot locate the session.
+      if (auth.UID) this.uid = auth.UID
       if (!this.addition.two_fa_code) {
         throw new Error("2FA is enabled but no two_fa_code provided")
       }
@@ -158,6 +165,16 @@ export class ProtonDriveClient {
           SRPSession: proof.SRPSession,
         },
       })) as ProtonAuthResp & { Code: number }
+    }
+
+    // 5. verify the server proof: H(A | M | S) must match the value the server
+    //    derived from the same shared session. A missing/mismatched proof means
+    //    the peer does not know the verifier and must be rejected.
+    if (!auth.ServerProof) {
+      throw new Error("auth failed: server proof missing")
+    }
+    if (!proofsEqual(auth.ServerProof, proof.ExpectedServerProof)) {
+      throw new Error("auth failed: invalid server proof")
     }
 
     if (!auth.AccessToken || !auth.UID) {

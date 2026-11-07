@@ -1,0 +1,3278 @@
+[
+ {
+  "id": "F-009",
+  "sev": "高",
+  "loc": "src/backend/server/fs.ts:1119",
+  "title": "/fs/copy、/fs/move、/fs/recursive_move 对源路径从不校验读 ACL（密码 / read_users），构成受保护内容的读取绕过",
+  "status": "已修复"
+ },
+ {
+  "id": "F-031",
+  "sev": "高",
+  "loc": "src/backend/server/auth.ts:758",
+  "title": "/otp/login 兑换签发的完整 JWT 缺少 pwd_ts claim，导致兑换出的令牌立即被所有鉴权入口拒绝——SSO/WebAuthn + 2FA 兑换流程对所有真实用户完全不可用",
+  "status": "已修复"
+ },
+ {
+  "id": "F-055",
+  "sev": "高",
+  "loc": "src/backend/pkg/http.ts:269",
+  "title": "isSafeUrl 不归一化主机名尾点，http://localhost./ 与 http://127.0.0.1.nip.io./ 等绕过全部 SSRF 检查",
+  "status": "已修复"
+ },
+ {
+  "id": "F-057",
+  "sev": "高",
+  "loc": "src/backend/pkg/upload-limit.ts:67",
+  "title": "readBodyWithinLimit 先把整个请求体读入内存、之后才检查上限，chunked（无/伪造 Content-Length）超大上传仍可打爆内存",
+  "status": "已修复"
+ },
+ {
+  "id": "F-069",
+  "sev": "高",
+  "loc": "src/backend/internal/model/db.ts:1026",
+  "title": "ensureDefaultSettings 对非字符串的 setting.value 调用 .trim()：任何一个数字/布尔值的设置项都会让每次 loadDb 失败并回退到默认空壳，随后一次管理员保存即可用空壳覆盖真实",
+  "status": "已修复"
+ },
+ {
+  "id": "F-076",
+  "sev": "高",
+  "loc": "src/backend/internal/model/store/schema.ts:405-447",
+  "title": "MySQL 方言建表 DDL 用 TEXT 列做 PRIMARY KEY/UNIQUE，是非法 SQL（ERROR 1170），导致全新 MySQL 部署整体不可用",
+  "status": "已修复"
+ },
+ {
+  "id": "F-083",
+  "sev": "高",
+  "loc": "src/backend/internal/model/store/format/sql.ts:129",
+  "title": "save() 生成的 DELETE ... NOT IN 为每行保留一个绑定参数，超过 D1/DO 单条查询 100 个绑定参数的硬上限，导致任何一张表超过 100 行时每次保存必然失败",
+  "status": "已修复"
+ },
+ {
+  "id": "F-084",
+  "sev": "高",
+  "loc": "src/backend/internal/model/store/format/sql.ts:81",
+  "title": "「已初始化」判定只依赖最后写入的标记（schema_info / INIT_MARK），标记写入位于非原子写入序列的最末尾，任何中途失败都会让有数据的库永久呈现为「全新空库」，重新打开匿名 /init/setup 接管与",
+  "status": "已修复"
+ },
+ {
+  "id": "F-090",
+  "sev": "高",
+  "loc": "src/backend/internal/op/storage.ts:1157",
+  "title": "五个分享驱动（115Share/123PanShare/AliyundriveShare/OnedriveSharelink/PikPakShare）的实例化分支不可达，管理端用这些模板创建的存储全部会实例化成错误的「个",
+  "status": "已修复"
+ },
+ {
+  "id": "F-091",
+  "sev": "高",
+  "loc": "src/backend/server/fs.ts:328",
+  "title": "分享口令的暴破节流（8 次/10 分钟锁定）在 /api/fs/* 的分享浏览端点上从未生效，提取码可被无限速穷举",
+  "status": "已修复"
+ },
+ {
+  "id": "F-096",
+  "sev": "高",
+  "loc": "src/backend/internal/seed/hash.ts:1",
+  "title": "纯 JS 哈希实现 hashers.ts 是死代码：hash.ts:1 与 codec.ts:1 仍从 hash-wasm 导入，运行时 WASM 编译的兼容问题原样存在",
+  "status": "已修复"
+ },
+ {
+  "id": "F-112",
+  "sev": "高",
+  "loc": "src/backend/index.ts:130",
+  "title": "全局 503 拦截中间件对每个非豁免请求无条件执行 driver.health()，违背「health 只在手动诊断路径被调用、不在每请求路径上」的设计不变量，KV list 配额被逐请求消耗并最终自伤式全站 503",
+  "status": "已修复"
+ },
+ {
+  "id": "F-113",
+  "sev": "高",
+  "loc": "src/backend/internal/archive/zip.ts:140",
+  "title": "extractZipEntry 的 zip-bomb 中止路径（reader.cancel）使未 await 的 writer.write()/writer.close() Promise 拒绝成为 unhandled ",
+  "status": "已修复"
+ },
+ {
+  "id": "F-133",
+  "sev": "高",
+  "loc": "src/backend/drivers/189/driver.ts:530",
+  "title": "多分片上传的 sliceMd5 计算与上游协议双重偏差（小写分片 MD5 参与拼接、结果又转大写），所有 >10MiB 文件提交的校验值必然错误",
+  "status": "已修复"
+ },
+ {
+  "id": "F-140",
+  "sev": "高",
+  "loc": "src/backend/drivers/139/util.ts:645",
+  "title": "getDisk 把文件列表读自响应里不存在的字段 fileList（API 实际返回 contentList），legacy 模式下永远返回空文件列表",
+  "status": "已修复"
+ },
+ {
+  "id": "F-148",
+  "sev": "高",
+  "loc": "src/backend/drivers/s3/sigv4.ts:181-187（wire 侧 src/backend/drivers/s3/util.ts:335、sigv4.ts:257-272）",
+  "title": "SigV4 签名用的 canonical query string（空格编成 %20）与实际发送的 query（URLSearchParams 把空格编成 +）不一致，任何查询参数值含空格或字面 \"+\" 的请求都会 Si",
+  "status": "已修复"
+ },
+ {
+  "id": "F-155",
+  "sev": "高",
+  "loc": "src/backend/drivers/lanzou/util.ts:863-884",
+  "title": "直链探测循环中 200 直出分支在 redirect:\"manual\" 下永不成立，200 响应体被整文件读入内存（最多 3 次），成功路径响应体从不取消",
+  "status": "已修复"
+ },
+ {
+  "id": "F-165",
+  "sev": "高",
+  "loc": "src/backend/drivers/weiyun/driver.ts:695",
+  "title": "uploadPart 按 session 固定 1MB chunkSize 计算 offset，与服务层 multipart 实际分片大小（默认 10MB、上限 64MB）不匹配，数据写错位导致文件损坏",
+  "status": "已修复"
+ },
+ {
+  "id": "F-166",
+  "sev": "高",
+  "loc": "src/backend/drivers/weiyun/driver.ts:629",
+  "title": "createUploadSession 传空内容调用 preUpload，却声明真实 file_size：所有分块 SHA、check_sha、check_data、file_sha 全按 0 字节计算",
+  "status": "已修复"
+ },
+ {
+  "id": "F-173",
+  "sev": "高",
+  "loc": "src/backend/drivers/proton_drive/srp.ts:205",
+  "title": "SRP 登录实现与 Proton 实际协议完全不兼容，login() 永远不可能成功",
+  "status": "已修复"
+ },
+ {
+  "id": "F-174",
+  "sev": "高",
+  "loc": "src/backend/drivers/proton_drive/crypto.ts:145",
+  "title": "decryptSessionKeyPacket 把 base64 二进制的 ContentKeyPacket 当作 armored 消息解析，任何文件下载都必然抛错",
+  "status": "已修复"
+ },
+ {
+  "id": "F-175",
+  "sev": "高",
+  "loc": "src/backend/drivers/proton_drive/driver.ts:341",
+  "title": "createReadStream 从修订列表接口读取 Blocks，而该接口只返回元数据不含 Blocks，所有下载必抛 \"file has no blocks\"",
+  "status": "已修复"
+ },
+ {
+  "id": "F-176",
+  "sev": "高",
+  "loc": "src/backend/drivers/proton_drive/driver.ts:395",
+  "title": "下载 block 时使用错误的鉴权头 Authorization: Bearer，Proton 存储端点要求 pm-storage-token",
+  "status": "已修复"
+ },
+ {
+  "id": "F-177",
+  "sev": "高",
+  "loc": "src/backend/drivers/proton_drive/driver.ts:376",
+  "title": "block.Index 实为 1-based，本实现按 0-based 计算偏移，导致全量下载截断最后一个块、Range 请求返回错位数据",
+  "status": "已修复"
+ },
+ {
+  "id": "F-185",
+  "sev": "高",
+  "loc": "src/backend/drivers/r2/driver.ts:562",
+  "title": "binding 模式目录的 copy/rename/move/remove 全都不是递归的：copyDirRecursive/removeDirRecursive 只处理第一层文件，子目录内容既不复制也不删除",
+  "status": "已修复"
+ },
+ {
+  "id": "F-186",
+  "sev": "高",
+  "loc": "src/backend/internal/op/storage.ts:1800",
+  "title": "同名 rename / 目标目录等于源目录的 move 没有任何 no-op 防护，copy-then-delete 的实现会把对象直接销毁（根源在共享 op 层，R2/S3 驱动共同受害）",
+  "status": "已修复"
+ },
+ {
+  "id": "F-192",
+  "sev": "高",
+  "loc": "src/backend/drivers/123pan/driver.ts:445",
+  "title": "123pan 分片会话上传的分片大小契约断裂：驱动按自带 16MB 计算 partCount/isMultipart，而两个调用方都按自己的分片大小切片上传，导致特定大小区间上传必然损坏或失败",
+  "status": "已修复"
+ },
+ {
+  "id": "F-200",
+  "sev": "高",
+  "loc": "src/backend/drivers/github/util.ts:353",
+  "title": "renewParentTrees 按 sha（而非路径名）在父树中定位待更新的子目录，sha 相同的兄弟目录会被错误替换，提交内容落到错误的目录",
+  "status": "已修复"
+ },
+ {
+  "id": "F-208",
+  "sev": "高",
+  "loc": "src/backend/drivers/baidu_netdisk/driver.ts:216",
+  "title": "move/copy 把虚拟路径 dstDir 直接当作百度网盘的目标目录，挂载点非根或 root_folder_path 非空时目标路径错位",
+  "status": "已修复"
+ },
+ {
+  "id": "F-214",
+  "sev": "高",
+  "loc": "src/backend/drivers/wopan/driver.ts:235",
+  "title": "move()/copy() 用虚拟路径 dstDir 解析目标文件夹 ID，挂载点带前缀时移动/复制必然失败或静默移错位置",
+  "status": "已修复"
+ },
+ {
+  "id": "F-220",
+  "sev": "高",
+  "loc": "src/backend/drivers/guangyapan/util.ts:342",
+  "title": "getFileList 永远只请求 page: 0，list() 的翻页循环从未推进页码，导致目录列表重复条目、漏掉第二页之后的文件，最坏情况发出 10001 次 API 请求",
+  "status": "已修复"
+ },
+ {
+  "id": "F-221",
+  "sev": "高",
+  "loc": "src/backend/drivers/guangyapan/driver.ts:75",
+  "title": "idCache 在 rename/move/remove/put 后从不失效，且驱动实例被跨请求缓存，导致按路径的破坏性操作（删除/改名/移动/复制）命中陈旧 ID 而删错文件",
+  "status": "已修复"
+ },
+ {
+  "id": "F-229",
+  "sev": "高",
+  "loc": "src/backend/drivers/ctfile/driver.ts:287-298",
+  "title": "move() 用站点虚拟路径 dstDir 解析目标文件夹，忽略了 dstPhysical，非根挂载/非根存储时移动失败或静默移入错误目录",
+  "status": "已修复"
+ },
+ {
+  "id": "F-236",
+  "sev": "高",
+  "loc": "src/backend/drivers/webdav/util.ts:654",
+  "title": "MOVE/COPY 收到持续 409 时无上限递归重试，形成请求风暴直至外部超时",
+  "status": "已修复"
+ },
+ {
+  "id": "F-243",
+  "sev": "高",
+  "loc": "src/backend/drivers/mopan/crypto.ts:64",
+  "title": "rsaEncrypt 是 base64 桩实现且两个 RSA 公钥为伪造占位符，每次请求的 AES 会话密钥以明文 base64 随头传输",
+  "status": "已修复"
+ },
+ {
+  "id": "F-253",
+  "sev": "高",
+  "loc": "src/backend/drivers/pikpak/driver.ts:432",
+  "title": "put() 的 OSS 上传请求缺少 Authorization 签名，只带了 x-oss-security-token，非秒传上传必然 403",
+  "status": "已修复"
+ },
+ {
+  "id": "F-254",
+  "sev": "高",
+  "loc": "src/backend/drivers/pikpak/driver.ts:402",
+  "title": "上传/秒传的 hash 用裸 SHA-1，而 PikPak API 要求 GCID（分块双重 SHA-1），秒传永远无法命中",
+  "status": "已修复"
+ },
+ {
+  "id": "F-260",
+  "sev": "高",
+  "loc": "src/backend/drivers/ftp/ftp-client.ts:520-531",
+  "title": "upload()/download() 在数据连接建立结果返回前未挂 error 监听器，PASV 数据连接失败会以未捕获异常击穿整个 Node 进程",
+  "status": "已修复"
+ },
+ {
+  "id": "F-261",
+  "sev": "高",
+  "loc": "src/backend/drivers/ftp/ftp-client.ts:208",
+  "title": "控制连接的 15 秒 inactivity timeout 从未清除，任何超过 15 秒的数据传输都会被中途断开，下载被静默截断为正常 EOF",
+  "status": "已修复"
+ },
+ {
+  "id": "F-262",
+  "sev": "高",
+  "loc": "src/backend/drivers/ftp/ftp-client.ts:392-400",
+  "title": "控制通道把 1xx 先行响应当最终响应消费，而 226 完成码的等待回调 push 太晚：完成码先到即被丢弃或错配，请求永久挂起并级联毒化缓存客户端",
+  "status": "已修复"
+ },
+ {
+  "id": "F-263",
+  "sev": "高",
+  "loc": "`src/backend/drivers/ftp/ftp-client.ts:556-560`",
+  "title": "按存储缓存的 FTPClient 完全没有命令串行化，并发请求交错复用同一控制连接，连接级全局状态（REST 偏移、CWD）互相污染导致数据错乱",
+  "status": "已修复"
+ },
+ {
+  "id": "F-271",
+  "sev": "高",
+  "loc": "`src/backend/internal/op/storage.ts:400`（alsoIn：F-396）",
+  "title": "createDriver 中 \"115open\" 先命中 legacy Driver115 分支，Pan115Driver 对自己的主名永远不可达（本模块整体成为死代码）；\"115_share\" 又被后一分支的 star",
+  "status": "已修复"
+ },
+ {
+  "id": "F-272",
+  "sev": "高",
+  "loc": "`src/backend/drivers/115open/driver.ts:382`",
+  "title": "move/copy 把「虚拟目标目录路径」当作 115 账号内的物理路径解析，文件会被移/复制到错误目录或直接报错",
+  "status": "已修复"
+ },
+ {
+  "id": "F-279",
+  "sev": "高",
+  "loc": "`src/backend/drivers/thunder/driver.ts:150-156`",
+  "title": "resolveFolderId 把物理路径末段的目录/文件名当作迅雷文件 ID 直接传给 API，导致除挂载根目录外所有操作失效",
+  "status": "已修复"
+ },
+ {
+  "id": "F-288",
+  "sev": "高",
+  "loc": "`src/backend/drivers/189_tv/util.ts:481`",
+  "title": "rapidUploadCreate 在 fileDataExists===1 时直接返回 true，从不调用 commit，秒传的文件永远不会真正创建",
+  "status": "已修复"
+ },
+ {
+  "id": "F-289",
+  "sev": "高",
+  "loc": "`src/backend/drivers/189_tv/driver.ts:157`",
+  "title": "move/copy 用虚拟路径 dstDir 调 pathToId 解析目标目录，挂载点/base_path 非根时必然失败或移错目录",
+  "status": "已修复"
+ },
+ {
+  "id": "F-305",
+  "sev": "高",
+  "loc": "`src/backend/drivers/github_releases/util.ts:328-364`",
+  "title": "getDownloadUrl 只按 basename 兜底解析且 get() 永不报 not-found：任意不存在的路径被当成文件返回，甚至能拿到其它 release 的直链（下载到错误内容）",
+  "status": "已修复"
+ },
+ {
+  "id": "F-310",
+  "sev": "高",
+  "loc": "`src/backend/drivers/onedrive/util.ts:106`",
+  "title": "requestApi 只特判 204，其余成功响应一律 res.json()，而 Graph copy 返回 202 Accepted + 空响应体，导致 Onedrive.copy() 每次成功复制都抛 SyntaxE",
+  "status": "已修复"
+ },
+ {
+  "id": "F-311",
+  "sev": "高",
+  "loc": "`src/backend/drivers/onedrive/driver.ts:312`",
+  "title": "put() 大文件分块上传完全不看每个 chunk PUT 的响应，任何一块失败都被静默吞掉，最终以\"成功\"结束但文件残缺",
+  "status": "已修复"
+ },
+ {
+  "id": "F-319",
+  "sev": "高",
+  "loc": "`src/backend/drivers/quark/driver.ts:148`",
+  "title": "QuarkDriver.move/copy 用虚拟目录路径 dstDir 解析目标文件夹 ID，忽略已传入的物理路径 _dstPhysical",
+  "status": "已修复"
+ },
+ {
+  "id": "F-327",
+  "sev": "高",
+  "loc": "`src/backend/drivers/wps/driver.ts:296-312`",
+  "title": "put() 是空壳 stub：不执行任何上传，静默返回成功，用户上传的文件被丢弃",
+  "status": "已修复"
+ },
+ {
+  "id": "F-328",
+  "sev": "高",
+  "loc": "`src/backend/drivers/terabox/driver.ts:292-332`",
+  "title": "put() 上传链路不检测任何 errno，且分块协议与上游参考实现不一致，大文件上传失败时静默报成功",
+  "status": "已修复"
+ },
+ {
+  "id": "F-334",
+  "sev": "高",
+  "loc": "`src/backend/drivers/halalcloud_open/driver.ts:139`",
+  "title": "move/copy 把 op 层传入的虚拟目标目录 dstDir 当物理路径经 fullPath() 换算，目标云端路径混入挂载前缀（并叠加 root_folder_id），跨目录 move/copy 必然指向错误路径",
+  "status": "已修复"
+ },
+ {
+  "id": "F-353",
+  "sev": "高",
+  "loc": "`src/backend/drivers/onedrive_app/util.ts:154`",
+  "title": "requestApi 对 202 空响应体调用 res.json()，导致 OnedriveAPP.copy() 在复制被接受后仍必然抛错",
+  "status": "已修复"
+ },
+ {
+  "id": "F-354",
+  "sev": "高",
+  "loc": "`src/backend/drivers/onedrive_app/driver.ts:249-257`",
+  "title": "大文件分块上传完全丢弃每个分块 PUT 的响应，任何分块失败都被静默吞掉，put() 照样成功返回",
+  "status": "已修复"
+ },
+ {
+  "id": "F-356",
+  "sev": "高",
+  "loc": "`src/backend/drivers/google_drive/util.ts:213`",
+  "title": "列表阶段把快捷方式条目的 id 原地替换为 targetId，导致后续 delete/rename/move/copy 全部作用在被指向的真实文件上",
+  "status": "已修复"
+ },
+ {
+  "id": "F-357",
+  "sev": "高",
+  "loc": "`src/backend/drivers/google_drive/util.ts:389`",
+  "title": "pathCache 只增不减且任何写操作都不失效；驱动实例又被 op 层跨请求缓存，重命名/删除/重建同名路径后所有路径解析拿到过期 file id",
+  "status": "已修复"
+ },
+ {
+  "id": "F-364",
+  "sev": "高",
+  "loc": "`src/backend/drivers/mediatrack/driver.ts:319-344`",
+  "title": "mediatrack put() 不检查对象存储 PUT 的响应结果，上传失败/跳过时仍然登记资产并报告成功",
+  "status": "已修复"
+ },
+ {
+  "id": "F-375",
+  "sev": "高",
+  "loc": "`src/backend/drivers/mega/util.ts:85`",
+  "title": "Mega 登录流程完全错误：密码从未参与认证，sid 永远为空，驱动整体不可用",
+  "status": "已修复"
+ },
+ {
+  "id": "F-376",
+  "sev": "高",
+  "loc": "`src/backend/drivers/mega/util.ts:155`",
+  "title": "Mega 节点属性从未解密：所有文件/目录都会被列成 \"unnamed\"，按名解析路径随之失效；createFolder 反向写入明文属性和假密钥",
+  "status": "已修复"
+ },
+ {
+  "id": "F-377",
+  "sev": "高",
+  "loc": "`src/backend/drivers/mega/util.ts:191`",
+  "title": "getDownloadLink 返回的是 Mega 密文下载 URL，用户拿到的直链内容是无法解密的乱码",
+  "status": "已修复"
+ },
+ {
+  "id": "F-384",
+  "sev": "高",
+  "loc": "`src/backend/drivers/netease_music/crypto.ts:176`",
+  "title": "weapi 第二层 AES 加密的明文用错了：直接加密第一层密文原始字节，漏掉了层间 base64 编码",
+  "status": "已修复"
+ },
+ {
+  "id": "F-386",
+  "sev": "高",
+  "loc": "`src/backend/drivers/netease_music/crypto.ts:105`",
+  "title": "aesEcbEncrypt 的 Workers/WebCrypto 分支必然抛 RangeError：WebCrypto 对 16 字节块返回 32 字节，out.set 越界",
+  "status": "已修复"
+ },
+ {
+  "id": "F-393",
+  "sev": "高",
+  "loc": "`src/backend/drivers/115/driver.ts:99`",
+  "title": "115 驱动的 pathCache 在 mkdir/rename/remove/move/copy 后从不失效，可导致删除/列出错误对象（数据丢失）",
+  "status": "已修复"
+ },
+ {
+  "id": "F-394",
+  "sev": "高",
+  "loc": "`src/backend/drivers/115/util.ts:109`",
+  "title": "115 驱动按大写字段（Fid/Fn/Fc/FS）解析 115 Open API 列表响应，而实际响应字段为小写（fid/fn/fc/fs），导致列表与路径解析全面失效",
+  "status": "已修复"
+ },
+ {
+  "id": "F-403",
+  "sev": "高",
+  "loc": "`src/backend/drivers/bunny_storage/driver.ts:193`",
+  "title": "remove() 对文件和目录一律追加尾斜杠 DELETE，文件删除按目录语义发出",
+  "status": "已修复"
+ },
+ {
+  "id": "F-420",
+  "sev": "高",
+  "loc": "`src/backend/drivers/chunk/driver.ts:140`",
+  "title": "list() 把带前缀的分片目录路径再喂给 listParts()，chunkDirRemote 会第二次拼接 chunkPrefix，导致按不存在的双重前缀目录计算分片文件大小",
+  "status": "已修复"
+ },
+ {
+  "id": "F-421",
+  "sev": "高",
+  "loc": "`src/backend/drivers/cloudflare_imgbed/driver.ts:105`",
+  "title": "list() 翻页终止条件把 directories 计入每页条数，但上游分页只对 files 生效，满足条件时请求循环永不终止",
+  "status": "已修复"
+ },
+ {
+  "id": "F-432",
+  "sev": "高",
+  "loc": "`src/backend/drivers/url_tree/driver.ts:314-320`",
+  "title": "move 只更新被移动节点自身的 level，不递归更新子孙节点，persist 后目录树结构被静默破坏",
+  "status": "已修复"
+ },
+ {
+  "id": "F-433",
+  "sev": "高",
+  "loc": "`src/backend/drivers/url_tree/driver.ts:352-370`",
+  "title": "put 对已存在的同名文件只追加新节点不去重，覆盖上传变成无效操作并污染树结构",
+  "status": "已修复"
+ },
+ {
+  "id": "F-434",
+  "sev": "高",
+  "loc": "`src/backend/drivers/cloudreve_v3/driver.ts:117`",
+  "title": "move/copy 把虚拟目标目录 dstDir 直接发给 Cloudreve API，挂载前缀/root_folder_path 下文件被移到错误位置",
+  "status": "已修复"
+ },
+ {
+  "id": "F-435",
+  "sev": "高",
+  "loc": "`src/backend/drivers/febbox/driver.ts:122`",
+  "title": "move/copy 用虚拟 dstDir 做 pathToId，挂载前缀下必然解析失败或移入错误目录",
+  "status": "已修复"
+ },
+ {
+  "id": "F-444",
+  "sev": "高",
+  "loc": "`src/backend/drivers/azure_blob/driver.ts:138-147`",
+  "title": "SharedKey 签名的 canonicalizedResource 完全构造错误（缺 container 段、query 值未解码、Content-Length 为 0 时签成 \"0\"），所有 SharedKey 请",
+  "status": "已修复"
+ },
+ {
+  "id": "F-445",
+  "sev": "高",
+  "loc": "`src/backend/drivers/azure_blob/driver.ts:197-203`",
+  "title": "服务 SAS 的 string-to-sign 字段布局错误（14 个字段而非 16 个，过期时间落在 signedIdentifier 槽位），生成的所有 SAS 下载链接必然被拒",
+  "status": "已修复"
+ },
+ {
+  "id": "F-446",
+  "sev": "高",
+  "loc": "`src/backend/drivers/google_photo/util.ts:168-180`",
+  "title": "fetchItems 分页永不发送 nextPageToken，且每轮都从原始 query 重置 pageToken，任何超过一页的列表都会无限循环重复请求第一页",
+  "status": "已修复"
+ },
+ {
+  "id": "F-456",
+  "sev": "高",
+  "loc": "`src/backend/drivers/cloudreve_v4/util.ts:78`",
+  "title": "cloudreve_v4 未解包 API 响应信封 {code,data,msg}，列出/登录/换链全部失效，驱动整体不可用",
+  "status": "已修复"
+ },
+ {
+  "id": "F-457",
+  "sev": "高",
+  "loc": "`src/backend/drivers/crypt/driver.ts:104`",
+  "title": "crypt 驱动 get() 不追加 encrypted_suffix，查询远端时用的是明文名，加密文件永远查不到",
+  "status": "已修复"
+ },
+ {
+  "id": "F-458",
+  "sev": "高",
+  "loc": "`src/backend/drivers/crypt/cipher.ts:56`",
+  "title": "crypt 注释声称「rclone crypt v1 兼容」，实际文件格式与 rclone/OpenList Go 版完全不同，跨实现数据互相不可读",
+  "status": "已修复"
+ },
+ {
+  "id": "F-467",
+  "sev": "高",
+  "loc": "`src/backend/drivers/kodbox/driver.ts:134`",
+  "title": "kodbox/ipfs_api/misskey/openlist 四个驱动的 move/copy 都把「虚拟目录路径」当作远端路径使用，违反 op 层契约",
+  "status": "已修复"
+ },
+ {
+  "id": "F-468",
+  "sev": "高",
+  "loc": "`src/backend/drivers/misskey/util.ts:33`",
+  "title": "getFiles/getFolders 不传 limit 也不分页，目录列表被静默截断为 10 条",
+  "status": "已修复"
+ },
+ {
+  "id": "F-475",
+  "sev": "高",
+  "loc": "src/backend/drivers/uss/driver.ts:64-93",
+  "title": "uss 列目录的响应解析与又拍云实际返回格式不符，JSON 分支永远不会命中，最终把 JSON 原文当文本行解析，目录列表彻底损坏",
+  "status": "已修复"
+ },
+ {
+  "id": "F-476",
+  "sev": "高",
+  "loc": "src/backend/drivers/uss/driver.ts:212-222",
+  "title": "uss 的 rename/move/copy 源地址缺少 bucket 段，X-Upyun-Move-Source / X-Upyun-Copy-Source 头格式错误，三个操作必然失败",
+  "status": "已修复"
+ },
+ {
+  "id": "F-001",
+  "sev": "中",
+  "loc": "src/backend/server/admin.ts:5229",
+  "title": "/index/build、/index/update、/scan/start 调 search() 时未传 per_page/page，索引与扫描结果被分页截断为前 30 条，且 /index/update 合并出重复条",
+  "status": "已修复"
+ },
+ {
+  "id": "F-004",
+  "sev": "中",
+  "loc": "src/backend/server/admin.ts:410",
+  "title": "/storage/update 对不存在的存储 id 静默返回 200 success；/storage/delete、enable、disable 对非法/缺失 id（parseInt 得 NaN 或 0）同样无操作却",
+  "status": "已修复"
+ },
+ {
+  "id": "F-010",
+  "sev": "中",
+  "loc": "src/backend/internal/upload/multipart.ts:71",
+  "title": "分片上传会话存在 per-isolate 内存 Map 中，在 Cloudflare Workers 等多 isolate 运行时上 init 与 chunk/complete 落到不同实例即 404",
+  "status": "已修复"
+ },
+ {
+  "id": "F-011",
+  "sev": "中",
+  "loc": "src/backend/server/middlewares.ts:600",
+  "title": "静态 API token 身份没有 id 字段，导致其创建的 multipart 会话永远无法通过所有权校验（chunk/complete/status 恒 404）",
+  "status": "已修复"
+ },
+ {
+  "id": "F-013",
+  "sev": "中",
+  "loc": "src/backend/server/fs.ts:1207（另见编号：F-058）",
+  "title": "/fs/form 先用 c.req.formData() 把整个请求体读入内存，之后才检查文件大小，无任何预读上限",
+  "status": "已修复"
+ },
+ {
+  "id": "F-014",
+  "sev": "中",
+  "loc": "src/backend/server/fs.ts:1442",
+  "title": "/fs/regex_rename 对用户提供的正则不做灾难性回溯防护（ReDoS），与 meta.hide 的 isSafeHidePattern 防护不对称",
+  "status": "已修复"
+ },
+ {
+  "id": "F-015",
+  "sev": "中",
+  "loc": "src/backend/server/fs.ts:2233（另见编号：F-115）",
+  "title": "/fs/archive/list 中 zip 根级目录完全不可见，深层级目录又被列成 is_dir:false 的文件，归档浏览在根层无法进入任何子目录",
+  "status": "已修复"
+ },
+ {
+  "id": "F-022",
+  "sev": "中",
+  "loc": "src/backend/server/seed.ts:343-346",
+  "title": "fetchSafe 的同源白名单漏掉 /d/ 与 /sd/ 前缀，导致本实例自产的种子源在转存时必然被拦截，offline_download/quick_save/rapid_transfer 对默认部署完全不可用",
+  "status": "已修复"
+ },
+ {
+  "id": "F-023",
+  "sev": "中",
+  "loc": "src/backend/server/seed.ts:990-1021",
+  "title": "GET /seed/capabilities 对 query 传入的任意 path 探测存储驱动名与能力，全程没有读权限校验，guest 即可枚举存储拓扑",
+  "status": "已修复"
+ },
+ {
+  "id": "F-025",
+  "sev": "中",
+  "loc": "src/backend/server/seed.ts:714-769",
+  "title": "generateSeed 直接对 getDb 返回的跨请求共享缓存对象 push 分享记录，循环中途抛错会在缓存里留下未持久化的幽灵分享，并发时是无锁丢失更新",
+  "status": "已修复"
+ },
+ {
+  "id": "F-026",
+  "sev": "中",
+  "loc": "src/backend/server/seed.ts:879-951",
+  "title": "uploadStreamToDriver 创建分片上传会话后，rapid_only 失败与 multipart 流失败路径都不中止会话、不取消 reader，遗留孤儿分片与悬挂连接",
+  "status": "已修复"
+ },
+ {
+  "id": "F-032",
+  "sev": "中",
+  "loc": "src/backend/pkg/utils.ts:52",
+  "title": "checkAdminAuth（/api/admin/* 的唯一守卫）不拒绝 type:\"otp_pending\" 的待兑换令牌，对无 pwd_update_at/token_epoch 的历史用户构成 2FA 绕过到管理",
+  "status": "已修复"
+ },
+ {
+  "id": "F-033",
+  "sev": "中",
+  "loc": "src/backend/server/webauthn.ts:79",
+  "title": "cborDecode 无输入边界/终止符校验，畸形 attestationObject 触发约 1.34 亿次解码迭代和 GB 级内存分配（CPU/内存耗尽 DoS）",
+  "status": "已修复"
+ },
+ {
+  "id": "F-034",
+  "sev": "中",
+  "loc": "src/backend/server/auth.ts:160",
+  "title": "登录防爆破的 KV 共享代码假设 getKvBinding().binding 一定是 KV 形态，在 cfkv REST（mode:\"api\"）部署上读写全部静默失效，计数退化为单 isolate 内存",
+  "status": "已修复"
+ },
+ {
+  "id": "F-035",
+  "sev": "中",
+  "loc": "src/backend/server/sso.ts:33",
+  "title": "OAuth state 只存进程内 Map 且没有任何 TTL 清扫：多实例部署下 SSO 登录间歇性失败，长驻进程内存无界增长",
+  "status": "已修复"
+ },
+ {
+  "id": "F-039",
+  "sev": "中",
+  "loc": "src/backend/server/public.ts:795",
+  "title": "POST /api/public/init/setup 存在无锁 TOCTOU：并发未鉴权请求可各自创建一个 role=2 管理员并全部持久化",
+  "status": "已修复"
+ },
+ {
+  "id": "F-040",
+  "sev": "中",
+  "loc": "src/backend/server/public.ts:701",
+  "title": "/init/setup 不保留保留用户名 \"guest\"：以 guest 为管理员用户名初始化后，匿名访客会通过 guest 回退直接继承 role=2 的完整管理员身份",
+  "status": "已修复"
+ },
+ {
+  "id": "F-041",
+  "sev": "中",
+  "loc": "src/backend/internal/op/share.ts:179（另见编号：F-094）",
+  "title": "resolveShare 的 recordAccess 用未 await 且未挂 waitUntil 的 saveDb 记访问计数，Workers 返回响应后写入可能被丢弃，max_accessed 配额形同虚设",
+  "status": "已修复"
+ },
+ {
+  "id": "F-044",
+  "sev": "中",
+  "loc": "src/backend/server/webdav.ts:398（另见编号：F-056）",
+  "title": "WebDAV PUT 将整个请求体无上限地读入内存，缺少 /fs/put 与 /s3 PUT 同款的大小限制保护",
+  "status": "已修复"
+ },
+ {
+  "id": "F-045",
+  "sev": "中",
+  "loc": "src/backend/server/middlewares.ts:277-291",
+  "title": "revokeToken 对共享黑名单键做无锁 read-modify-write，并发注销会互相覆盖、静默丢失注销记录",
+  "status": "已修复"
+ },
+ {
+  "id": "F-053",
+  "sev": "中",
+  "loc": "src/backend/pkg/crypto.ts:353",
+  "title": "aesCbcEncryptBase64 在 Cloudflare Workers 上产生双重 PKCS#7 填充的密文，导致 chaoxing 驱动登录凭证被破坏",
+  "status": "已修复"
+ },
+ {
+  "id": "F-054",
+  "sev": "中",
+  "loc": "src/backend/pkg/totp.ts:8",
+  "title": "totp.ts 依赖 Node 专有的 otplib（crypto.createHmac/randomBytes）与 qrcode，在阿里云 ESA 边缘构建下 2FA 完全不可用：开启 2FA 抛 500，已开启 2F",
+  "status": "已修复"
+ },
+ {
+  "id": "F-062",
+  "sev": "中",
+  "loc": "src/backend/pkg/meta.ts:116",
+  "title": "canAccess 只校验「最近一条」meta 的 read_users，祖先目录的 read_users 白名单在存在更近 meta 时被端到端绕过",
+  "status": "已修复"
+ },
+ {
+  "id": "F-063",
+  "sev": "中",
+  "loc": "src/backend/pkg/meta.ts:46",
+  "title": "getNearestMeta 用大小写敏感的 === 匹配 meta 路径，而同文件的 metaCoversPath 及 sign.ts 全链路都是大小写不敏感的，meta 密码/read_users 在大小写不一致的请",
+  "status": "已修复"
+ },
+ {
+  "id": "F-070",
+  "sev": "中",
+  "loc": "src/backend/internal/model/db.ts:2331-2342（另见编号：F-071）",
+  "title": "saveDb 在解析存储后端之前就修改 memoryDb 与请求缓存，而后端解析/健康检查抛错发生在 try 之外、无回滚，失败的写入在内存中生效",
+  "status": "已修复"
+ },
+ {
+  "id": "F-072",
+  "sev": "中",
+  "loc": "src/backend/internal/model/audit.ts:158-175",
+  "title": "persistAuditLogToKV 把任何读取/解析失败当作「首次写入」，用单条日志覆盖全部既有审计历史；且整体读-改-写无锁，并发写互相丢失",
+  "status": "已修复"
+ },
+ {
+  "id": "F-073",
+  "sev": "中",
+  "loc": "src/backend/internal/model/audit.ts:113（另见编号：F-002）",
+  "title": "审计日志的 KV 持久化只写不读：loadAuditLogsFromKV 全仓库无调用者，查询/统计/清理接口只能看到当前 isolate 的模块级内存数组，重启或换 isolate 后审计记录全部「消失」",
+  "status": "已修复"
+ },
+ {
+  "id": "F-077",
+  "sev": "中",
+  "loc": "src/backend/internal/model/store/backend.ts:170",
+  "title": "isServerlessRuntime 把 index.ts 对所有请求无条件注入的 __requestOrigin 当作 serverless 证据，导致自托管 Node 上内存回退与 DB_DRIVER=memory",
+  "status": "已修复"
+ },
+ {
+  "id": "F-078",
+  "sev": "中",
+  "loc": "src/backend/internal/model/store/backend.ts:903（另见编号：F-038）",
+  "title": "isPersistentStatus 依赖 health 结果里的 available:false，但 d1/do/mysql/cfkv 四个驱动的 health() 从不返回该字段，导致 SQL 后端不健康时被判定为「",
+  "status": "已修复"
+ },
+ {
+  "id": "F-079",
+  "sev": "中",
+  "loc": "src/backend/internal/model/store/json.ts:49-68",
+  "title": "installRespSafetyNet 注册 uncaughtException 监听后，Node 对所有未捕获异常的默认崩溃行为被整体禁用，非匹配错误被静默吞掉（连日志都没有），与注释「let Node.js def",
+  "status": "已修复"
+ },
+ {
+  "id": "F-080",
+  "sev": "中",
+  "loc": "src/backend/internal/model/store/json.ts:494-525",
+  "title": "getKvStatus 恒报 connected:true：readFromKv 把所有读错误吞成 null，getKvStatus 的 catch 是死代码，401/网络故障时诊断接口误报 KV 已连接",
+  "status": "已修复"
+ },
+ {
+  "id": "F-081",
+  "sev": "中",
+  "loc": "src/backend/internal/model/store/backend.ts:751",
+  "title": "getStorageBackend 的模块级缓存键包含 per-request 的 env 身份，生产环境（每请求新 env 对象）下缓存永不命中，每请求重新解析驱动并重新探测——KV 代理模式等于每个 API 请求多一",
+  "status": "已修复"
+ },
+ {
+  "id": "F-085",
+  "sev": "中",
+  "loc": "src/backend/internal/model/store/driver/blob.ts:190",
+  "title": "ESA Blob 的 health() 用 head(\"__health_check__\") 探测一个全仓库从未写入过的键，head 的 not-found 异常没有处理，ESA 部署的健康检查结果不可信（误报不可用 →",
+  "status": "已修复"
+ },
+ {
+  "id": "F-088",
+  "sev": "中",
+  "loc": "src/backend/internal/model/store/driver/kv.ts:335",
+  "title": "isSignatureError 用消息内容正则 /not a function|invalid|unexpected|argument/i 猜测「签名错误」，真实存储故障（消息恰好含这些词）会被误判并可能被吞成 nul",
+  "status": "已修复"
+ },
+ {
+  "id": "F-092",
+  "sev": "中",
+  "loc": "src/backend/internal/op/search.ts:112",
+  "title": "search.ts 用 `isDir && !item.sign` 识别挂载点，但多数主流驱动对真实目录也返回空 sign，导致这些驱动下所有真实文件夹被从搜索结果中剔除",
+  "status": "已修复"
+ },
+ {
+  "id": "F-097",
+  "sev": "中",
+  "loc": "src/backend/internal/seed/codec.ts:338",
+  "title": "encodeCas/decodeCas 使用裸 Node Buffer 全局（未 import），在无 Node compat 的边缘构建（ESA 浏览器构建）上必然 ReferenceError",
+  "status": "已修复"
+ },
+ {
+  "id": "F-098",
+  "sev": "中",
+  "loc": "src/backend/internal/seed/codec.ts:410",
+  "title": "decodeCas 多文件分支硬编码 piece_size 为 DEFAULT_PIECE_SIZE，非 10 MiB 分片大小的种子 encodeCas→decodeCas 往返直接抛错",
+  "status": "已修复"
+ },
+ {
+  "id": "F-099",
+  "sev": "中",
+  "loc": "src/backend/internal/seed/codec.ts:473",
+  "title": "encodeTorrent 在种子缺少 SHA-1 分片哈希时静默产出 0 分片的非法 torrent，其自身 decodeTorrent 都拒收",
+  "status": "已修复"
+ },
+ {
+  "id": "F-100",
+  "sev": "中",
+  "loc": "src/backend/internal/seed/codec.ts:24",
+  "title": "fatal TextDecoder 使非 UTF-8（GBK/Big5）文件名的种子完全无法导入，且抛出的是原始 TypeError 而非领域错误",
+  "status": "已修复"
+ },
+ {
+  "id": "F-104",
+  "sev": "中",
+  "loc": "src/backend/internal/cache/store.ts:394",
+  "title": "缓存键只含 storageId 不含存储修订号，叠加管理端 storage id 复用（max+1）与「先清后写」竞态，可让新存储/新凭据命中旧存储的缓存内容",
+  "status": "已修复"
+ },
+ {
+  "id": "F-108",
+  "sev": "中",
+  "loc": "src/backend/internal/driver/sort.ts:22-33（alsoIn：F-344、F-170、F-369、F-197、F-134）",
+  "title": "order_by 键匹配启发式漏掉驱动表单真实提供的键值（updated_at/update_at/file_id/file_type），这些键全部静默回退为按文件名重排，覆盖掉驱动 API 已返回的排序",
+  "status": "已修复"
+ },
+ {
+  "id": "F-114",
+  "sev": "中",
+  "loc": "src/backend/internal/upload/multipart.ts:190（alsoIn：F-012）",
+  "title": "pruneSessions 在生产代码中从未被调用，分片会话 Map 只增不减；MAX_TOTAL_CHUNKS / MAX_UPLOAD_BYTES 两个防 DoS 常量同样零引用，注释声称的加固并未接线",
+  "status": "已修复"
+ },
+ {
+  "id": "F-120",
+  "sev": "中",
+  "loc": "vercel.json:20-23",
+  "title": "SPA 兜底改写吞掉 /dav 与 /s3（以及裸 /api），WebDAV / S3 网关在 Vercel 上完全不可达",
+  "status": "已修复"
+ },
+ {
+  "id": "F-121",
+  "sev": "中",
+  "loc": "functions/_kv-proxy.js:168-198",
+  "title": "边缘 KV 代理鉴权跳过 token epoch（M-3 改密失效）与 jti 注销名单校验，旧管理员凭据在 /kv-* 上最长 7 天内仍可全量读写 KV",
+  "status": "已修复"
+ },
+ {
+  "id": "F-122",
+  "sev": "中",
+  "loc": "edgeone.json:61-70",
+  "title": "EdgeOne 定时调度 payload 固定为 {\"cron_secret\": \"\"}，永远无法通过 matchCronSecret，token-refresh 调度必然 401",
+  "status": "已修复"
+ },
+ {
+  "id": "F-123",
+  "sev": "中",
+  "loc": "functions/_kv-proxy.js:57-60",
+  "title": "Edge Function 侧与 Node 侧对 JWT_SECRET 的长度要求不一致（>=16 vs 仅非空），JWT_SECRET 为 1-15 字符时 EdgeOne Node 云函数的 KV 代理永久 401",
+  "status": "已修复"
+ },
+ {
+  "id": "F-124",
+  "sev": "中",
+  "loc": "scripts/build-edge.mjs:73-75",
+  "title": "build-edge.mjs 的 empty-node-driver 插件把 sftp/ftp 驱动替换为抛错桩，同时打进了 Node 运行时产物（dist-server 与 EdgeOne Node 云函数），SFTP",
+  "status": "已修复"
+ },
+ {
+  "id": "F-125",
+  "sev": "中",
+  "loc": "esa-entry.ts:141-147",
+  "title": "esa-entry.ts 的 KV get 失败时把 null 写入 60 秒跨请求模块级缓存，瞬时故障被放大成整个 isolate 60 秒的「数据不存在」",
+  "status": "已修复"
+ },
+ {
+  "id": "F-128",
+  "sev": "中",
+  "loc": "scripts/fetch-frontend.mjs:584",
+  "title": "tarBin() 返回带引号的路径被直接传给无 shell 的 execFileSync，Windows 上 i18n 语言包解包必然 ENOENT，源码构建中断",
+  "status": "已修复"
+ },
+ {
+  "id": "F-129",
+  "sev": "中",
+  "loc": "scripts/fetch-frontend.mjs:623",
+  "title": "buildLocalRepo 用无 shell 的 execFileSync 执行 npm/npx，Windows 上 npm/npx 是 .cmd shim（ENOENT/EINVAL），整个源码构建路径在 Windo",
+  "status": "已修复"
+ },
+ {
+  "id": "F-130",
+  "sev": "中",
+  "loc": "scripts/fetch-frontend.mjs:329",
+  "title": "replaceDist 先 rmSync(DEST) 再 cpSync(src→DEST)，当 FRONTEND_DIST 指向仓库自身 dist 目录时源目录先被删除，构建失败且缓存产物丢失",
+  "status": "已修复"
+ },
+ {
+  "id": "F-135",
+  "sev": "中",
+  "loc": "src/backend/drivers/189/util.ts:78",
+  "title": "parseJsonPreservingIds 只保护字面键 \"id\"，initMultiUpload 响应的数字型 uploadFileId 超过 2^53 时精度丢失，后续分片/提交请求携带错误 ID",
+  "status": "已修复"
+ },
+ {
+  "id": "F-136",
+  "sev": "中",
+  "loc": "src/backend/drivers/189/driver.ts:190",
+  "title": "pathIdCache 在 rename/remove/move 后永不失效，而驱动实例被 storage 层跨请求缓存，旧\"路径→ID\"映射跨请求持续生效并指向错误/已删除目录",
+  "status": "已修复"
+ },
+ {
+  "id": "F-137",
+  "sev": "中",
+  "loc": "src/backend/drivers/189/driver.ts:104",
+  "title": "跨请求共享的驱动实例上，每个操作开头 `this.budget.used = 0` 相互清零，并发请求的子请求预算统计失效，可触发 Workers \"Too many subrequests\" 硬错误",
+  "status": "已修复"
+ },
+ {
+  "id": "F-141",
+  "sev": "中",
+  "loc": "src/backend/drivers/139/util.ts:15",
+  "title": "encodeURIComponentCustom 对 !'()* 的转义方向与参考实现相反，导致含这些字符的请求体签名错误",
+  "status": "已修复"
+ },
+ {
+  "id": "F-142",
+  "sev": "中",
+  "loc": "src/backend/drivers/139/util.ts:626",
+  "title": "legacy getDisk 一次性请求 startNumber:1/endNumber:5000 且从不分页，大目录内容被静默截断",
+  "status": "已修复"
+ },
+ {
+  "id": "F-143",
+  "sev": "中",
+  "loc": "src/backend/drivers/139/util.ts:752",
+  "title": "legacy 模式重命名文件时把文件的 contentID 当 catalogID 发给目录改名接口 updateCatalogInfo，文件重命名必然失败",
+  "status": "已修复"
+ },
+ {
+  "id": "F-144",
+  "sev": "中",
+  "loc": "src/backend/drivers/139/util.ts:182",
+  "title": "每次请求前都 await 的令牌刷新没有任何并发去重/加锁，缓存共享的 driver 实例在并发请求下会触发多次 refreshToken 并乱序持久化",
+  "status": "已修复"
+ },
+ {
+  "id": "F-149",
+  "sev": "中",
+  "loc": "src/backend/drivers/s3/util.ts:119、190（配合 src/backend/drivers/s3/driver.ts:275-287、308-328）",
+  "title": "S3 目录 marker（以 / 结尾的零字节 key）在解析层被整体丢弃，导致删除这类目录时报成功但目录仍然存在，rename/move/copy 目录时丢失空的子目录",
+  "status": "已修复"
+ },
+ {
+  "id": "F-150",
+  "sev": "中",
+  "loc": "src/backend/drivers/s3/util.ts:712-721",
+  "title": "getLink() 的 custom_host 非预签名分支用裸字符串拼接生成 raw_url，key 未做任何 URL 编码",
+  "status": "已修复"
+ },
+ {
+  "id": "F-154",
+  "sev": "中",
+  "loc": "src/backend/drivers/s3/driver.ts:151-155",
+  "title": "list() 在列表热路径上为每个文件串行做一次 SigV4 预签名（每次约 6 次 crypto.subtle），大目录在 Workers CPU 限额下可能超限",
+  "status": "已修复"
+ },
+ {
+  "id": "F-156",
+  "sev": "中",
+  "loc": "src/backend/drivers/lanzou/driver.ts:59",
+  "title": "pathIdCache 只写不清，配合长生命周期的 driver 缓存，删除文件夹后同名重建会解析到已删除的旧 fol_id",
+  "status": "已修复"
+ },
+ {
+  "id": "F-157",
+  "sev": "中",
+  "loc": "src/backend/drivers/lanzou/driver.ts:391-393",
+  "title": "move() 把虚拟路径 dstDir 当物理路径解析，非根挂载/非根用户 base_path 下移动文件必然失败或移入错误文件夹",
+  "status": "已修复"
+ },
+ {
+  "id": "F-158",
+  "sev": "中",
+  "loc": "src/backend/drivers/lanzou/util.ts:753",
+  "title": "由远端页面/响应内容决定的请求目标（探测域名、iframeFullUrl、resp.dom 构造的 ajax.php）未做 SSRF 校验就 fetch，与同函数内 302 location 走 safeRedirect",
+  "status": "已修复"
+ },
+ {
+  "id": "F-159",
+  "sev": "中",
+  "loc": "src/backend/drivers/lanzou/util.ts:464-469",
+  "title": "doupload 在 account 模式下对 zt=9 无限递归重登，无重试上限",
+  "status": "已修复"
+ },
+ {
+  "id": "F-160",
+  "sev": "中",
+  "loc": "src/backend/drivers/lanzou/help.ts:95-132",
+  "title": "removeJSComment（及 removeNotes 对协议相对 URL 的处理）不识别字符串字面量，把页面里 https:// 或 //开头的 URL 当注释删除断，破坏后续 iframe/fn 链接提取",
+  "status": "已修复"
+ },
+ {
+  "id": "F-167",
+  "sev": "中",
+  "loc": "src/backend/drivers/weiyun/driver.ts:594",
+  "title": "put() 上传循环不按协议处理 upload_state=3（该通道无剩余分片），继续用自增 offset 硬灌数据，且从不校验上传完成",
+  "status": "已修复"
+ },
+ {
+  "id": "F-168",
+  "sev": "中",
+  "loc": "src/backend/drivers/weiyun/util.ts:367",
+  "title": "403 重试仍使用 URL 里旧的 g_tk，刷新后的 wyctoken 被写进无人读取的 headers[\"g_tk\"]",
+  "status": "已修复"
+ },
+ {
+  "id": "F-169",
+  "sev": "中",
+  "loc": "src/backend/drivers/weiyun/driver.ts:116",
+  "title": "pathFolderCache 只增不减、rename/remove/move 后不失效，而驱动实例按 isolate 跨请求缓存——导致陈旧路径解析出幽灵目录及无界内存增长",
+  "status": "已修复"
+ },
+ {
+  "id": "F-171",
+  "sev": "中",
+  "loc": "src/backend/drivers/weiyun/driver.ts:223",
+  "title": "resolveFolder/resolveFile 单页拉 500 条、无分页循环，超过 500 条目的目录中第 500 条之后的内容对 get/rename/remove/move/上传定位不可见",
+  "status": "已修复"
+ },
+ {
+  "id": "F-178",
+  "sev": "中",
+  "loc": "src/backend/drivers/proton_drive/crypto.ts:186",
+  "title": "decryptXAttrSize 永远返回 0：把 armored PGP 文本当 base64 解码、把 JSON 明文当 protobuf 解析",
+  "status": "已修复"
+ },
+ {
+  "id": "F-179",
+  "sev": "中",
+  "loc": "src/backend/drivers/proton_drive/crypto.ts:132",
+  "title": "名称哈希算法错误：官方是 hex(HMAC-SHA256(name, 父目录 NodeHashKey))，本实现是 base64(SHA256(name)) 且完全没有密钥",
+  "status": "已修复"
+ },
+ {
+  "id": "F-180",
+  "sev": "中",
+  "loc": "src/backend/drivers/proton_drive/driver.ts:424",
+  "title": "mkdir 请求体缺少必需的 NodeHashKey 字段，且 NodePassphraseSignature 恒为空串",
+  "status": "已修复"
+ },
+ {
+  "id": "F-181",
+  "sev": "中",
+  "loc": "src/backend/drivers/proton_drive/driver.ts:405",
+  "title": "写操作（mkdir/rename/remove）从不失效驱动内缓存，而驱动实例又被 driverCache 长期缓存，导致写后读陈旧",
+  "status": "已修复"
+ },
+ {
+  "id": "F-182",
+  "sev": "中",
+  "loc": "src/backend/drivers/proton_drive/driver.ts:367",
+  "title": "createReadStream 对 Range 请求仍从第 0 块开始下载并解密全部块，且一次 pull 把整个文件 enqueue 进流队列（无背压）",
+  "status": "已修复"
+ },
+ {
+  "id": "F-183",
+  "sev": "中",
+  "loc": "src/backend/drivers/proton_drive/util.ts:150",
+  "title": "2FA 二阶段请求缺少 X-Pm-Uid 会话头，2FA 账号即使验证码正确也无法完成登录",
+  "status": "已修复"
+ },
+ {
+  "id": "F-187",
+  "sev": "中",
+  "loc": "src/backend/drivers/r2/driver.ts:201",
+  "title": "api 模式的直传（s3_presigned）被前端宣告可用，但实际调用永远抛 \"Direct upload is not enabled\"——S3 回退实例缺少 enable_direct_upload 标志",
+  "status": "已修复"
+ },
+ {
+  "id": "F-188",
+  "sev": "中",
+  "loc": "src/backend/drivers/r2/driver.ts:334",
+  "title": "binding 模式 + custom_host 的直链完全不编码对象 key，文件名含 #、?、% 等字符时直链必坏",
+  "status": "已修复"
+ },
+ {
+  "id": "F-189",
+  "sev": "中",
+  "loc": "src/backend/drivers/r2/driver.ts:549（unit: drv-r2）",
+  "title": "binding 模式 copy/rename/move 把整个对象读进内存再 put（arrayBuffer 全量缓冲），大文件必触发 Workers 128MB 内存上限",
+  "status": "已修复"
+ },
+ {
+  "id": "F-193",
+  "sev": "中",
+  "loc": "src/backend/drivers/123pan/driver.ts:80（unit: drv-123pan）",
+  "title": "subrequest 预算对象是缓存驱动实例上的可变共享状态，并发请求交错 reset/累加会击穿 Cloudflare 50 次子请求上限或造成错误截断",
+  "status": "已修复"
+ },
+ {
+  "id": "F-194",
+  "sev": "中",
+  "loc": "src/backend/drivers/123pan/util.ts:129（unit: drv-123pan）",
+  "title": "signPath 的签名成分与参考实现不一致：timestamp 被加了 8 小时（未来时间），CST 小时未做 mod 24 且日期不随 UTC+8 滚动，每天 8 小时时段生成错误的 timeSign",
+  "status": "已修复"
+ },
+ {
+  "id": "F-195",
+  "sev": "中",
+  "loc": "src/backend/server/fs.ts:1915（unit: drv-123pan）",
+  "title": "分片上传 complete 接口不校验分片是否收齐即通知驱动完成上传，缺片文件会被标记为成功（根源在范围外的 fs.ts）",
+  "status": "已修复"
+ },
+ {
+  "id": "F-201",
+  "sev": "中",
+  "loc": "src/backend/drivers/github/util.ts:195（unit: drv-github）",
+  "title": "getContentApiUrl/getContents 未对路径做百分号编码，文件名含 #、?、% 时会请求到错误的对象或 404（可静默返回错文件内容）",
+  "status": "已修复"
+ },
+ {
+  "id": "F-202",
+  "sev": "中",
+  "loc": "src/backend/drivers/github/driver.ts:491（unit: drv-github）",
+  "title": "move/copy 用字符串前缀 startsWith 判断父子关系而非路径段前缀，合法操作被误拒、move 被误路由后深层报错",
+  "status": "已修复"
+ },
+ {
+  "id": "F-203",
+  "sev": "中",
+  "loc": "src/backend/drivers/github/driver.ts:43（unit: drv-github）",
+  "title": "私有仓库文件 download_url 为 null，raw_url 落空后整条下载链路直接 404，无任何基于 token 的回退",
+  "status": "已修复"
+ },
+ {
+  "id": "F-204",
+  "sev": "中",
+  "loc": "src/backend/drivers/github/driver.ts:106（unit: drv-github）",
+  "title": "空仓库上驱动完全不可用：getBranchHead 404 使 isOnBranch=false 拦掉所有写操作，getContents 404 拦掉所有读操作，且报错误导",
+  "status": "已修复"
+ },
+ {
+  "id": "F-215",
+  "sev": "中",
+  "loc": "src/backend/drivers/wopan/util.ts:183（unit: drv-wopan）",
+  "title": "request() 响应解密失败被吞掉，把原始密文当数据返回，列表/元数据静默变空而非报错",
+  "status": "已修复"
+ },
+ {
+  "id": "F-216",
+  "sev": "中",
+  "loc": "src/backend/drivers/wopan/util.ts:302（unit: drv-wopan）",
+  "title": "access_token 短于 16 字符时既不报错也不刷新，静默用非法长度 AES 密钥加密请求，服务器永远无法解密",
+  "status": "已修复"
+ },
+ {
+  "id": "F-222",
+  "sev": "中",
+  "loc": "src/backend/drivers/guangyapan/driver.ts:170（unit: drv-guangyapan）",
+  "title": "resolveId/resolveItemId/get 每层只扫描第一页列表，page_size 之外真实存在的文件/文件夹对 get、rename、remove、move、copy、嵌套 mkdir 全部报 not f",
+  "status": "已修复"
+ },
+ {
+  "id": "F-223",
+  "sev": "中",
+  "loc": "src/backend/drivers/guangyapan/driver.ts:385（unit: drv-guangyapan）",
+  "title": "OSS 上传 URL 中的 objectPath 完全未做 URL 编码，文件名含 # 或 ? 时请求路径被截断，而签名却按完整路径计算，上传必然 403 或写入错误 key",
+  "status": "已修复"
+ },
+ {
+  "id": "F-230",
+  "sev": "中",
+  "loc": "src/backend/drivers/ctfile/driver.ts:239-245（unit: drv-ctfile）",
+  "title": "get() 获取直链失败时抛异常，违背框架「设置 raw_url_error 并返回条目」的契约，把本应 404+原因的响应变成 500",
+  "status": "已修复"
+ },
+ {
+  "id": "F-231",
+  "sev": "中",
+  "loc": "src/backend/drivers/ctfile/util.ts:411（unit: drv-ctfile）",
+  "title": "上传链路对全量内容同步跑纯 JS MD5（实测 28.4 MB/s），叠加三份全量内存拷贝，Workers 上大文件上传超 CPU/内存预算",
+  "status": "已修复"
+ },
+ {
+  "id": "F-237",
+  "sev": "中",
+  "loc": "src/backend/drivers/webdav/util.ts:231（unit: drv-webdav）",
+  "title": "Digest 认证不处理 MD5/MD5-SESS 以外的算法，对 SHA-256 挑战用空 ha1 的 MD5 作答，必然 401",
+  "status": "已修复"
+ },
+ {
+  "id": "F-238",
+  "sev": "中",
+  "loc": "src/backend/drivers/webdav/util.ts:196（unit: drv-webdav）",
+  "title": "Digest 挑战解析按逗号朴素切分并区分大小写，带逗号的 realm/qop 与 auth-int 均产生错误凭据",
+  "status": "已修复"
+ },
+ {
+  "id": "F-239",
+  "sev": "中",
+  "loc": "src/backend/drivers/webdav/util.ts:108（unit: drv-webdav）",
+  "title": "PROPFIND 解析器不对 XML 实体解码，含 &、< 等字符的文件名被原样带出并污染后续路径操作",
+  "status": "已修复"
+ },
+ {
+  "id": "F-244",
+  "sev": "中",
+  "loc": "src/backend/drivers/mopan/util.ts:145（unit: drv-mopan）",
+  "title": "401 自动重登录无递归防护：登录接口自身返回 code 401 时 performLogin 无限递归；并发 401 也会各自触发重复登录",
+  "status": "已修复"
+ },
+ {
+  "id": "F-245",
+  "sev": "中",
+  "loc": "src/backend/drivers/mopan/driver.ts:415（unit: drv-mopan）",
+  "title": "分片上传的 PUT 响应完全不检查，分片失败被静默忽略后照常提交，可能产生损坏文件或难以定位的 commit 错误",
+  "status": "已修复"
+ },
+ {
+  "id": "F-246",
+  "sev": "中",
+  "loc": "src/backend/drivers/mopan/driver.ts:170（unit: drv-mopan）",
+  "title": "queryFiles 从不传 pageSize，而 list() 硬编码\"每页 100 条\"作为翻页终止条件，页大小不符时目录列表被静默截断",
+  "status": "已修复"
+ },
+ {
+  "id": "F-247",
+  "sev": "中",
+  "loc": "src/backend/drivers/mopan/driver.ts:201（unit: drv-mopan）",
+  "title": "get() 与 resolveFolderId() 只搜父目录第一页，超过一页的目录里靠后的文件/子目录一律报 not found",
+  "status": "已修复"
+ },
+ {
+  "id": "F-248",
+  "sev": "中",
+  "loc": "src/backend/drivers/mopan/driver.ts:105（unit: drv-mopan）",
+  "title": "onAuthUpdate 持久化的 token 从未被驱动读回，每次构建驱动都强制完整账密/短信重新登录",
+  "status": "已修复"
+ },
+ {
+  "id": "F-255",
+  "sev": "中",
+  "loc": "src/backend/drivers/pikpak/util.ts:472（unit: drv-pikpak）",
+  "title": "并发请求同时触发 token 刷新时无 singleflight/互斥保护，refresh_token 轮换会导致刷新竞态失败",
+  "status": "已修复"
+ },
+ {
+  "id": "F-256",
+  "sev": "中",
+  "loc": "src/backend/drivers/pikpak/driver.ts:269（unit: drv-pikpak）",
+  "title": "remove/move/copy 在父目录中找不到目标项时静默 return，调用方与用户看到的是成功",
+  "status": "已修复"
+ },
+ {
+  "id": "F-265",
+  "sev": "中",
+  "loc": "src/backend/drivers/ftp/ftp-client.ts:131（unit: drv-ftp）",
+  "title": "Unix 风格列表中不带年份的日期（ls 对近 6 个月文件的默认格式，即最常见情况）被解析成 2001 年",
+  "status": "已修复"
+ },
+ {
+  "id": "F-266",
+  "sev": "中",
+  "loc": "src/backend/drivers/ftp/ftp-client.ts:371-374（unit: drv-ftp）",
+  "title": "cwd_list 模式下 CWD 响应码未检查，CWD 失败后静默列出当前所在（错误）目录的内容",
+  "status": "已修复"
+ },
+ {
+  "id": "F-273",
+  "sev": "中",
+  "loc": "src/backend/drivers/115open/driver.ts:184（unit: drv-115open）",
+  "title": "resolveFolderId 快速路径构造的 fullPath 是错的：root_id=\"0\" 时产生双斜杠路径（\"//target\"），root_id≠\"0\" 时前缀了数字 ID 而非 Go 上游的目录名路径；ini",
+  "status": "已修复"
+ },
+ {
+  "id": "F-274",
+  "sev": "中",
+  "loc": "src/backend/drivers/115open/util.ts:115（unit: drv-115open）",
+  "title": "refreshToken 无 singleflight/互斥，而驱动实例被 driverCache 全局缓存并与并发请求共享：并发 401 会同时用同一个旧 refresh_token 发起两次刷新，在 refresh_",
+  "status": "已修复"
+ },
+ {
+  "id": "F-275",
+  "sev": "中",
+  "loc": "src/backend/drivers/115open/util.ts:79（unit: drv-115open）",
+  "title": "fetchWithRetry 对所有请求（包括 mkdir/delFile/move/copy 等非幂等 POST）在网络错误/20 秒超时后无差别重试 3 次，服务端已执行但响应丢失时会造成重复副作用",
+  "status": "已修复"
+ },
+ {
+  "id": "F-280",
+  "sev": "中",
+  "loc": "src/backend/drivers/thunder/driver.ts:139-148（unit: drv-thunder）",
+  "title": "持久化的 refresh_token/captcha_token 从未被回灌到客户端，非 expert 驱动每次冷启动都做全量用户名密码登录",
+  "status": "已修复"
+ },
+ {
+  "id": "F-281",
+  "sev": "中",
+  "loc": "src/backend/drivers/thunder/util.ts:410-426（unit: drv-thunder）",
+  "title": "refreshToken 不校验 OAuth 错误响应即覆盖 tokenResp 并持久化，并发刷新竞态会把共享驱动实例整体毒化",
+  "status": "已修复"
+ },
+ {
+  "id": "F-282",
+  "sev": "中",
+  "loc": "src/backend/drivers/thunder/util.ts:304-328（unit: drv-thunder）",
+  "title": "authRequest 对错误码 9/10/16/4121/4122 的重试没有次数上限，持续错误时无限递归",
+  "status": "已修复"
+ },
+ {
+  "id": "F-283",
+  "sev": "中",
+  "loc": "src/backend/drivers/thunder/util.ts:257-278（unit: drv-thunder）",
+  "title": "rawRequest 在响应体是合法 JSON 时完全不检查 HTTP 状态码，非 2xx 的未知错误体会被当作成功数据处理",
+  "status": "已修复"
+ },
+ {
+  "id": "F-284",
+  "sev": "中",
+  "loc": "src/backend/drivers/thunder/util.ts:371-408（unit: drv-thunder）",
+  "title": "coreLogin/login 不校验响应，登录失败被吞掉并以误导性的 \"empty token\" 在后续操作中才暴露",
+  "status": "已修复"
+ },
+ {
+  "id": "F-290",
+  "sev": "中",
+  "loc": "src/backend/drivers/189_tv/util.ts:601（unit: drv-189_tv）",
+  "title": "家庭云上传提交（commit）把 UploadFileId/FamilyId/ResumePolicy 放在 query 参数里，而 Go 原版与本项目自己的 PUT 步骤都是放请求头",
+  "status": "已修复"
+ },
+ {
+  "id": "F-291",
+  "sev": "中",
+  "loc": "src/backend/drivers/189_tv/driver.ts:242（unit: drv-189_tv）",
+  "title": "配置项 root_folder_id 声明后从未被读取，根目录被硬编码为 -11（个人云）/\"\"（家庭云）",
+  "status": "已修复"
+ },
+ {
+  "id": "F-292",
+  "sev": "中",
+  "loc": "src/backend/drivers/189_tv/util.ts:73（unit: drv-189_tv）",
+  "title": "parseJsonPreservingIds 只保护键名恰为 \"id\" 的整数，uploadFileId（int64）仍以 JS number 解析，超过 2^53 时精度损坏",
+  "status": "已修复"
+ },
+ {
+  "id": "F-294",
+  "sev": "中",
+  "loc": "src/backend/drivers/189_tv/util.ts:419（unit: drv-189_tv）",
+  "title": "waitBatchTask 最多轮询 20×300ms≈6 秒就抛「批量任务超时」，而服务端批量任务仍在继续执行",
+  "status": "已修复"
+ },
+ {
+  "id": "F-295",
+  "sev": "中",
+  "loc": "src/backend/drivers/189_tv/util.ts:530（unit: drv-189_tv）",
+  "title": "put() 在 Worker 内对完整文件做两次全量拷贝并用纯 JS CryptoJS 计算 MD5，内存与 CPU 都可能超限",
+  "status": "已修复"
+ },
+ {
+  "id": "F-298",
+  "sev": "中",
+  "loc": "src/backend/drivers/baidu_photo/driver.ts:195（unit: drv-baidu_photo）",
+  "title": "mkdir 的空路径守卫方向写反，任何真实的创建相册请求都必然抛异常，且硬编码 \"new_album\" 无视调用方传入的名字",
+  "status": "已修复"
+ },
+ {
+  "id": "F-299",
+  "sev": "中",
+  "loc": "src/backend/drivers/baidu_photo/util.ts:103（unit: drv-baidu_photo）",
+  "title": "requestJson 不检查 HTTP 状态码且吞掉 JSON 解析异常，非 JSON 错误响应（网关 5xx HTML/WAF 页）被当作成功 `{}` 返回，写操作可能静默假成功",
+  "status": "已修复"
+ },
+ {
+  "id": "F-300",
+  "sev": "中",
+  "loc": "src/backend/drivers/baidu_photo/driver.ts:67（unit: drv-baidu_photo）",
+  "title": "相册 tid 是 18 位 int64（约 3.2e18），代码全程用 JS number 承载并在 parseSign 中 Number() 转换，精度丢失后所有相册写操作发送的都是被舍入的错误 tid",
+  "status": "已修复"
+ },
+ {
+  "id": "F-306",
+  "sev": "中",
+  "loc": "src/backend/drivers/github_releases/util.ts:110-132（unit: drv-github_releases）",
+  "title": "设置非默认 root_folder_path 后整个驱动失灵：挂载点匹配用的 physicalPath 被通用层拼入了 root 前缀，驱动从不剥离，导致列表恒为空、存储根被当成文件",
+  "status": "已修复"
+ },
+ {
+  "id": "F-307",
+  "sev": "中",
+  "loc": "src/backend/drivers/github_releases/util.ts:193-211（unit: drv-github_releases）",
+  "title": "readmeFiles 不过滤目录条目，把 GitHub /contents 返回的目录（download_url=null）当文件列出；过滤规则也比 Go 版显著过宽",
+  "status": "已修复"
+ },
+ {
+  "id": "F-312",
+  "sev": "中",
+  "loc": "src/backend/drivers/onedrive/driver.ts:134（unit: drv-onedrive）",
+  "title": "getMetaUrl 对路径段做 decodeURIComponent 二次解码，字面文件名含 %XX 序列时 URL 指向错误对象；而 list/get 用的 buildUrl 不解码，行为不一致",
+  "status": "已修复"
+ },
+ {
+  "id": "F-313",
+  "sev": "中",
+  "loc": "src/backend/drivers/onedrive/driver.ts:92（unit: drv-onedrive）",
+  "title": "chunk_size 只校验 ≥1，未对齐微软要求的 320 KiB 倍数；chunk_size 为 1/2/3/4/6/7/8/9 MiB 等配置时大文件上传会在提交阶段报错",
+  "status": "已修复"
+ },
+ {
+  "id": "F-314",
+  "sev": "中",
+  "loc": "src/backend/drivers/onedrive/driver.ts:39（unit: drv-onedrive）",
+  "title": "构造函数用 `!!` 强转布尔配置，把字符串 \"false\" 变成 true，随后 init() 专为字符串准备的归一化分支永远不可达",
+  "status": "已修复"
+ },
+ {
+  "id": "F-315",
+  "sev": "中",
+  "loc": "src/backend/drivers/onedrive/util.ts:101（unit: drv-onedrive）",
+  "title": "401 触发的 refreshToken 无 singleflight 互斥：驱动实例跨并发请求共享，token 过期时 N 个并发请求并行刷新并各自持久化，DB 读改写竞态可能把已轮换的旧 token 覆盖回去",
+  "status": "已修复"
+ },
+ {
+  "id": "F-316",
+  "sev": "中",
+  "loc": "src/backend/drivers/onedrive/util.ts:10（unit: drv-onedrive）",
+  "title": "refresh_token（长期凭据）以 GET 查询参数 refresh_ui 明文发往第三方 api.oplist.org，出现在第三方与中间代理的访问日志中",
+  "status": "已修复"
+ },
+ {
+  "id": "F-320",
+  "sev": "中",
+  "loc": "src/backend/drivers/quark/util.ts:294（unit: drv-sftp-quark）",
+  "title": "quark move/copy 请求体缺少上游及所有已知实现都会发送的 action_type / exclude_fids 字段",
+  "status": "已修复"
+ },
+ {
+  "id": "F-321",
+  "sev": "中",
+  "loc": "src/backend/drivers/quark/driver.ts:177（unit: drv-sftp-quark）",
+  "title": "pathFileIdCache 在 rename/remove/move 后永不失效，isolate 存活期内旧路径继续解析到旧 fid",
+  "status": "已修复"
+ },
+ {
+  "id": "F-322",
+  "sev": "中",
+  "loc": "src/backend/drivers/quark/driver.ts:32（unit: drv-sftp-quark）",
+  "title": "夸克刷新的 __puus/__pus cookie 只更新内存，从未持久化（onCookieUpdate 回调无人接线），与上游行为相悖",
+  "status": "已修复"
+ },
+ {
+  "id": "F-329",
+  "sev": "中",
+  "loc": "src/backend/drivers/terabox/util.ts:283-302（unit: drv-wps-terabox）",
+  "title": "TeraBox 全部元数据变更操作（mkdir/rename/remove/move/copy）不检查响应 errno，失败一律报成功",
+  "status": "已修复"
+ },
+ {
+  "id": "F-330",
+  "sev": "中",
+  "loc": "src/backend/drivers/terabox/driver.ts:62-68（unit: drv-wps-terabox）",
+  "title": "list() 除 errno 9000 外吞掉所有错误码，鉴权失效等错误呈现为空目录，且空结果被写入文件树缓存固定下来",
+  "status": "已修复"
+ },
+ {
+  "id": "F-331",
+  "sev": "中",
+  "loc": "src/backend/drivers/terabox/driver.ts:116-136（unit: drv-wps-terabox）",
+  "title": "get() 只扫描父目录第一页（num=1000）且对找不到的路径伪造成功条目返回，不抛 not found",
+  "status": "已修复"
+ },
+ {
+  "id": "F-335",
+  "sev": "中",
+  "loc": "src/backend/drivers/dropbox/driver.ts:174（unit: drv-dropbox-halalcloud_open）",
+  "title": "put() 把含非 ASCII 字符的 JSON 参数直接放进 Dropbox-API-Arg 请求头，fetch 阶段抛 TypeError，任何非 Latin-1 文件名（中文等）的上传必然失败",
+  "status": "已修复"
+ },
+ {
+  "id": "F-336",
+  "sev": "中",
+  "loc": "src/backend/drivers/dropbox/driver.ts:87（unit: drv-dropbox-halalcloud_open）",
+  "title": "get() 把所有异常（path/not_found、令牌刷新失败、网络错误、限流）一律吞掉并返回 is_dir=true 的假目录，404 与临时故障的语义完全丢失",
+  "status": "已修复"
+ },
+ {
+  "id": "F-337",
+  "sev": "中",
+  "loc": "src/backend/drivers/halalcloud_open/driver.ts:89（unit: drv-dropbox-halalcloud_open）",
+  "title": "get() 的 catch 与『列表中找不到目标』共用同一个 is_dir=true 占位目录返回：列父目录失败（token 刷新失败/网络错误/限流）与对象不存在都表现为『该路径是目录』",
+  "status": "已修复"
+ },
+ {
+  "id": "F-338",
+  "sev": "中",
+  "loc": "src/backend/drivers/dropbox/driver.ts:170（unit: drv-dropbox-halalcloud_open）",
+  "title": "put() 单次调用 /2/files/upload，未实现 upload_session 分片上传，超过 150 MiB 的文件上传必然失败",
+  "status": "已修复"
+ },
+ {
+  "id": "F-341",
+  "sev": "中",
+  "loc": "src/backend/drivers/189pc/driver.ts:187（unit: drv-aliyundrive_open-189pc）",
+  "title": "189pc 驱动的方法签名与 StorageDriver 调用约定不匹配，且把虚拟/物理路径字符串直接当作天翼云盘文件 ID 使用，一旦接入所有操作都指向错误的 ID",
+  "status": "已修复"
+ },
+ {
+  "id": "F-342",
+  "sev": "中",
+  "loc": "src/backend/drivers/aliyundrive_open/util.ts:108（unit: drv-aliyundrive_open-189pc）",
+  "title": "aliyundrive_open 无条件把 refresh_token 发给 6 个硬编码第三方中转 API，配置的 use_online_api 开关从未被读取，即使用户配置了自己的 client_id/client_",
+  "status": "已修复"
+ },
+ {
+  "id": "F-343",
+  "sev": "中",
+  "loc": "src/backend/drivers/aliyundrive_open/util.ts:386（unit: drv-aliyundrive_open-189pc）",
+  "title": "putFile 在 create 响应缺少 upload_url 时静默 return，put() 以成功告终但内容从未上传，属于「报告成功的数据丢失」",
+  "status": "已修复"
+ },
+ {
+  "id": "F-345",
+  "sev": "中",
+  "loc": "src/backend/drivers/aliyundrive_open/util.ts:204（unit: drv-aliyundrive_open-189pc）",
+  "title": "token 刷新无并发去重，且轮换后的 refresh_token 只存内存、从不持久化，跨 isolate 必然反复用数据库旧 token 刷新",
+  "status": "已修复"
+ },
+ {
+  "id": "F-347",
+  "sev": "中",
+  "loc": "src/backend/drivers/aliyundrive_open/driver.ts:201（unit: drv-aliyundrive_open-189pc）",
+  "title": "pathFileIdCache 在 rename/remove/move/copy/mkdir 后从不失效，而驱动实例又被 driverCache 跨请求长期缓存，变更后同路径操作会命中已删除/已改名的旧 fileId",
+  "status": "已修复"
+ },
+ {
+  "id": "F-358",
+  "sev": "中",
+  "loc": "src/backend/drivers/seafile/driver.ts:47（unit: drv-google_drive-seafile）",
+  "title": "配置了 repo_id 时加密资料库永远不会被解密，即使已配置 repo_pwd",
+  "status": "已修复"
+ },
+ {
+  "id": "F-359",
+  "sev": "中",
+  "loc": "src/backend/drivers/seafile/driver.ts:218（unit: drv-google_drive-seafile）",
+  "title": "get() 对不存在的路径返回伪造的目录条目（is_dir=true）而不是报错，任何上游错误都被吞成『这是一个目录』",
+  "status": "已修复"
+ },
+ {
+  "id": "F-360",
+  "sev": "中",
+  "loc": "src/backend/drivers/google_drive/util.ts:317（unit: drv-google_drive-seafile）",
+  "title": "chunk_size 配置大于 5MB 时，5MB~chunk_size 之间的文件走 multipart 上传，超出 Drive multipart 接口 5MB 硬限制必然 400",
+  "status": "已修复"
+ },
+ {
+  "id": "F-365",
+  "sev": "中",
+  "loc": "src/backend/drivers/chaoxing/driver.ts:152（unit: drv-chaoxing-mediatrack）",
+  "title": "chaoxing move() 用虚拟目标目录 dstDir 调用按物理路径解析的 pathToId，非根挂载的存储 move 必然失败或移错位置",
+  "status": "已修复"
+ },
+ {
+  "id": "F-366",
+  "sev": "中",
+  "loc": "src/backend/drivers/mediatrack/driver.ts:231-264 (move), 196-197 (rename), 228 (remove)（unit: drv-chaoxing-mediatrack）",
+  "title": "mediatrack idCache 在 move 后完全不失效、rename/remove 只删自身 key，旧路径的陈旧映射会让后续写操作落到已移走/已改名的目录",
+  "status": "已修复"
+ },
+ {
+  "id": "F-367",
+  "sev": "中",
+  "loc": "src/backend/drivers/chaoxing/driver.ts:85-87, 100-110（unit: drv-chaoxing-mediatrack）",
+  "title": "chaoxing get() 用 catch-all 吞掉上游 API 失败，最终返回伪造的 0 字节文件条目而非报错",
+  "status": "已修复"
+ },
+ {
+  "id": "F-368",
+  "sev": "中",
+  "loc": "src/backend/drivers/chaoxing/util.ts:33-41（unit: drv-chaoxing-mediatrack）",
+  "title": "chaoxing cookie 只在为空时登录一次，过期后永不刷新，存储永久不可用直到管理员手动清空 cookie",
+  "status": "已修复"
+ },
+ {
+  "id": "F-371",
+  "sev": "中",
+  "loc": "src/backend/drivers/chaoxing/util.ts:223-225（unit: drv-chaoxing-mediatrack）",
+  "title": "chaoxing upload 的 getUploadConfig 请求不带 Cookie/Referer，与 Go 参考实现（始终带 Cookie）不一致",
+  "status": "已修复"
+ },
+ {
+  "id": "F-378",
+  "sev": "中",
+  "loc": "src/backend/drivers/mega/util.ts:223（unit: drv-mega-autoindex）",
+  "title": "Mega 写操作不检查返回数组内的负数错误码：删除/移动/建目录失败时静默\"成功\"",
+  "status": "已修复"
+ },
+ {
+  "id": "F-379",
+  "sev": "中",
+  "loc": "src/backend/drivers/autoindex/util.ts:133（unit: drv-mega-autoindex）",
+  "title": "parseSize 的 TB/PB 单位换算因 32 位位移溢出完全错误（1<<40 实际等于 256）",
+  "status": "已修复"
+ },
+ {
+  "id": "F-380",
+  "sev": "中",
+  "loc": "src/backend/drivers/autoindex/util.ts:161（unit: drv-mega-autoindex）",
+  "title": "modified_time_format 配置被接受、存储、传参但从未使用；无法解析的时间戳静默伪造成当前时间",
+  "status": "已修复"
+ },
+ {
+  "id": "F-381",
+  "sev": "中",
+  "loc": "src/backend/drivers/autoindex/driver.ts:158（unit: drv-mega-autoindex）",
+  "title": "get() 把所有非根路径一律当作已存在的普通文件返回：目录被报成文件，不存在的路径被伪造为有效条目",
+  "status": "已修复"
+ },
+ {
+  "id": "F-385",
+  "sev": "中",
+  "loc": "src/backend/drivers/netease_music/crypto.ts:66（unit: drv-123_share-netease_music）",
+  "title": "aesCbcEncrypt 的 Workers/WebCrypto 分支双重 PKCS7 padding：手动 pkcs7Pad 后又调用自带 padding 的 WebCrypto AES-CBC",
+  "status": "已修复"
+ },
+ {
+  "id": "F-387",
+  "sev": "中",
+  "loc": "src/backend/drivers/123_share/util.ts:67（unit: drv-123_share-netease_music）",
+  "title": "signPath 用本地时区构造 yyyyMMddHHmm 时间串，而上游钉死 UTC+8，UTC 运行时上 timeSign 永远与服务器期望不一致",
+  "status": "已修复"
+ },
+ {
+  "id": "F-388",
+  "sev": "中",
+  "loc": "src/backend/drivers/123_share/driver.ts:42（unit: drv-123_share-netease_music）",
+  "title": "resolveParentId 逐级查目录时找不到段就静默 break，返回错误的父目录 ID，不存在路径不报错",
+  "status": "已修复"
+ },
+ {
+  "id": "F-395",
+  "sev": "中",
+  "loc": "src/backend/drivers/115/util.ts:100（unit: drv-quark_open-115）",
+  "title": "115 驱动以 JSON body + 旧版 Web API 参数名/端点调用 Open API，与官方 SDK 的 GET+query / form 编码及参数名全面矛盾；写操作与换链失效，过期 token 永不触发刷",
+  "status": "已修复"
+ },
+ {
+  "id": "F-397",
+  "sev": "中",
+  "loc": "src/backend/drivers/quark_open/driver.ts:183",
+  "title": "quark_open 驱动的 rename/remove/move 用只匹配目录的 resolveDirId 解析条目自身路径，导致对文件的改名/删除/移动全部失败",
+  "status": "已修复"
+ },
+ {
+  "id": "F-398",
+  "sev": "中",
+  "loc": "src/backend/drivers/115/util.ts:54",
+  "title": "115 request() 将 HTTP 错误/非 JSON 响应吞成空成功（{}），错误静默变为『空目录/空链接』",
+  "status": "已修复"
+ },
+ {
+  "id": "F-399",
+  "sev": "中",
+  "loc": "src/backend/drivers/115/util.ts:100",
+  "title": "115 getFiles 只取 offset=0、limit=1000 一页，无翻页循环，超过 1000 条的目录被静默截断",
+  "status": "已修复"
+ },
+ {
+  "id": "F-400",
+  "sev": "中",
+  "loc": "src/backend/drivers/quark_open/util.ts:73",
+  "title": "quark_open 秒传的 proof_seed1 依赖的 user_id 永远为空字符串，秒传校验必然失败",
+  "status": "已修复"
+ },
+ {
+  "id": "F-404",
+  "sev": "中",
+  "loc": "src/backend/drivers/bunny_storage/driver.ts:50",
+  "title": "init() 校验 cdn_base_url 后丢弃 normalizeBaseURL 返回值，无协议的 CDN 地址通过校验但每次 get() 都抛 Invalid URL",
+  "status": "已修复"
+ },
+ {
+  "id": "F-405",
+  "sev": "中",
+  "loc": "src/backend/drivers/bunny_storage/util.ts:88",
+  "title": "cdn_token_include_ip 配置项被解析但从未参与签名，开启 IP 绑定的拉取区域所有签名直链 403",
+  "status": "已修复"
+ },
+ {
+  "id": "F-406",
+  "sev": "中",
+  "loc": "src/backend/drivers/cnb_releases/driver.ts:91",
+  "title": "get() 对解析失败的路径返回伪造 FileItem 而不是抛 not found，且 findRelease 吞掉全部 API 错误",
+  "status": "已修复"
+ },
+ {
+  "id": "F-410",
+  "sev": "中",
+  "loc": "src/backend/drivers/mediafire/util.ts:60",
+  "title": "MediaFire 客户端把所有 API 失败静默吞掉：list 忽略 result 字段、postForm 吞掉非 JSON 响应、checkResult 对 undefined 放行、HTTP 状态码从不检查",
+  "status": "已修复"
+ },
+ {
+  "id": "F-411",
+  "sev": "中",
+  "loc": "src/backend/drivers/degoo/driver.ts:75",
+  "title": "DriverDegoo.get() 用 catch-all 吞掉所有查询失败（文件不存在、网络错误、鉴权失败），并返回一个伪造的目录条目",
+  "status": "已修复"
+ },
+ {
+  "id": "F-412",
+  "sev": "中",
+  "loc": "src/backend/drivers/mediafire/driver.ts:62",
+  "title": "DriverMediafire.get() 同样吞掉所有失败，且对不存在的路径返回伪造的文件条目（is_dir=false、raw_url 空）",
+  "status": "已修复"
+ },
+ {
+  "id": "F-413",
+  "sev": "中",
+  "loc": "src/backend/drivers/degoo/driver.ts:126",
+  "title": "DriverDegoo.move() 用虚拟路径 dstDir 解析目标目录 ID，忽略了正确的物理目标路径参数",
+  "status": "已修复"
+ },
+ {
+  "id": "F-414",
+  "sev": "中",
+  "loc": "src/backend/drivers/mediafire/driver.ts:123",
+  "title": "DriverMediafire.move()/copy() 同样用虚拟 dstDir 调 resolveFolderId，忽略 dstPhysical",
+  "status": "已修复"
+ },
+ {
+  "id": "F-415",
+  "sev": "中",
+  "loc": "src/backend/drivers/mediafire/util.ts:63",
+  "title": "MediaFire session_token 只在 init() 获取一次，过期后无任何恢复路径；新 token 写入 addition_session_token 但全仓库无人读取（死代码）",
+  "status": "已修复"
+ },
+ {
+  "id": "F-416",
+  "sev": "中",
+  "loc": "src/backend/drivers/degoo/util.ts:147",
+  "title": "ClientDegoo.apiCall 对 Unauthorized 的重试是无限递归，没有次数上限",
+  "status": "已修复"
+ },
+ {
+  "id": "F-422",
+  "sev": "中",
+  "loc": "src/backend/drivers/123_open/driver.ts:132",
+  "title": "move() 用虚拟目标目录 dstDir 调 resolveDirId，而非传入却被忽略的物理路径 dstPhysical，非根挂载时移动必然失败",
+  "status": "已修复"
+ },
+ {
+  "id": "F-423",
+  "sev": "中",
+  "loc": "src/backend/drivers/aliyundrive_share/driver.ts:43",
+  "title": "resolveFileId 路径段匹配失败时 break 并返回上级目录 ID，导致对不存在路径的 list 静默返回错误目录内容、link 可能取到错误文件",
+  "status": "已修复"
+ },
+ {
+  "id": "F-424",
+  "sev": "中",
+  "loc": "src/backend/drivers/123_open/driver.ts:83",
+  "title": "123_open 与 quark_uc_tv 的 get() 对不存在的路径返回伪造的 FileItem（虚假的\"存在\"）而不是抛错，且第一个 try 吞掉包括网络/鉴权错误在内的一切异常",
+  "status": "已修复"
+ },
+ {
+  "id": "F-425",
+  "sev": "中",
+  "loc": "src/backend/drivers/chunk/driver.ts:115",
+  "title": "listParts() 对分片序号稀疏缺失的文件静默剔除空洞，缺失分片的上传产物会被当成完整文件合并，输出静默损坏的字节流",
+  "status": "已修复"
+ },
+ {
+  "id": "F-426",
+  "sev": "中",
+  "loc": "src/backend/drivers/aliyundrive_share/driver.ts:145",
+  "title": "驱动自己声明的下载必需 Referer/UA 头永远不会生效：承载它们的 link() 在全代码库无任何调用点，实际下载走的 get() 从不设置 raw_url_headers",
+  "status": "已修复"
+ },
+ {
+  "id": "F-427",
+  "sev": "中",
+  "loc": "src/backend/drivers/123_open/driver.ts:9",
+  "title": "123_open 完全忽略配置项 root_folder_id，永远从网盘根目录（\"0\"）解析路径",
+  "status": "已修复"
+ },
+ {
+  "id": "F-428",
+  "sev": "中",
+  "loc": "src/backend/drivers/cloudflare_imgbed/driver.ts:184",
+  "title": "remove() 把 folder 参数硬编码为 false，删除图床\"目录\"时上游按单文件幂等删除处理：返回成功但什么都没删",
+  "status": "已修复"
+ },
+ {
+  "id": "F-436",
+  "sev": "中",
+  "loc": "src/backend/drivers/115_share/driver.ts:42-44",
+  "title": "resolveCid 遇到不存在的目录段时 break 而非报错，list 不存在的路径静默返回祖先目录内容",
+  "status": "已修复"
+ },
+ {
+  "id": "F-437",
+  "sev": "中",
+  "loc": "src/backend/drivers/febbox/driver.ts:156-158",
+  "title": "addition.root_folder_id 声明于类型但驱动从未读取，所有操作固定锚定账号根目录",
+  "status": "已修复"
+ },
+ {
+  "id": "F-438",
+  "sev": "中",
+  "loc": "src/backend/drivers/febbox/driver.ts:53-73",
+  "title": "get() 把所有异常吞掉并回退成合成的空目录，网络/鉴权故障与路径不存在都伪装成『存在的空文件夹』",
+  "status": "已修复"
+ },
+ {
+  "id": "F-439",
+  "sev": "中",
+  "loc": "src/backend/drivers/cloudreve_v3/driver.ts:70-72",
+  "title": "get() 同样吞掉 listFiles 全部异常并返回合成的空目录",
+  "status": "已修复"
+ },
+ {
+  "id": "F-440",
+  "sev": "中",
+  "loc": "src/backend/drivers/febbox/util.ts:72-75",
+  "title": "request 对 code===-10001 无限刷新重试，无重试上限；并发时还会引发 refresh_token 轮换竞态",
+  "status": "已修复"
+ },
+ {
+  "id": "F-441",
+  "sev": "中",
+  "loc": "src/backend/drivers/url_tree/driver.ts:22",
+  "title": "parseFileLine 优先取 http:// 的下标而非更早出现的 https://，URL 查询串里含 http:// 的合法行导致整个存储构造即抛错",
+  "status": "已修复"
+ },
+ {
+  "id": "F-447",
+  "sev": "中",
+  "loc": "src/backend/drivers/doubao/driver.ts:100-118",
+  "title": "rename/remove 用 resolveDirId 解析条目自身路径，而 resolveDirId 只匹配目录（node_type===1），导致对文件的重命名与删除必定抛错",
+  "status": "已修复"
+ },
+ {
+  "id": "F-448",
+  "sev": "中",
+  "loc": "src/backend/drivers/google_photo/util.ts:126-138",
+  "title": "mediaItems:search 是 POST 接口，albumId/pageSize/pageToken 被当作 URL query 发送且无请求体，相册列举实际返回的是整个媒体库而非相册内容",
+  "status": "已修复"
+ },
+ {
+  "id": "F-449",
+  "sev": "中",
+  "loc": "src/backend/drivers/teambition/util.ts:40-46",
+  "title": "request() 从不检查 HTTP 状态码，非 JSON 或不含 name/message 的错误响应都被当作成功返回，过期 cookie 时静默返回空列表、写操作假成功",
+  "status": "已修复"
+ },
+ {
+  "id": "F-450",
+  "sev": "中",
+  "loc": "src/backend/drivers/pikpak_share/driver.ts:37-49",
+  "title": "resolveParentId 逐段查找目录失败时静默 break 并返回最后匹配到的 id，不存在的子路径会返回错误目录（根目录）的内容",
+  "status": "已修复"
+ },
+ {
+  "id": "F-459",
+  "sev": "中",
+  "loc": "src/backend/drivers/onedrive_sharelink/util.ts:33",
+  "title": "onedrive_sharelink 的 getFiles 完全忽略 folderPath 参数，任何子目录列表返回的都是分享根目录的内容",
+  "status": "已修复"
+ },
+ {
+  "id": "F-460",
+  "sev": "中",
+  "loc": "src/backend/drivers/onedrive_sharelink/driver.ts:65",
+  "title": "onedrive_sharelink get() 只在分享根目录列表里按文件名匹配任意深度的路径，嵌套路径要么报不存在、要么命中同名的另一个文件",
+  "status": "已修复"
+ },
+ {
+  "id": "F-461",
+  "sev": "中",
+  "loc": "src/backend/drivers/onedrive_sharelink/util.ts:76",
+  "title": "onedrive_sharelink 忽略 NextHref 分页，超过一页的目录被静默截断",
+  "status": "已修复"
+ },
+ {
+  "id": "F-462",
+  "sev": "中",
+  "loc": "src/backend/drivers/alias/driver.ts:103",
+  "title": "alias 路径树合成不完整：单个具名子路径的根目录列表为空；多段 aliasSub 的中间目录既不可导航、get 又返回错误类型",
+  "status": "已修复"
+ },
+ {
+  "id": "F-463",
+  "sev": "中",
+  "loc": "src/backend/drivers/alias/driver.ts:174",
+  "title": "alias get() 对不存在/不可达路径永远返回伪造的 0 字节文件而不报 404",
+  "status": "已修复"
+ },
+ {
+  "id": "F-464",
+  "sev": "中",
+  "loc": "src/backend/drivers/cloudreve_v4/driver.ts:64",
+  "title": "cloudreve_v4 get() 吞掉全部上游错误并返回伪造的 0 字节文件，把存储故障伪装成正常条目",
+  "status": "已修复"
+ },
+ {
+  "id": "F-469",
+  "sev": "中",
+  "loc": "src/backend/drivers/ipfs_api/driver.ts:36",
+  "title": "ipns 模式下列目录永远失败，且 get() 兜底对任意不存在路径都返回伪造目录",
+  "status": "已修复"
+ },
+ {
+  "id": "F-470",
+  "sev": "中",
+  "loc": "src/backend/drivers/kodbox/util.ts:49",
+  "title": "request() 对 code=10001 的重登录重试没有次数上限，可无限递归",
+  "status": "已修复"
+ },
+ {
+  "id": "F-471",
+  "sev": "中",
+  "loc": "src/backend/drivers/openlist/types.ts:16",
+  "title": "openlist 驱动的 root_path 配置项声明了但从未被使用，配置后静默失效",
+  "status": "已修复"
+ },
+ {
+  "id": "F-472",
+  "sev": "中",
+  "loc": "src/backend/drivers/strm/driver.ts:128",
+  "title": "strm 的 withSign 选项在管理界面可配置但驱动从未读取，开启签名校验的站点所有 .strm 链接 401",
+  "status": "已修复"
+ },
+ {
+  "id": "F-477",
+  "sev": "中",
+  "loc": "src/backend/drivers/teldrive/driver.ts:102-111",
+  "title": "teldrive 的 move() 用「虚拟目标目录路径」解析目标文件夹 id，而源用的是物理路径；存储挂载在子路径或设置 root_folder_path 时移动必失败",
+  "status": "已修复"
+ },
+ {
+  "id": "F-478",
+  "sev": "中",
+  "loc": "src/backend/drivers/uss/driver.ts:57-115",
+  "title": "uss 列目录完全没有分页：不带 x-list-limit 也不读 x-upyun-list-iter 迭代头，超过 100 个条目的目录被静默截断",
+  "status": "已修复"
+ },
+ {
+  "id": "F-479",
+  "sev": "中",
+  "loc": "src/backend/drivers/uss/driver.ts:59",
+  "title": "uss 把 key 未经百分号编码直接拼进 URL 路径，名字中含 # 或 ? 时路径被截断成 fragment/query，列目录/取链/建目录/删除/上传全部错位",
+  "status": "已修复"
+ },
+ {
+  "id": "F-480",
+  "sev": "中",
+  "loc": "src/backend/drivers/uss/driver.ts:117-138",
+  "title": "uss 的 get() 不做任何存在性检查并恒返回 is_dir:false、size:0 的伪造条目，目录被当文件、不存在路径也返回 200",
+  "status": "已修复"
+ },
+ {
+  "id": "F-485",
+  "sev": "中",
+  "loc": "src/backend/drivers/virtual/driver.ts:95",
+  "title": "无 Range 的整文件下载中，createReadStream() 生成与 get() 所报 size 无关的独立随机长度，与 raw.ts 按 fileItem.size 写死的 Content-Length 不匹配",
+  "status": "已修复"
+ },
+ {
+  "id": "F-486",
+  "sev": "中",
+  "loc": "src/backend/drivers/virtual/driver.ts:71",
+  "title": "get() 对所有路径一律返回 is_dir:false + 随机 size，目录条目（folder_N）被当作随机大小的文件",
+  "status": "已修复"
+ },
+ {
+  "id": "F-003",
+  "sev": "低",
+  "loc": "src/backend/server/admin.ts:484",
+  "title": "/storage/enable 用裸 async IIFE 在响应返回后初始化驱动并回写状态，未注册 executionCtx.waitUntil，Workers 上该后台任务会被终止",
+  "status": "已修复"
+ },
+ {
+  "id": "F-005",
+  "sev": "低",
+  "loc": "src/backend/server/admin.ts:284",
+  "title": "create/update 的挂载路径冲突检查跳过已禁用存储，而 enable 时不复查冲突，最终可出现两个已启用存储挂在同一 mount_path",
+  "status": "已修复"
+ },
+ {
+  "id": "F-006",
+  "sev": "低",
+  "loc": "src/backend/server/admin.ts:5061",
+  "title": "meta/update 把原始 body.hide（可能为数组/对象）直接入库，校验用的却是 String(body.hide)；非字符串 hide 会让该 meta 覆盖路径上的每次列目录抛 TypeError",
+  "status": "已修复"
+ },
+ {
+  "id": "F-007",
+  "sev": "低",
+  "loc": "src/backend/server/admin.ts:519",
+  "title": "/driver/names 返回的驱动名单缺少 driverConfigs 里已存在的 5 个驱动：CtFile、Cloudflare R2、WeiYun、SFTP、FTP",
+  "status": "已修复"
+ },
+ {
+  "id": "F-008",
+  "sev": "低",
+  "loc": "src/backend/server/admin.ts:270",
+  "title": "空 mount_path 的 default_mount_path 兜底用未归一化的 body.driver 查 driverConfigs，非规范驱动名时兜底失效，create 会静默把存储挂到根路径 \"/\"",
+  "status": "已修复"
+ },
+ {
+  "id": "F-016",
+  "sev": "低",
+  "loc": "src/backend/server/fs.ts:805",
+  "title": "/fs/get 分享分支的 raw_url 未做逐段百分号编码，文件名含 ?/#/% 时链接直接损坏",
+  "status": "已修复"
+ },
+ {
+  "id": "F-017",
+  "sev": "低",
+  "loc": "src/backend/server/fs.ts:446",
+  "title": "三个读取端点用 startsWith(\"/@s\") 判定分享路径，比 isSharePath 宽松，吞掉了名字以 @s 开头的普通目录",
+  "status": "已修复"
+ },
+ {
+  "id": "F-019",
+  "sev": "低",
+  "loc": "src/backend/server/fs.ts:1876",
+  "title": "init 接受并钳制 X-Chunk-Size 到最大 64MB，但 chunk 端点默认只允许 16MB 单片，按 init 返回的 chunk_size 上传必然 413",
+  "status": "已修复"
+ },
+ {
+  "id": "F-020",
+  "sev": "低",
+  "loc": "src/backend/server/fs.ts:1210",
+  "title": "两处请求错误返回 HTTP 200 但 body 里 code=400，状态码与语义不一致",
+  "status": "已修复"
+ },
+ {
+  "id": "F-024",
+  "sev": "低",
+  "loc": "src/backend/server/seed.ts:2003-2009",
+  "title": "legacy /fs/torrent/generate 跳过分片对齐门禁直接把 per-file 分片喂给 encodeTorrent，多文件种子存在非对齐文件时产出损坏的种子文件",
+  "status": "已修复"
+ },
+ {
+  "id": "F-027",
+  "sev": "低",
+  "loc": "src/backend/server/seed.ts:202-209",
+  "title": "contentBytes 完全忽略显式 encoding=\"base64\"：以字母 d 开头的 base64 内容被当作 UTF-8 文本编码",
+  "status": "已修复"
+ },
+ {
+  "id": "F-028",
+  "sev": "低",
+  "loc": "src/backend/server/seed.ts:481",
+  "title": "collectSourceFiles 把实际存储路径记为 virtualPath，generateSeed 用它匹配用户提供的 file_comments/share_files/direct_files 键，base_",
+  "status": "已修复"
+ },
+ {
+  "id": "F-029",
+  "sev": "低",
+  "loc": "src/backend/server/seed.ts:1826（另见编号：F-103）",
+  "title": "重算路径创建并喂数据的 TorrentPieceHasher 从未被 digest，每次重算把整个文件 SHA-1 两遍，纯浪费一倍 CPU",
+  "status": "已修复"
+ },
+ {
+  "id": "F-030",
+  "sev": "低",
+  "loc": "src/backend/server/seed.ts:1520-1534",
+  "title": "selected_files 直接 Number() 转索引，null/空串/false 都被折叠成索引 0，畸形输入静默改变转存范围",
+  "status": "已修复"
+ },
+ {
+  "id": "F-036",
+  "sev": "低",
+  "loc": "src/backend/server/webauthn.ts:307",
+  "title": "WebAuthn 挑战的「单次消费」是双写单删：命中本地表不清持久化副本、命中持久化路径不清本地副本，同一挑战最多可被消费两次",
+  "status": "已修复"
+ },
+ {
+  "id": "F-037",
+  "sev": "低",
+  "loc": "src/backend/server/auth.ts:226",
+  "title": "loginFailures 的懒清理条件漏掉 count 为 1-4 的条目，这些条目永不删除，Map 在长驻运行时无界增长",
+  "status": "已修复"
+ },
+ {
+  "id": "F-042",
+  "sev": "低",
+  "loc": "src/backend/server/raw.ts:251",
+  "title": "Range 兜底重试覆盖 upstreamRes 前未取消旧响应体；safeProxyFetch 的每个 3xx 响应体也未取消——上游连接/流滞留到 GC",
+  "status": "已修复"
+ },
+ {
+  "id": "F-046",
+  "sev": "低",
+  "loc": "src/backend/server/webdav.ts:352-366",
+  "title": "PROPFIND 取了 Depth 头却没用（死三元）、对文件路径也走目录 list、且把一切资源声明为集合——三处 RFC 4918 偏差叠加",
+  "status": "已修复"
+ },
+ {
+  "id": "F-049",
+  "sev": "低",
+  "loc": "src/backend/server/mcp.ts:11-17",
+  "title": "/sse 端点实际返回 Content-Type: text/plain 而非声明的 text/event-stream——c.text() 覆盖了先前 c.header 设置的值",
+  "status": "已修复"
+ },
+ {
+  "id": "F-051",
+  "sev": "低",
+  "loc": "src/backend/server/middlewares.ts:235-303",
+  "title": "进程内 revokedJtis 集合只增不减，过期条目在 isolate 存续期内永驻内存",
+  "status": "已修复"
+ },
+ {
+  "id": "F-052",
+  "sev": "低",
+  "loc": "src/backend/server/s3.ts:263-266",
+  "title": "HeadObject 把 ISO 8601 时间戳原样塞进 Last-Modified，不符合 RFC 9110 要求的 IMF-fixdate 格式",
+  "status": "已修复"
+ },
+ {
+  "id": "F-059",
+  "sev": "低",
+  "loc": "src/backend/pkg/http.ts:10",
+  "title": "FetchConfig.signal 被静默丢弃：get/post/request 都不透传也不合并调用方的取消信号",
+  "status": "已修复"
+ },
+ {
+  "id": "F-060",
+  "sev": "低",
+  "loc": "src/backend/pkg/stream.ts:26-39",
+  "title": "parseRange 不支持后缀区间（bytes=-N）、越界 end 不按 RFC 截断、多区间请求被误解析为首个区间",
+  "status": "已修复"
+ },
+ {
+  "id": "F-061",
+  "sev": "低",
+  "loc": "src/backend/pkg/csrf.ts:244",
+  "title": "getCookie 对畸形 cookie 值调用 decodeURIComponent 可抛 URIError，使请求 500 而非 403",
+  "status": "已修复"
+ },
+ {
+  "id": "F-064",
+  "sev": "低",
+  "loc": "src/backend/pkg/permission.ts:241",
+  "title": "getActualPath 对 base_path 自身包含的 .. 段不折叠，导致用户根目录（reqPath=\"/\"）与子路径解析到两棵不同的树，且 isWithinUserRoot 随后拒绝一切写入",
+  "status": "已修复"
+ },
+ {
+  "id": "F-065",
+  "sev": "低",
+  "loc": "src/backend/pkg/audit.ts:416",
+  "title": "InMemoryAuditLogStorage.query 在无过滤条件时对 this.logs 原地 sort，之后 write() 的 shift() 会把最新的日志条目当作「最旧」淘汰掉",
+  "status": "已修复"
+ },
+ {
+  "id": "F-066",
+  "sev": "低",
+  "loc": "src/backend/pkg/utils.ts:23",
+  "title": "formatBytes 对 (0,1) 区间、负数和超过 PB 的字节数产生错误输出（错误数值 + \"undefined\" 单位 / NaN）",
+  "status": "已修复"
+ },
+ {
+  "id": "F-067",
+  "sev": "低",
+  "loc": "src/backend/pkg/meta.ts:167",
+  "title": "canRead/canWrite 只把 user === null 当作系统上下文，传入 undefined 且 meta 命中 read_users/write_users 时直接抛 TypeError（canAcce",
+  "status": "已修复"
+ },
+ {
+  "id": "F-068",
+  "sev": "低",
+  "loc": "src/backend/pkg/validators.ts:87",
+  "title": "createUserRequestSchema/updateUserRequestSchema 的 role 语义注释（0=超管,1=管理员,2=普通用户,3=访客）与运行时 UserRole 枚举（GENERAL=0,",
+  "status": "已修复"
+ },
+ {
+  "id": "F-074",
+  "sev": "低",
+  "loc": "src/backend/internal/model/db.ts:2166-2171",
+  "title": "unsealDb 的 v1GiveUp「首个 v1 密文解不开即跳过后续」是死条件：标志只在任务执行时置位，而检查发生在全部任务调度完成之前，该优化永不生效",
+  "status": "已修复"
+ },
+ {
+  "id": "F-075",
+  "sev": "低",
+  "loc": "src/backend/pkg/path.ts:41",
+  "title": "decodePathFully 把任意 3 个及以上连续点归一成 \"..\"，文件名中合法的 \"...\" 在解析物理路径前被静默改写，这类文件永远无法按原名访问",
+  "status": "已修复"
+ },
+ {
+  "id": "F-082",
+  "sev": "低",
+  "loc": "src/backend/internal/model/store/schema.ts:539",
+  "title": "singleflight 协调表 MySQL 方言的 key 列为 VARCHAR(512)，而实际去重键包含用户可控的完整虚拟路径，超长路径/中文长路径下 INSERT 失败，跨实例去重静默降级",
+  "status": "已修复"
+ },
+ {
+  "id": "F-086",
+  "sev": "低",
+  "loc": "src/backend/internal/model/store/driver/mysql.ts:50",
+  "title": "schema 初始化缓存只按表前缀去重，而连接池按完整配置键控：同进程内切换 MySQL 配置（多库/配置变更）时第二个池跳过建表导致全部查询报表不存在，且被替换的旧池从不 .end()，并发首调还会创建两个池弃其一",
+  "status": "已修复"
+ },
+ {
+  "id": "F-087",
+  "sev": "低",
+  "loc": "src/backend/internal/model/store/driver/kv.ts:349",
+  "title": "KV binding 模式下每次「键不存在」的读取都会发起第二次真实的 KV 读：第一种签名成功返回 null 后仍落入对象签名重试，把所有 miss 的读配额翻倍",
+  "status": "已修复"
+ },
+ {
+  "id": "F-089",
+  "sev": "低",
+  "loc": "src/backend/internal/model/store/driver/blob.ts:166",
+  "title": "ESA Blob 的 list 分页 do/while(cursor) 循环没有游标推进检测、重复页检测和迭代上限，正是 kv.ts 因 issue #125 修过的「游标不推进 → 同页空转打满配额」缺陷类，此处完全未",
+  "status": "已修复"
+ },
+ {
+  "id": "F-093",
+  "sev": "低",
+  "loc": "src/backend/internal/op/storage.ts:147",
+  "title": "driverInitCache 只在创建失败时清理，成功条目永不回收，长生命周期进程中随存储编辑次数无上限增长（正是 M-8 为 driverCache 修过的同类问题）",
+  "status": "已修复"
+ },
+ {
+  "id": "F-095",
+  "sev": "低",
+  "loc": "src/backend/internal/op/share.ts:235",
+  "title": "多文件分享的子路径匹配用「原始存储段」与「已解码请求段」比较，编码形式入库的历史分享条目永远匹配不上自己的解码名",
+  "status": "已修复"
+ },
+ {
+  "id": "F-101",
+  "sev": "低",
+  "loc": "src/backend/internal/seed/codec.ts:673",
+  "title": "parseSeed 格式嗅探把裸 JSON 的 CAS 内容误判为 oss，decodeCas 自带的 raw-JSON 回退经 parseSeed 永远不可达",
+  "status": "已修复"
+ },
+ {
+  "id": "F-102",
+  "sev": "低",
+  "loc": "src/backend/internal/seed/hash.ts:122",
+  "title": "hashReadableStream 出错路径只 releaseLock 不 cancel 流，上游响应体（下载连接）不会被主动终止",
+  "status": "已修复"
+ },
+ {
+  "id": "F-105",
+  "sev": "低",
+  "loc": "src/backend/internal/cache/store.ts:191",
+  "title": "过期条目的惰性清理用 `void cacheDelete(key, env)` 删除所有后端的同键条目，会误删其他后端上仍有效的缓存，并与并发回写竞态",
+  "status": "已修复"
+ },
+ {
+  "id": "F-106",
+  "sev": "低",
+  "loc": "src/backend/internal/cache/config.ts:94",
+  "title": "readRaw 把空字符串环境变量当作未设置，导致文档承诺的 `CACHE_EXCLUDE_DRIVERS=\"\"`（不排除任何驱动）语义无法达成",
+  "status": "已修复"
+ },
+ {
+  "id": "F-107",
+  "sev": "低",
+  "loc": "src/backend/internal/model/store/driver/memory.ts:10",
+  "title": "memoryDriver 无容量上限、无过期淘汰，配合 store.ts 仅在「再次读到过期条目」时才删除，CACHE_DRIVER=memory 下缓存 Map 无界增长",
+  "status": "已修复"
+ },
+ {
+  "id": "F-109",
+  "sev": "低",
+  "loc": "src/backend/internal/driver/sort.ts:14（alsoIn：F-218）",
+  "title": "order_direction 比较大小写敏感，大写 \"DESC\"/\"ASC\" 被一律当作升序，方向完全反转",
+  "status": "已修复"
+ },
+ {
+  "id": "F-110",
+  "sev": "低",
+  "loc": "src/backend/internal/driver/sort.ts:24-29",
+  "title": "order_by 命中 \"created\"（含 created_at）分支时比较的是 modified 字段，FileItem.created 从未参与排序",
+  "status": "已修复"
+ },
+ {
+  "id": "F-111",
+  "sev": "低",
+  "loc": "src/backend/internal/driver/base.ts:45",
+  "title": "\"ts\" 同时出现在 videoExts（:45）与 textExts（:82），video 先判导致 textExts 里的 \"ts\" 永远不可达，.ts 文本/源码文件被分类为 VIDEO",
+  "status": "已修复"
+ },
+ {
+  "id": "F-116",
+  "sev": "低",
+  "loc": "src/backend/server/fs.ts:1746（alsoIn：F-018）",
+  "title": "X-File-Size 为非数字时 parseInt 得 NaN，`size <= 0` 拦不住 NaN，校验全部通过直到 new Array(NaN) 抛 RangeError → 500，并遗留孤儿驱动上传会话",
+  "status": "已修复"
+ },
+ {
+  "id": "F-117",
+  "sev": "低",
+  "loc": "src/backend/internal/upload/multipart.ts:112",
+  "title": "snapshot 的 received_bytes = 已收分片数 × chunk_size，最后一片通常不足 chunk_size，导致返回的 received_bytes 超过文件真实大小",
+  "status": "已修复"
+ },
+ {
+  "id": "F-118",
+  "sev": "低",
+  "loc": "src/backend/server/mcp.ts:35（alsoIn：F-050）",
+  "title": "JSON-RPC 协议级错误（-32601 / -32602）被映射为 HTTP 404，按 response.ok 判定成败的 MCP 客户端会把协议错误当成传输层失败",
+  "status": "已修复"
+ },
+ {
+  "id": "F-119",
+  "sev": "低",
+  "loc": "src/backend/durable-objects/OpenListDB.ts:37",
+  "title": "ensureSchema() 在每个 RPC 方法开头全量重放 11 条 DDL，把每次 KV 语义操作放大成 11+ 次 SQLite exec",
+  "status": "已修复"
+ },
+ {
+  "id": "F-126",
+  "sev": "低",
+  "loc": "middleware.js:27-28",
+  "title": "middleware.js 的后端路径清单与后端实际根路由不一致：/dav、/s3 未放行，/health 被放行但根路径并不存在该路由（只有 /api/health）",
+  "status": "已修复"
+ },
+ {
+  "id": "F-127",
+  "sev": "低",
+  "loc": "esa-entry.ts:166-173",
+  "title": "ESA KV 包装层的 delete 吞掉底层删除异常，删除「成功」但值在下一次 get 时复活",
+  "status": "已修复"
+ },
+ {
+  "id": "F-131",
+  "sev": "低",
+  "loc": "scripts/build-bin.js:7",
+  "title": "build-bin.js 引用不存在的 npm script build:server（第一步必失败），且从未注入 SEA blob 却打印 'Injected blob into binary...'，dist/ser",
+  "status": "已修复"
+ },
+ {
+  "id": "F-132",
+  "sev": "低",
+  "loc": "scripts/fetch-frontend.mjs:595",
+  "title": "fetchI18n 第二次下载失败被完全吞掉，落地检查只查『零语言目录』，复用仓库时静默沿用上一轮的陈旧语言包，与该函数声明的『失败即中断』意图矛盾",
+  "status": "已修复"
+ },
+ {
+  "id": "F-138",
+  "sev": "低",
+  "loc": "src/backend/drivers/189/crypto.ts:265",
+  "title": "上传参数加密的 AES-ECB 密钥与 HMAC-SHA1 签名密钥（randomKey）用 Math.random() 生成而非 CSPRNG",
+  "status": "已修复"
+ },
+ {
+  "id": "F-139",
+  "sev": "低",
+  "loc": "src/backend/drivers/189/driver.ts:280",
+  "title": "路径末段恰好等于 root_folder_id 字符串时被误判为存储根，返回根目录信息而非该文件夹",
+  "status": "已修复"
+ },
+ {
+  "id": "F-145",
+  "sev": "低",
+  "loc": "src/backend/drivers/139/util.ts:450",
+  "title": "刷新窗口内 refreshToken 的任何暂时性失败都会让整个存储不可用，即使现有令牌仍然有效",
+  "status": "已修复"
+ },
+ {
+  "id": "F-146",
+  "sev": "低",
+  "loc": "src/backend/drivers/139/driver.ts:202",
+  "title": "link() 对同一文件重复调用 getDownloadUrl：get() 内部已取过一次下载直链，link() 又丢弃 item.raw_url 再调一次",
+  "status": "已修复"
+ },
+ {
+  "id": "F-147",
+  "sev": "低",
+  "loc": "src/backend/drivers/139/driver.ts:109",
+  "title": "条目缺 id 时 sign 回退为文件名，link()/rename() 随后把文件名当作 fileId 发给 139 API",
+  "status": "已修复"
+ },
+ {
+  "id": "F-151",
+  "sev": "低",
+  "loc": "src/backend/drivers/s3/util.ts:431-434、468-474（lastEvaluatedKey 定义于 util.ts:151-153、222-224）",
+  "title": "listObjects v1/v2 分页回退 marker 取自过滤后的 files 数组末项而非本页真实最后一个 key，可能产生重复条目甚至死循环",
+  "status": "已修复"
+ },
+ {
+  "id": "F-152",
+  "sev": "低",
+  "loc": "src/backend/drivers/s3/util.ts:306-340（canonical 侧 src/backend/drivers/s3/sigv4.ts:170-177）",
+  "title": "key 本身含有合法百分号转义序列（如名为 a%2Fb.txt 的文件）时，getUrl 生成的请求路径寻址到错误的对象",
+  "status": "已修复"
+ },
+ {
+  "id": "F-153",
+  "sev": "低",
+  "loc": "src/backend/drivers/s3/util.ts:65-72",
+  "title": "unescapeXml 逐个 replace 的解码顺序导致实体被二次解码",
+  "status": "已修复"
+ },
+ {
+  "id": "F-161",
+  "sev": "低",
+  "loc": "src/backend/drivers/lanzou/help.ts:37-49",
+  "title": "mustParseTime 分支顺序错误：「昨天」「前天」「半小时前」都返回当前时间而非正确偏移",
+  "status": "已修复"
+ },
+ {
+  "id": "F-162",
+  "sev": "低",
+  "loc": "src/backend/drivers/lanzou/help.ts:277-285",
+  "title": "formToMap 按第一个 = 截断值（base64 padding 丢失），且 decodeURIComponent 对非法 % 序列抛出的 URIError 未被捕获，直接炸掉整个 get()",
+  "status": "已修复"
+ },
+ {
+  "id": "F-163",
+  "sev": "低",
+  "loc": "src/backend/drivers/lanzou/util.ts:440-443",
+  "title": "用裸子串 includes(\"acw_sc__v2\") 判定 WAF 挑战页，普通响应只要包含该字符串就会调用 calcAcwScV2 并抛错，业务响应被吞",
+  "status": "已修复"
+ },
+ {
+  "id": "F-164",
+  "sev": "低",
+  "loc": "src/backend/drivers/lanzou/util.ts:330",
+  "title": "用 /403|405/.test(err.message) 判定是否被 WAF 拦截，而 message 内嵌了完整 URL，分享 ID 含 403/405 时任意错误都会被误判为拦截",
+  "status": "已修复"
+ },
+ {
+  "id": "F-172",
+  "sev": "低",
+  "loc": "src/backend/drivers/weiyun/driver.ts:315",
+  "title": "list() 达到 SUBREQUEST_LIMIT 预算时仅 console.warn 后 break，静默返回截断的目录列表（部分失败当成功）",
+  "status": "已修复"
+ },
+ {
+  "id": "F-184",
+  "sev": "低",
+  "loc": "src/backend/drivers/proton_drive/driver.ts:61",
+  "title": "驱动初始化时对 password 做 trim，静默篡改含首尾空白的合法密码",
+  "status": "已修复"
+ },
+ {
+  "id": "F-190",
+  "sev": "低",
+  "loc": "src/backend/drivers/r2/driver.ts:347",
+  "title": "remove_bucket 在 binding 模式下没有可剥的桶名前缀，却仍无条件剥掉一段与桶同名的真实 key 前缀，生成错误直链",
+  "status": "已修复"
+ },
+ {
+  "id": "F-191",
+  "sev": "低",
+  "loc": "src/backend/drivers/r2/driver.ts:102",
+  "title": "normalizeR2Addition 不 trim custom_host，配置值带首尾空格时 binding 模式生成完全非法的直链",
+  "status": "已修复"
+ },
+ {
+  "id": "F-198",
+  "sev": "低",
+  "loc": "src/backend/drivers/123pan/util.ts:306",
+  "title": "request() 完全不检查 HTTP 状态码，非 JSON 响应变成晦涩的 SyntaxError，且 HTTP 层 401 无法触发重登录重试",
+  "status": "已修复"
+ },
+ {
+  "id": "F-199",
+  "sev": "低",
+  "loc": "src/backend/drivers/123pan/driver.ts:302",
+  "title": "以 rootId 字符串（默认 \"0\"）命名的顶层文件/文件夹会被误判为存储根，返回根目录条目而非该条目",
+  "status": "已修复"
+ },
+ {
+  "id": "F-205",
+  "sev": "低",
+  "loc": "src/backend/drivers/github/driver.ts:114",
+  "title": "init 用裸 catch 把 getBranchHead 的所有失败（无效 token、401/403、限流、网络错误）都归类为「非分支引用」，错误上下文被丢弃",
+  "status": "已修复"
+ },
+ {
+  "id": "F-206",
+  "sev": "低",
+  "loc": "src/backend/drivers/github/util.ts:47",
+  "title": "renderCommitMessage 把用户可控的文件名/路径直接作为 String.replace 替换串，$&、$'、$` 等特殊模式被展开，提交消息被破坏",
+  "status": "已修复"
+ },
+ {
+  "id": "F-207",
+  "sev": "低",
+  "loc": "src/backend/drivers/github/driver.ts:305",
+  "title": "写入对象自身名为 .gitkeep 且目标目录恰好只含 .gitkeep 时，newTree 请求中构造出同路径的两条冲突条目（新增 blob + sha:null 删除）",
+  "status": "已修复"
+ },
+ {
+  "id": "F-209",
+  "sev": "低",
+  "loc": "src/backend/drivers/baidu_netdisk/driver.ts:82",
+  "title": "upload_thread 配置为不可解析字符串时产生 NaN，上传并发数为 0，所有分片被静默跳过导致上传必然失败",
+  "status": "已修复"
+ },
+ {
+  "id": "F-210",
+  "sev": "低",
+  "loc": "src/backend/drivers/baidu_netdisk/util.ts:387",
+  "title": "官方下载链接在 HEAD 未返回 Location 的回退分支中，access_token 被 sanitizeDlink 从 URL 中剥除，得到必然无法下载的断链",
+  "status": "已修复"
+ },
+ {
+  "id": "F-211",
+  "sev": "低",
+  "loc": "src/backend/drivers/baidu_netdisk/driver.ts:156",
+  "title": "get() 吞掉 getDownloadLink 的全部异常，raw_url 留空且不设置 raw_url_error，下载失败的真实原因（风控/token 失效等）只在服务端 console.warn",
+  "status": "已修复"
+ },
+ {
+  "id": "F-212",
+  "sev": "低",
+  "loc": "src/backend/drivers/baidu_netdisk/driver.ts:66",
+  "title": "pathCache 只写不读（从未被消费）且无容量上限，随 list/get 调用无界增长",
+  "status": "已修复"
+ },
+ {
+  "id": "F-213",
+  "sev": "低",
+  "loc": "src/backend/drivers/baidu_netdisk/driver.ts:284",
+  "title": "大文件上传在 Workers 上受纯 JS MD5 双遍计算与全量内存 Buffer 的 CPU/内存约束",
+  "status": "已修复"
+ },
+ {
+  "id": "F-217",
+  "sev": "低",
+  "loc": "src/backend/drivers/wopan/driver.ts:48",
+  "title": "normalizeWoPanAddition 对非字符串字段调用 .trim()，family_id 等被存成 JSON 数字时驱动构造直接 TypeError",
+  "status": "已修复"
+ },
+ {
+  "id": "F-219",
+  "sev": "低",
+  "loc": "src/backend/drivers/wopan/driver.ts:314",
+  "title": "fetchFolderFiles 分页循环没有子请求预算/页数上限，大目录在 Workers 上会以运行时异常中途失败",
+  "status": "已修复"
+ },
+ {
+  "id": "F-224",
+  "sev": "低",
+  "loc": "src/backend/drivers/guangyapan/util.ts:400",
+  "title": "waitUploadTaskInfo 只检查 data.fileId 是否出现，完全忽略响应里的业务错误（code/msg），上传登记失败时会空转 300 次×1 秒（约 5 分钟）后报一个通用 timeout，真实错误",
+  "status": "已修复"
+ },
+ {
+  "id": "F-225",
+  "sev": "低",
+  "loc": "src/backend/drivers/guangyapan/util.ts:22",
+  "title": "normalizePhoneE164 对以 86 开头但未带 + 的 13 位号码什么都不做——空 if 块注释写着 \"handled below\"，实际下方只处理 11 位，号码原样透传给短信登录",
+  "status": "已修复"
+ },
+ {
+  "id": "F-226",
+  "sev": "低",
+  "loc": "src/backend/drivers/guangyapan/driver.ts:30",
+  "title": "order_by/sort_type 只在严格等于 undefined 时取默认值，配置里为 null 或空串时变成 0；page_size 非数字时变成 NaN 并以 null 发给 API，还会让 list() 的分",
+  "status": "已修复"
+ },
+ {
+  "id": "F-227",
+  "sev": "低",
+  "loc": "src/backend/drivers/guangyapan/driver.ts:416",
+  "title": "真实上传 OSS 成功后若 token 未带 taskId，后端登记步骤被静默跳过，文件成为 OSS 上的孤儿对象；而秒传路径对同样的空 taskId 却视为致命错误",
+  "status": "已修复"
+ },
+ {
+  "id": "F-228",
+  "sev": "低",
+  "loc": "src/backend/drivers/guangyapan/driver.ts:27",
+  "title": "addition 缺 device_id 时每次构造驱动都随机生成一个新设备 ID（及派生 device_sign），但从不通过 onStateChanged 持久化，isolate 重启或驱动缓存淘汰后设备身份漂移",
+  "status": "已修复"
+ },
+ {
+  "id": "F-232",
+  "sev": "低",
+  "loc": "src/backend/drivers/ctfile/util.ts:117-122",
+  "title": "重试循环中 429/5xx 分支不消费/取消响应体，且 res.text() 在 try 之外，读体网络错误绕过重试与统一错误包装",
+  "status": "已修复"
+ },
+ {
+  "id": "F-233",
+  "sev": "低",
+  "loc": "src/backend/drivers/ctfile/util.ts:456-473",
+  "title": "withOrder 对 size/time 的 asc/desc 方向映射反了（asc 发送 big/new 即降序，desc 反发 small/old），当前被本地重排掩盖",
+  "status": "已修复"
+ },
+ {
+  "id": "F-234",
+  "sev": "低",
+  "loc": "src/backend/drivers/ctfile/util.ts:301-310",
+  "title": "folderMeta/renameFolder 的 ID 形态首选 raw（带 d 前缀），与官方文档「不带 d 前缀」及模块自述策略相反，按文档实现时首次请求必 400 多一次往返",
+  "status": "已修复"
+ },
+ {
+  "id": "F-235",
+  "sev": "低",
+  "loc": "src/backend/drivers/ctfile/driver.ts:44-46",
+  "title": "ctfileDateToIso 把无时区的 \"YYYY-MM-DD HH:mm:ss\" 按运行时本地时区解析，同一数据在不同运行时算出的 modified 相差数小时",
+  "status": "已修复"
+ },
+ {
+  "id": "F-240",
+  "sev": "低",
+  "loc": "src/backend/drivers/webdav/util.ts:171",
+  "title": "targetPath 为 \"/\" 时 endsWith('') 恒真，首个 PROPFIND response 无条件被判为目录自身，可能吞掉第一个子项",
+  "status": "已修复"
+ },
+ {
+  "id": "F-241",
+  "sev": "低",
+  "loc": "src/backend/drivers/webdav/util.ts:113",
+  "title": "displayname 为纯路径时未按注释回退到 href basename，拼出的条目路径错位",
+  "status": "已修复"
+ },
+ {
+  "id": "F-242",
+  "sev": "低",
+  "loc": "src/backend/drivers/webdav/util.ts:394",
+  "title": "getSharepointCookie 校验不一致：跟随重定向时要求两个 cookie 齐全，最终却允许只拿到一个就返回不完整会话",
+  "status": "已修复"
+ },
+ {
+  "id": "F-249",
+  "sev": "低",
+  "loc": "src/backend/drivers/mopan/driver.ts:337",
+  "title": "批量任务轮询忽略 TaskStatusFailed 等失败终态，失败任务空转 10 秒后报误导性 timeout；taskIDList 为空时 taskID 为 undefined",
+  "status": "已修复"
+ },
+ {
+  "id": "F-250",
+  "sev": "低",
+  "loc": "src/backend/drivers/mopan/driver.ts:88",
+  "title": "upload_thread 配置被解析校验后从未使用（分片永远串行上传），且 parseInt 的 NaN 能绕过范围校验",
+  "status": "已修复"
+ },
+ {
+  "id": "F-251",
+  "sev": "低",
+  "loc": "src/backend/drivers/mopan/crypto.ts:1",
+  "title": "裸 \"crypto\" 静态导入且无运行时门控，在 ESA 边缘构建下整个驱动必然抛错",
+  "status": "已修复"
+ },
+ {
+  "id": "F-252",
+  "sev": "低",
+  "loc": "src/backend/drivers/mopan/driver.ts:284",
+  "title": "move/copy 依赖未在接口契约中声明的\"srcPhys/dstPhys 即目标项自身路径\"约定，正确性完全寄生于调用方当前实现",
+  "status": "已修复"
+ },
+ {
+  "id": "F-257",
+  "sev": "低",
+  "loc": "src/backend/drivers/pikpak/driver.ts:432",
+  "title": "OSS 上传 URL 直接内插 params.key，未做 URL 编码，key 含 #/? 等保留字符时请求打到错误路径",
+  "status": "已修复"
+ },
+ {
+  "id": "F-258",
+  "sev": "低",
+  "loc": "src/backend/drivers/pikpak/driver.ts:252",
+  "title": "rename/remove/move 只清理目标项自身的 idCache 键，其子目录/子文件的路径键全部失效缺失",
+  "status": "已修复"
+ },
+ {
+  "id": "F-259",
+  "sev": "低",
+  "loc": "src/backend/drivers/pikpak/util.ts:356",
+  "title": "login/refreshToken/refreshCaptchaToken 直接 await res.json() 且不检查 HTTP 状态，非 JSON 响应会抛出掩盖真相的 SyntaxError",
+  "status": "已修复"
+ },
+ {
+  "id": "F-264",
+  "sev": "低",
+  "loc": "src/backend/drivers/ftp/encoding.ts:34-42",
+  "title": "非 UTF-8 编码支持整体失效：getIconv 从未被调用 + ESM 产物中裸 require 必然抛错被吞，GBK 等编码静默退化为 UTF-8",
+  "status": "已修复"
+ },
+ {
+  "id": "F-267",
+  "sev": "低",
+  "loc": "src/backend/drivers/ftp/ftp-client.ts:280-281",
+  "title": "控制通道按 TCP 分块逐块解码，多字节字符被分块边界切开时产生乱码",
+  "status": "已修复"
+ },
+ {
+  "id": "F-268",
+  "sev": "低",
+  "loc": "src/backend/drivers/ftp/ftp-client.ts:154",
+  "title": "DOS 格式列表的日期 Date.parse 恒为 NaN，mtime 静默回退为当前时间",
+  "status": "已修复"
+ },
+ {
+  "id": "F-269",
+  "sev": "低",
+  "loc": "src/backend/drivers/ftp/ftp-client.ts:458-465",
+  "title": "mkdirAll 把所有 MKD 错误（含权限拒绝）都当「目录已存在」吞掉，mkdir 假报成功",
+  "status": "已修复"
+ },
+ {
+  "id": "F-270",
+  "sev": "低",
+  "loc": "src/backend/drivers/ftp/ftp-client.ts:60-69",
+  "title": "parseFtpAddress 对不带方括号的 IPv6 地址解析出非法主机与错误端口",
+  "status": "已修复"
+ },
+ {
+  "id": "F-276",
+  "sev": "低",
+  "loc": "src/backend/drivers/115open/driver.ts:325",
+  "title": "get() 吞掉 downUrl 的全部失败（含 406 配额用尽），返回 raw_url=\"\" 且从不填写 FileItem.raw_url_error，下载端点只能给出泛化的 404「未返回下载链接」，真实原因丢失",
+  "status": "已修复"
+ },
+ {
+  "id": "F-277",
+  "sev": "低",
+  "loc": "src/backend/drivers/115open/driver.ts:319",
+  "title": "linkCache 的过期条目永远不会被清理（只能被同 key 覆盖），长驻实例上随下载过的文件数无界增长",
+  "status": "已修复"
+ },
+ {
+  "id": "F-278",
+  "sev": "低",
+  "loc": "src/backend/drivers/115open/driver.ts:129",
+  "title": "SUBREQUEST_LIMIT=45 的截断预算无条件应用于所有运行时：默认 page_size=200 时目录超过约 8800 项就被静默截断，且只有 console.warn，调用方拿不到任何「结果不完整」的信号",
+  "status": "已修复"
+ },
+ {
+  "id": "F-285",
+  "sev": "低",
+  "loc": "src/backend/drivers/thunder/driver.ts:432-439",
+  "title": "ThunderExpertDriver.init() 在凭据不完整时两个登录分支都不执行也不报错，init 静默成功",
+  "status": "已修复"
+ },
+ {
+  "id": "F-286",
+  "sev": "低",
+  "loc": "src/backend/drivers/thunder/driver.ts:272-273",
+  "title": "move/copy 把虚拟目标目录 dstDir 传给 resolveFolderId，而物理目标 _dstPhys 被忽略",
+  "status": "已修复"
+ },
+ {
+  "id": "F-287",
+  "sev": "低",
+  "loc": "src/backend/drivers/thunder/util.ts:55-77",
+  "title": "calcGcid 用纯 JS 的 CryptoJS 对整个上传内容分块做 SHA1，大文件上传极易超出 Workers CPU 限额",
+  "status": "已修复"
+ },
+ {
+  "id": "F-293",
+  "sev": "低",
+  "loc": "src/backend/drivers/189_tv/driver.ts:96",
+  "title": "get() 用空 catch 吞掉全部异常并返回伪造的 is_dir 条目，op 层还会把这条假数据缓存成下载链接",
+  "status": "已修复"
+ },
+ {
+  "id": "F-296",
+  "sev": "低",
+  "loc": "src/backend/drivers/189_tv/util.ts:340",
+  "title": "getFileDownloadUrl 的探测 GET 与 upload 的 PUT 响应体从未被读取或取消，在 Workers 上会一直占用上游连接",
+  "status": "已修复"
+ },
+ {
+  "id": "F-297",
+  "sev": "低",
+  "loc": "src/backend/drivers/189_tv/util.ts:286",
+  "title": "getFiles 分页循环无上限，也不做 subrequest 预算检查，超大目录在 Workers 上会直接撞每请求 50 子请求上限",
+  "status": "已修复"
+ },
+ {
+  "id": "F-301",
+  "sev": "低",
+  "loc": "src/backend/drivers/baidu_photo/driver.ts:183",
+  "title": "get() 对任何不存在的路径返回伪造的 is_dir:true 目录项而不抛 not-found，且该假条目会被 op 层写入直链缓存",
+  "status": "已修复"
+ },
+ {
+  "id": "F-302",
+  "sev": "低",
+  "loc": "src/backend/drivers/baidu_photo/driver.ts:377",
+  "title": "albumCache 无 TTL 且随驱动实例跨请求持久存活，只在驱动自身变更后清除，外部改动（改名/删除相册）后 findAlbum 命中陈旧条目",
+  "status": "已修复"
+ },
+ {
+  "id": "F-303",
+  "sev": "低",
+  "loc": "src/backend/drivers/baidu_photo/util.ts:421",
+  "title": "上传分片的响应体完全不读取与校验，业务层 errno 错误不可见，失败分片无重试，最终以 create 步骤的误导性错误失败",
+  "status": "已修复"
+ },
+ {
+  "id": "F-304",
+  "sev": "低",
+  "loc": "src/backend/drivers/baidu_photo/util.ts:352",
+  "title": "上传对整个文件做两遍纯 JS MD5 扫描外加一次全量 Uint8Array 拷贝，大文件在 Workers 的 CPU/内存限制下必然失败或超时",
+  "status": "已修复"
+ },
+ {
+  "id": "F-308",
+  "sev": "低",
+  "loc": "src/backend/drivers/github_releases/util.ts:261-278",
+  "title": "list() 合成的祖先目录 size 恒为 0、modified 用当前时间，丢失 Go 版聚合的 release 体量与真实时间",
+  "status": "已修复"
+ },
+ {
+  "id": "F-309",
+  "sev": "低",
+  "loc": "src/backend/drivers/github_releases/util.ts:141",
+  "title": "max_page 非法值被静默解释为「不限制」，与 per_page 的兜底行为不一致；翻页终止仅依赖短页条件，无任何护栏",
+  "status": "已修复"
+ },
+ {
+  "id": "F-317",
+  "sev": "低",
+  "loc": "src/backend/drivers/onedrive/driver.ts:292",
+  "title": "enable_direct_upload 配置被解析、归一化却从未被消费，勾选后上传仍全量经 Worker 中转，属无效死配置",
+  "status": "已修复"
+ },
+ {
+  "id": "F-318",
+  "sev": "低",
+  "loc": "src/backend/drivers/onedrive/util.ts:50",
+  "title": "本地 OAuth 刷新分支不看 HTTP 状态、不透出微软返回的 error_description，一切失败都抛成一句 \"Empty token\"",
+  "status": "已修复"
+ },
+ {
+  "id": "F-323",
+  "sev": "低",
+  "loc": "src/backend/drivers/quark/util.ts:392",
+  "title": "unescapeHtml 先替换 &amp; 导致二次解码，文件名含实体字面量时被错误篡改",
+  "status": "已修复"
+ },
+ {
+  "id": "F-324",
+  "sev": "低",
+  "loc": "src/backend/drivers/quark/util.ts:353",
+  "title": "quark init() 吞掉全部 /config 校验错误，无效 cookie 的存储照样挂载成功",
+  "status": "已修复"
+ },
+ {
+  "id": "F-325",
+  "sev": "低",
+  "loc": "src/backend/drivers/sftp/util.ts:318",
+  "title": "removeRecursive 把 lstat 的任何错误都当成「路径不存在」，删除静默假成功",
+  "status": "已修复"
+ },
+ {
+  "id": "F-326",
+  "sev": "低",
+  "loc": "src/backend/drivers/sftp/util.ts:50",
+  "title": "parseAddress 无法解析不带方括号的 IPv6 地址，会把末段误当端口",
+  "status": "已修复"
+ },
+ {
+  "id": "F-332",
+  "sev": "低",
+  "loc": "src/backend/drivers/wps/driver.ts:147-172",
+  "title": "get() 返回的 raw_url 不带 raw_url_headers，而同一驱动 link() 为同一批下载 URL 明确附带 User-Agent/Referer，实际下载链路因此缺失必需头",
+  "status": "已修复"
+ },
+ {
+  "id": "F-333",
+  "sev": "低",
+  "loc": "src/backend/drivers/wps/driver.ts:230-238",
+  "title": "move/copy/remove 在源路径解析为 null 时静默跳过并返回成功，操作实际未执行",
+  "status": "已修复"
+ },
+ {
+  "id": "F-339",
+  "sev": "低",
+  "loc": "src/backend/drivers/dropbox/driver.ts:80",
+  "title": "文件 get() 恒返回 size 0 与 modified=当前时间，忽略了 get_temporary_link 响应自带的 metadata",
+  "status": "已修复"
+ },
+ {
+  "id": "F-340",
+  "sev": "低",
+  "loc": "src/backend/drivers/dropbox/util.ts:31",
+  "title": "use_online_api 刷新令牌时把 refresh_token 放进查询串请求管理员配置的 api_url_address，未做同仓库已建立的 assertSafeUrl SSRF 校验",
+  "status": "已修复"
+ },
+ {
+  "id": "F-346",
+  "sev": "低",
+  "loc": "src/backend/drivers/189pc/util.ts:2",
+  "title": "189pc 驱动使用 Node 专有 crypto 模块，在 ESA 边缘构建中被替换为抛错 shim，登录、签名、哈希等所有操作运行时必抛异常",
+  "status": "已修复"
+ },
+ {
+  "id": "F-348",
+  "sev": "低",
+  "loc": "src/backend/drivers/189pc/driver.ts:217",
+  "title": "189pc list() 分页循环以 recordCount 为唯一退出条件，recordCount 缺失/为 undefined 时死循环直到 CPU 限额",
+  "status": "已修复"
+ },
+ {
+  "id": "F-349",
+  "sev": "低",
+  "loc": "src/backend/drivers/189pc/driver.ts:352",
+  "title": "189pc put() 对任意大小文件都只声明/上传单个分片，与 sliceSize=10MB 的分片声明矛盾；同时计算了从未使用的全文件 SHA-1",
+  "status": "已修复"
+ },
+ {
+  "id": "F-350",
+  "sev": "低",
+  "loc": "src/backend/drivers/aliyundrive_open/util.ts:293",
+  "title": "listFiles 在 UserNotAllowedAccessDrive 时切换 drive_id 重试，但保留了旧 drive 的 parent_file_id，非根目录重试必失败",
+  "status": "已修复"
+ },
+ {
+  "id": "F-351",
+  "sev": "低",
+  "loc": "src/backend/drivers/aliyundrive_open/driver.ts:178",
+  "title": "rapidUpload 秒传未命中时，/openFile/create 已创建的未完成文件条目既不补传也不删除，直接返回 false 留下孤儿条目",
+  "status": "已修复"
+ },
+ {
+  "id": "F-352",
+  "sev": "低",
+  "loc": "src/backend/drivers/aliyundrive_open/util.ts:142",
+  "title": "在线中转返回缺 access_token 时，把完整响应 JSON（含轮换后的 refresh_token）打进错误消息并 console.warn 到日志",
+  "status": "已修复"
+ },
+ {
+  "id": "F-355",
+  "sev": "低",
+  "loc": "src/backend/drivers/onedrive_app/driver.ts:51-54",
+  "title": "构造函数用 `!!` 强转布尔字段，使 init() 里的字符串布尔归一化成为死代码，字符串 \"false\" 被反转为 true",
+  "status": "已修复"
+ },
+ {
+  "id": "F-361",
+  "sev": "低",
+  "loc": "src/backend/drivers/google_drive/util.ts:195",
+  "title": "Google Drive 的 order_by 默认值是 Drive 专用复合查询串，被 sortFileItems 的启发式误读成『按修改时间排序』，覆盖了 API 返回的 name 排序",
+  "status": "已修复"
+ },
+ {
+  "id": "F-362",
+  "sev": "低",
+  "loc": "src/backend/drivers/google_drive/driver.ts:53",
+  "title": "get() 对目录也返回非空 raw_url 和 Authorization 头，/d|/p 访问目录时会把 Google 的 403 错误原样代理给用户",
+  "status": "已修复"
+ },
+ {
+  "id": "F-363",
+  "sev": "低",
+  "loc": "src/backend/drivers/seafile/util.ts:26",
+  "title": "配置了静态 token 时 getToken() 直接短路，401 重试机制永远无法用已有的 username/password 恢复会话",
+  "status": "已修复"
+ },
+ {
+  "id": "F-370",
+  "sev": "低",
+  "loc": "src/backend/drivers/chaoxing/util.ts:140-151",
+  "title": "chaoxing getFiles 对 recType=2 响应不检查 result，失败时静默返回缺文件的残缺目录列表",
+  "status": "已修复"
+ },
+ {
+  "id": "F-372",
+  "sev": "低",
+  "loc": "src/backend/drivers/chaoxing/driver.ts:190-192 与 203-204",
+  "title": "chaoxing pathCache 的写入键带前导斜杠、查询键不带，缓存永不命中（死缓存）",
+  "status": "已修复"
+ },
+ {
+  "id": "F-373",
+  "sev": "低",
+  "loc": "src/backend/drivers/mediatrack/driver.ts:214-215 (remove), 251-252 (move), 283-284 (copy)",
+  "title": "mediatrack remove/move/copy 找不到源对象时静默返回成功，部分失败被隐藏",
+  "status": "已修复"
+ },
+ {
+  "id": "F-374",
+  "sev": "低",
+  "loc": "src/backend/drivers/chaoxing/types.ts:8 与 driver.ts:191",
+  "title": "chaoxing addition 声明了 root_folder_id 但驱动从不使用（根目录恒为 \"-1\"），与 op 层对根节点 sign 的取值相互矛盾",
+  "status": "已修复"
+ },
+ {
+  "id": "F-382",
+  "sev": "低",
+  "loc": "src/backend/drivers/autoindex/driver.ts:180",
+  "title": "get() 把远端 URL 塞进 sign 字段，违反同文件声明的 sign 不变式，并经分享接口原样泄漏给客户端",
+  "status": "已修复"
+ },
+ {
+  "id": "F-383",
+  "sev": "低",
+  "loc": "src/backend/drivers/mega/types.ts:6",
+  "title": "move_to_trash 与 root_folder_id 配置项完全未实现，配置静默失效",
+  "status": "已修复"
+ },
+ {
+  "id": "F-389",
+  "sev": "低",
+  "loc": "src/backend/drivers/netease_music/driver.ts:69",
+  "title": "get() 对不存在的歌曲返回伪造的 FileItem（size 0、sign 空、raw_url 空）而不是抛错",
+  "status": "已修复"
+ },
+ {
+  "id": "F-390",
+  "sev": "低",
+  "loc": "src/backend/drivers/netease_music/util.ts:77",
+  "title": "request() 既不检查 resp.ok 也不检查网易云返回体里的 code 字段，鉴权失败/限流被吞成空列表",
+  "status": "已修复"
+ },
+ {
+  "id": "F-391",
+  "sev": "低",
+  "loc": "src/backend/drivers/netease_music/util.ts:109",
+  "title": "removeSong 完全忽略响应内容，删除失败也向调用方报成功",
+  "status": "已修复"
+ },
+ {
+  "id": "F-392",
+  "sev": "低",
+  "loc": "src/backend/drivers/netease_music/util.ts:110",
+  "title": "removeSong 走明文 http:// 并在请求头携带含 MUSIC_U 的完整 Cookie，会话凭据明文传输",
+  "status": "已修复"
+ },
+ {
+  "id": "F-401",
+  "sev": "低",
+  "loc": "src/backend/drivers/115/util.ts:62",
+  "title": "115 与 quark_open 的 request() 在 token 刷新后无条件递归重试、无次数上限，也无并发刷新去重",
+  "status": "已修复"
+ },
+ {
+  "id": "F-402",
+  "sev": "低",
+  "loc": "src/backend/drivers/115/driver.ts:46",
+  "title": "115 驱动对上游已完全解码的路径再次 decodeURIComponent，字面名含 %XX 的文件可能匹配到错误的条目",
+  "status": "已修复"
+ },
+ {
+  "id": "F-407",
+  "sev": "低",
+  "loc": "src/backend/drivers/cnb_releases/driver.ts:29",
+  "title": "release.assets 为 undefined/null 时 r.assets.reduce 直接抛 TypeError，一条 release 拖垮整次列目录",
+  "status": "已修复"
+ },
+ {
+  "id": "F-408",
+  "sev": "低",
+  "loc": "src/backend/drivers/bunny_storage/util.ts:97",
+  "title": "signCDNURL 用 decodeURIComponent 解码路径，文件名含非法 % 转义时抛 URIError，该文件彻底无法访问",
+  "status": "已修复"
+ },
+ {
+  "id": "F-409",
+  "sev": "低",
+  "loc": "src/backend/drivers/bunny_storage/util.ts:76",
+  "title": "cdnURL 未按 Go 参考实现剥离 cdn_base_url 路径中的挂载前缀，该配置形态下生成错误直链",
+  "status": "已修复"
+ },
+ {
+  "id": "F-417",
+  "sev": "低",
+  "loc": "src/backend/drivers/degoo/driver.ts:155",
+  "title": "两个驱动的 pathCache 键不匹配：查找键无前导斜杠、存储键有前导斜杠，缓存永不命中（形同虚设）",
+  "status": "已修复"
+ },
+ {
+  "id": "F-418",
+  "sev": "低",
+  "loc": "src/backend/drivers/mediafire/driver.ts:28",
+  "title": "MediaFire 返回的 created（无时区的 \"YYYY-MM-DD HH:MM:SS\"）被 new Date 按运行时本地时区解析，modified 时间戳随部署环境漂移；且 Invalid Date 会令 t",
+  "status": "已修复"
+ },
+ {
+  "id": "F-419",
+  "sev": "低",
+  "loc": "src/backend/drivers/degoo/util.ts:66",
+  "title": "isTokenExpired 在 JWT payload 无有效 exp 时因 NaN 比较返回 false（视为未过期）",
+  "status": "已修复"
+ },
+ {
+  "id": "F-429",
+  "sev": "低",
+  "loc": "src/backend/drivers/aliyundrive_share/util.ts:95",
+  "title": "三个驱动的 token 失效重试均为\"原地刷新后无限递归\"，刷新成功但令牌仍被拒时无界递归（栈溢出/无界 CPU）",
+  "status": "已修复"
+ },
+ {
+  "id": "F-431",
+  "sev": "低",
+  "loc": "src/backend/drivers/cloudflare_imgbed/driver.ts:136",
+  "title": "get() 对任何路径都返回 is_dir:false 且构造 /file/ 直链，目录路径被伪造成可下载文件",
+  "status": "已修复"
+ },
+ {
+  "id": "F-442",
+  "sev": "低",
+  "loc": "src/backend/drivers/febbox/driver.ts:159",
+  "title": "pathToId 的缓存键读写不一致（读取无前导斜杠、写入带前导斜杠），缓存永不命中",
+  "status": "已修复"
+ },
+ {
+  "id": "F-443",
+  "sev": "低",
+  "loc": "src/backend/drivers/url_tree/driver.ts:172-182",
+  "title": "getSizeFromUrl 用默认 redirect:follow 发起 HEAD，assertSafeUrl 的 SSRF 校验会被 3xx 跳转绕过",
+  "status": "已修复"
+ },
+ {
+  "id": "F-451",
+  "sev": "低",
+  "loc": "src/backend/drivers/azure_blob/driver.ts:275-311",
+  "title": "目录的 rename/move/remove 只复制/删除 0 字节目录标记 blob，其下所有子 blob 留在旧前缀下成为不可见孤儿",
+  "status": "已修复"
+ },
+ {
+  "id": "F-452",
+  "sev": "低",
+  "loc": "src/backend/drivers/doubao/driver.ts:48-88",
+  "title": "get() 用 try{}catch{} 吞掉全部错误并合成假条目：API 故障时返回伪造文件、不存在的路径返回假文件而非 404，且结果会被写入下载链接缓存长期生效",
+  "status": "已修复"
+ },
+ {
+  "id": "F-453",
+  "sev": "低",
+  "loc": "src/backend/drivers/google_photo/driver.ts:70-82",
+  "title": "get() 对任何错误或未命中的路径一律返回 is_dir:true 的假目录，不存在路径不会 404，API 故障时所有文件都变成『目录』",
+  "status": "已修复"
+ },
+ {
+  "id": "F-454",
+  "sev": "低",
+  "loc": "src/backend/drivers/azure_blob/driver.ts:63-91",
+  "title": "parseListBlobsXml 不做 XML 实体解码，名称含 & < > 等字符的 blob 在列表中显示为转义串且 sign 路径错误",
+  "status": "已修复"
+ },
+ {
+  "id": "F-455",
+  "sev": "低",
+  "loc": "src/backend/drivers/azure_blob/driver.ts:203",
+  "title": "sasUrl 与 copyBlob 用未编码的 blob 路径拼 URL，名称含 ? 或 # 时 SAS 下载链接/复制源被截断",
+  "status": "已修复"
+ },
+ {
+  "id": "F-465",
+  "sev": "低",
+  "loc": "src/backend/drivers/crypt/driver.ts:243",
+  "title": "crypt isFile() 在「同名文件与目录共存」时误判，把对目录的操作落到同名文件上",
+  "status": "已修复"
+ },
+ {
+  "id": "F-466",
+  "sev": "低",
+  "loc": "src/backend/drivers/crypt/driver.ts:225",
+  "title": "crypt createReadStream 无论是否 Range 请求都全量拉取并解密整个文件，大文件在 Workers/EdgeOne 上会超内存",
+  "status": "已修复"
+ },
+ {
+  "id": "F-473",
+  "sev": "低",
+  "loc": "src/backend/drivers/ipfs_api/driver.ts:124",
+  "title": "MFS 根层级 rename 生成 \"//新名\" 双斜杠目标路径",
+  "status": "已修复"
+ },
+ {
+  "id": "F-474",
+  "sev": "低",
+  "loc": "src/backend/drivers/misskey/driver.ts:184",
+  "title": "pathCache 的写入键带前导斜杠、读取键不带，缓存永远不命中",
+  "status": "已修复"
+ },
+ {
+  "id": "F-481",
+  "sev": "低",
+  "loc": "src/backend/drivers/teldrive/types.ts:10",
+  "title": "teldrive 配置项 root_path 在驱动中从未被读取，声明的根路径限制静默失效",
+  "status": "已修复"
+ },
+ {
+  "id": "F-482",
+  "sev": "低",
+  "loc": "src/backend/drivers/openlist_share/driver.ts:50-74",
+  "title": "openlist_share 的 get() 把「目标不存在」和「上游出错」都吞掉并返回一个假目录，404 永远不可见",
+  "status": "已修复"
+ },
+ {
+  "id": "F-483",
+  "sev": "低",
+  "loc": "src/backend/drivers/lenovonas/driver.ts:43-65",
+  "title": "lenovonas 与 teldrive 的 get() 用空 catch{} 包住取直链/列目录，瞬时错误被吞后降级为 size 0、无 raw_url 的假文件",
+  "status": "已修复"
+ },
+ {
+  "id": "F-484",
+  "sev": "低",
+  "loc": "src/backend/drivers/teldrive/driver.ts:132-151",
+  "title": "teldrive 的 pathCache 挂在跨请求复用的驱动实例上且无任何失效手段，远端变更后会命中过期文件 id，remove/move 操作到旧对象上",
+  "status": "已修复"
+ },
+ {
+  "id": "F-021",
+  "sev": "低",
+  "loc": "src/backend/server/seed.ts:353-358",
+  "title": "fetchSafe 手动跟随重定向时把 init.headers（含用户 Authorization 凭证与驱动 raw_url_headers）原样转发到跨域重定向目标，造成 Bearer token 泄漏",
+  "status": "已修复"
+ },
+ {
+  "id": "F-043",
+  "sev": "低",
+  "loc": "src/backend/server/share.ts:142",
+  "title": "/share/create 自定义分享 ID 的唯一性检查存在 TOCTOU，并发创建可产生重复 share id",
+  "status": "已修复"
+ },
+ {
+  "id": "F-047",
+  "sev": "低",
+  "loc": "src/backend/server/s3.ts:71-82",
+  "title": "parseS3Path 只对 key 做百分号解码，bucket 段保留编码原样，含空格/非 ASCII 的一级目录无法经 /s3 访问",
+  "status": "已修复"
+ },
+ {
+  "id": "F-048",
+  "sev": "低",
+  "loc": "src/backend/server/assets.ts:208,228,287",
+  "title": "resolvedCdnCache 无 TTL：$version 解析为 latest 时，静态资源 302 在整个 isolate 生命周期内钉死在首次解析的旧版本",
+  "status": "已修复"
+ },
+ {
+  "id": "F-196",
+  "sev": "低",
+  "loc": "src/backend/drivers/123pan/util.ts:575",
+  "title": "createUpload 请求体把 parentFileId 作为 JSON 字符串发送，与参考实现（数值）及本文件 mkdir（parseInt 成数值）不一致",
+  "status": "已修复"
+ },
+ {
+  "id": "F-430",
+  "sev": "低",
+  "loc": "src/backend/drivers/chunk/driver.ts:341",
+  "title": "createReadStream 用 `skip >= partSize` 跳过分片，远端列表把分片大小报成 0 时（元数据缺失的存储如 cloudflare_imgbed 作底层），所有分片被当作空片跳过，非空文件下载",
+  "status": "已修复"
+ }
+]

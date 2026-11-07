@@ -49,28 +49,41 @@ export class DriverGooglePhoto implements StorageDriver {
 
   async get(_virtualPath: string, physicalPath: string): Promise<FileItem> {
     const parts = physicalPath.split("/").filter(Boolean)
-    const rawName = parts[parts.length - 1] || "root"
-    const parentPath = "/" + parts.slice(0, -1).join("/")
-
-    try {
-      const parentId = await this.pathToId(parentPath)
-      const files = await this.client.getFiles(parentId)
-      const target = files.find((f) => (f.filename || f.title) === rawName)
-      if (target) {
-        const item = fileToItem(target)
-        if (!item.is_dir) {
-          try {
-            item.raw_url = await this.client.link(target.id)
-          } catch {
-            item.raw_url_error = "[GooglePhoto] failed to resolve download url"
-          }
-        }
-        return item
+    if (parts.length === 0) {
+      return {
+        name: "root",
+        size: 0,
+        is_dir: true,
+        modified: new Date().toISOString(),
+        sign: "root",
+        type: 1,
+        raw_url: "",
       }
-    } catch {
-      // fall through
     }
 
+    // F-453：以前未命中与任何异常都落到伪造的 is_dir:true 目录，
+    // 不存在的路径不 404、API 故障时所有文件都「变成目录」。
+    // 现在：查询异常向上传播；未命中时先用 pathToId + 列目录确认该路径
+    // 确实是相册层级，确认不了就抛 not found。
+    const rawName = parts[parts.length - 1]
+    const parentPath = "/" + parts.slice(0, -1).join("/")
+    const parentId = await this.pathToId(parentPath)
+    const files = await this.client.getFiles(parentId)
+    const target = files.find((f) => (f.filename || f.title) === rawName)
+    if (target) {
+      const item = fileToItem(target)
+      if (!item.is_dir) {
+        try {
+          item.raw_url = await this.client.link(target.id)
+        } catch {
+          item.raw_url_error = "[GooglePhoto] failed to resolve download url"
+        }
+      }
+      return item
+    }
+
+    const dirId = await this.pathToId(physicalPath)
+    await this.client.getFiles(dirId)
     return {
       name: rawName,
       size: 0,

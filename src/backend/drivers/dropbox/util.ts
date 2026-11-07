@@ -5,6 +5,55 @@ import {
   DropboxCurrentAccountResp,
   DropboxSpaceUsageResp,
 } from "./types"
+import { assertSafeUrl } from "../../pkg/http"
+
+/**
+ * Dropbox 的参数头。F-335：`Dropbox-API-Arg` 的头值必须是 ByteString，
+ * 直接放 JSON.stringify 的结果会让任何非 Latin-1 文件名（中文/emoji…）在
+ * fetch 构造请求时抛 TypeError；128-255 区间的字符还会被按单字节发送，
+ * UTF-8 语义被破坏。
+ *
+ * 这里把 JSON 里的非 ASCII 字符转成等价的 `\uXXXX` 转义（JSON 规范内的
+ * 合法写法，服务端解析后仍是原始字符），保证头值恒为纯 ASCII，且沿用
+ * 官方 `Dropbox-API-Arg` 头名，不依赖任何未文档化的变体。
+ */
+function toAsciiJson(json: string): string {
+  return json.replace(
+    /[\u007f-\uffff]/g,
+    (c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"),
+  )
+}
+
+function apiArgHeader(arg: unknown): Record<string, string> {
+  return { "Dropbox-API-Arg": toAsciiJson(JSON.stringify(arg)) }
+}
+
+/** 单次 /2/files/upload 的上限（Dropbox 硬限制 150 MiB） */
+const SINGLE_UPLOAD_LIMIT = 150 * 1024 * 1024
+/** upload_session 的 append 分片：必须是 4 MiB 的倍数（最后一块除外） */
+const SESSION_CHUNK_SIZE = 8 * 1024 * 1024
+
+function parseErrorSummary(text: string): string {
+  try {
+    return String(JSON.parse(text)?.error_summary || "")
+  } catch {
+    return ""
+  }
+}
+
+/** Dropbox 错误体形如 {"error":{".tag":"path","path":{".tag":"not_file"}}} */
+function parseErrorTag(text: string): string {
+  try {
+    const data = JSON.parse(text)
+    const err = data?.error
+    const nested =
+      err?.path?.[".tag"] ?? err?.lookup?.[".tag"] ?? err?.[".tag"] ?? ""
+    const fromSummary = String(data?.error_summary || "").split("/")[1] || ""
+    return String(nested || fromSummary)
+  } catch {
+    return ""
+  }
+}
 
 export class DropboxApiClient {
   private addition: DropboxAddition
@@ -14,6 +63,10 @@ export class DropboxApiClient {
   }) => Promise<void>
   private base = "https://api.dropboxapi.com"
   private contentBase = "https://content.dropboxapi.com"
+  /** 单次上传上限（可被测试覆盖，默认 Dropbox 的 150 MiB 硬限制） */
+  private singleUploadLimit = SINGLE_UPLOAD_LIMIT
+  /** upload_session 分片大小（可被测试覆盖，默认 8 MiB） */
+  private sessionChunkSize = SESSION_CHUNK_SIZE
 
   constructor(
     addition: DropboxAddition,
@@ -28,6 +81,9 @@ export class DropboxApiClient {
 
   async refreshToken(): Promise<void> {
     if (this.addition.use_online_api && this.addition.api_url_address) {
+      // F-340：该字段会把 refresh_token 发出去，必须先做 SSRF 校验，
+      // 与 aliyundrive_open 的 FIX(H-2) 保持一致。
+      assertSafeUrl(this.addition.api_url_address, "Dropbox api_url_address")
       const u = new URL(this.addition.api_url_address)
       u.searchParams.set("refresh_ui", this.addition.refresh_token)
       u.searchParams.set("server_use", "true")
@@ -140,7 +196,17 @@ export class DropboxApiClient {
         return this.request<T>(uri, options, false)
       }
 
-      throw new Error(`Dropbox API error (${res.status}): ${text}`)
+      // F-336：把 Dropbox 的 error_summary/.tag 结构化附加到 Error 上，
+      // 供驱动层区分「对象不存在」「是目录」「其它故障」。
+      const err = new Error(`Dropbox API error (${res.status}): ${text}`) as Error & {
+        status?: number
+        tag?: string
+        errorSummary?: string
+      }
+      err.status = res.status
+      err.errorSummary = parseErrorSummary(text)
+      err.tag = parseErrorTag(text)
+      throw err
     }
 
     const contentType = res.headers.get("content-type") || ""
@@ -213,15 +279,95 @@ export class DropboxApiClient {
     return entries
   }
 
-  async getTemporaryLink(filePath: string): Promise<string> {
-    const res = await this.request<{ link: string }>(
+  /**
+   * F-339：get_temporary_link 的响应同时带有 metadata（size、server_modified …），
+   * 之前只取 link 丢弃了它，导致 get() 只能返回 size 0 与「当前时间」。
+   */
+  async getTemporaryLink(
+    filePath: string,
+  ): Promise<{ link: string; metadata?: DropboxFileEntry }> {
+    return this.request<{ link: string; metadata?: DropboxFileEntry }>(
       "/2/files/get_temporary_link",
       {
         method: "POST",
         body: { path: filePath },
       },
     )
-    return res.link
+  }
+
+  /**
+   * F-338：/2/files/upload 单次上限 150 MiB，更大文件必须走
+   * upload_session/start + append_v2 + finish。之前一律单次上传，
+   * 超过 150 MiB 的文件必然失败。
+   */
+  async upload(path: string, content: Uint8Array): Promise<void> {
+    const commit = {
+      path,
+      mode: "overwrite",
+      autorename: false,
+      mute: false,
+      strict_conflict: false,
+    }
+
+    if (content.length <= this.singleUploadLimit) {
+      await this.request("/2/files/upload", {
+        method: "POST",
+        isContentApi: true,
+        customHeaders: {
+          ...apiArgHeader(commit),
+          "Content-Type": "application/octet-stream",
+        },
+        body: content,
+      })
+      return
+    }
+
+    const total = content.length
+    const firstEnd = Math.min(this.sessionChunkSize, total)
+    const started = await this.request<{ session_id: string }>(
+      "/2/files/upload_session/start",
+      {
+        method: "POST",
+        isContentApi: true,
+        customHeaders: {
+          ...apiArgHeader({ close: false }),
+          "Content-Type": "application/octet-stream",
+        },
+        body: content.subarray(0, firstEnd),
+      },
+    )
+    const sessionId = started.session_id
+    if (!sessionId) {
+      throw new Error("Dropbox upload_session/start returned no session_id")
+    }
+    let offset = firstEnd
+
+    while (total - offset > this.sessionChunkSize) {
+      const end = offset + this.sessionChunkSize
+      await this.request("/2/files/upload_session/append_v2", {
+        method: "POST",
+        isContentApi: true,
+        customHeaders: {
+          ...apiArgHeader({ cursor: { session_id: sessionId, offset } }),
+          "Content-Type": "application/octet-stream",
+        },
+        body: content.subarray(offset, end),
+      })
+      offset = end
+    }
+
+    await this.request("/2/files/upload_session/finish", {
+      method: "POST",
+      isContentApi: true,
+      customHeaders: {
+        ...apiArgHeader({
+          cursor: { session_id: sessionId, offset },
+          commit,
+        }),
+        "Content-Type": "application/octet-stream",
+      },
+      body: content.subarray(offset),
+    })
   }
 
   async createFolder(folderPath: string): Promise<void> {

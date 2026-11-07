@@ -146,4 +146,13 @@ export interface StoreBackend {
   init?(env?: any): Promise<void>
   /** 健康检查，用于 /debug/info 与 /admin/kv/status。 */
   health?(env?: any): Promise<any>
+  /**
+   * 最近一次 load 的「键列表完整性」是否可证明（QS-1）。
+   *
+   * key 格式 + 最终一致后端（kv / cfkv）的 list 可能部分漏报，客户端无法证明
+   * 「没列出来 = 不存在」。此时返回 false，db.ts 据此不把内存库标记为 dbTrusted
+   * （内存库不是持久化状态的完整镜像），避免匿名 /init/setup 与写回被误放行。
+   * 未实现时视为「可证明」（map / sql / 强一致驱动）。
+   */
+  loadCompletenessProven?(env?: any): boolean
 }

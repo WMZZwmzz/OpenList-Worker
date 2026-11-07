@@ -2,7 +2,7 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { Pan123ShareDriver } from "./driver"
 import { Pan123ShareAddition } from "./types"
-import { crc32, signPath } from "./util"
+import { crc32, formatCstTime, signPath } from "./util"
 
 test("123PanShare CRC32 and path signing", () => {
   const c = crc32("test_string")
@@ -56,4 +56,22 @@ test("Pan123ShareDriver instantiation and methods", async () => {
 
   const link = await driver.link("/file_b.mp4", "/file_b.mp4")
   assert.equal(link.url, "https://download.123pan.cn/file_b.mp4")
+})
+
+test("F-387: signPath 时间串固定按 UTC+8（北京时间）构造", () => {
+  // 2024-01-01T00:30:00Z → 北京时间 2024-01-01 08:30
+  assert.equal(formatCstTime(new Date("2024-01-01T00:30:00Z")), "202401010830")
+  // 2024-01-01T16:05:00Z → 北京时间 2024-01-02 00:05（跨日）
+  assert.equal(formatCstTime(new Date("2024-01-01T16:05:00Z")), "202401020005")
+})
+
+test("F-388: list 不存在的目录段时抛错，不再回退到祖先目录", async () => {
+  const driver = new Pan123ShareDriver({ sharekey: "key" })
+  ;(driver as any).client.getFiles = async () => [
+    { FileId: 101, FileName: "folder_a", Type: 1, Size: 0 },
+  ]
+  await assert.rejects(
+    () => driver.list("/", "/missing"),
+    /Folder not found: missing/,
+  )
 })

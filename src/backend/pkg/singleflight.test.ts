@@ -190,7 +190,9 @@ test("schema: singleflight 表名带 x_ 前缀，且 DDL 覆盖两种方言", ()
 
   const mysql = buildSingleFlightDdl("mysql").join("\n")
   assert.match(mysql, /CREATE TABLE IF NOT EXISTS `x_singleflight`/)
-  assert.match(mysql, /`key` VARCHAR\(512\) PRIMARY KEY/)
+  // F-082：去重键含用户可控的完整虚拟路径，512 字符会截断；768 是 utf8mb4
+  // 下 InnoDB（DYNAMIC）索引上限（3072 字节），与 kv 表同一兼容假设。
+  assert.match(mysql, /`key` VARCHAR\(768\) PRIMARY KEY/)
   assert.match(mysql, /`expires_at` BIGINT NOT NULL/)
   // MySQL 不支持 CREATE INDEX IF NOT EXISTS，因此不建索引
   assert.doesNotMatch(mysql, /CREATE INDEX/)

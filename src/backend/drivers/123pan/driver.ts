@@ -48,6 +48,52 @@ function sessionToUpload(s: Pan123SessionData): Pan123UploadResp["data"] {
   }
 }
 
+/**
+ * 分片会话的**运行期观测状态**。
+ *
+ * 分片大小契约由调用方掌握：fs 的 /multipart/* 按前端 X-Chunk-Size
+ * （缺省 10MB、上限 64MB）切片，seed 按 8MB 切片，两者都不会读取驱动返回的
+ * chunkSize/partCount。因此驱动绝不能按自己的名义 16MB 去声明
+ * partCount/isMultipart —— 否则 10MB<size≤16MB 会被声明为单片（实际两片），
+ * 收尾 isMultipart=false 但已 PUT 两片，文件被截断/上传失败。
+ *
+ * 这里按**实际收到的分片**记录片号与字节数：
+ *   - 单/多分片判定：partNumber>1 或 单片长度<size → 多分片；
+ *   - complete 时用各片字节之和校验总大小，并据此给出 isMultipart。
+ * 状态与 fs 的会话管理器同为进程内状态（分片请求必须命中同一 isolate 才能
+ * 取到会话），生命周期一致。
+ */
+interface Pan123ObservedUpload {
+  /** partNumber → 该片实际字节数（重复上传同一片时覆盖，不重复累计） */
+  partBytes: Map<number, number>
+}
+
+const observedUploads = new Map<string, Pan123ObservedUpload>()
+const MAX_OBSERVED_UPLOADS = 256
+
+function observedKey(s: Pan123SessionData): string {
+  return `${s.key}|${s.uploadId}`
+}
+
+function observePart(
+  s: Pan123SessionData,
+  partNumber: number,
+  contentLength: number,
+): Pan123ObservedUpload {
+  const key = observedKey(s)
+  let state = observedUploads.get(key)
+  if (!state) {
+    state = { partBytes: new Map() }
+    if (observedUploads.size >= MAX_OBSERVED_UPLOADS) {
+      const oldest = observedUploads.keys().next().value
+      if (oldest !== undefined) observedUploads.delete(oldest)
+    }
+    observedUploads.set(key, state)
+  }
+  state.partBytes.set(partNumber, contentLength)
+  return state
+}
+
 function pan123FileToFileItem(f: Pan123File): FileItem {
   const isDir = f.Type === 1
   return {
@@ -64,6 +110,26 @@ function pan123FileToFileItem(f: Pan123File): FileItem {
   }
 }
 
+/** 单次调用允许的子请求预算（Cloudflare 免费版硬上限 50，留 5 次余量） */
+const SUBREQUEST_LIMIT = 45
+
+/**
+ * F-193：子请求预算必须是**调用局部**对象。
+ *
+ * 驱动实例被 op 层按 storageId+modified 跨请求缓存复用，把 `{used,limit}`
+ * 挂在实例上会让并发请求互相 reset/累加——后到者的 reset 清掉先到者已消耗的
+ * 计数（击穿 50 次上限），或双方共用同一计数被提前截断（目录列表静默缺失
+ * 且被写入文件树缓存）。因此每个入口方法各自创建一个预算对象并向下传递。
+ */
+interface SubrequestBudget {
+  used: number
+  limit: number
+}
+
+function newBudget(): SubrequestBudget {
+  return { used: 0, limit: SUBREQUEST_LIMIT }
+}
+
 export class Pan123Driver implements StorageDriver {
   readonly rapidHashAlgos = ["md5"]
   readonly rapidHashNeedsPieces = false
@@ -72,12 +138,6 @@ export class Pan123Driver implements StorageDriver {
   private addition: Pan123Addition
   /** cache: physical path → folder FileId (string) */
   private pathIdCache = new Map<string, string>()
-  /**
-   * Cloudflare Workers subrequest 预算（免费版单次 invocation 最多 50 个子请求）。
-   * 所有分页/路径解析调用共享该预算；超出时截断并告警，避免
-   * "Too many subrequests by single Worker invocation" 错误。
-   */
-  private budget = { used: 0, limit: 45 }
 
   constructor(
     addition: Pan123Addition,
@@ -99,7 +159,10 @@ export class Pan123Driver implements StorageDriver {
    * folder by name, caching results. Each level consumes at most one
    * page of subrequests (findName early-termination).
    */
-  private async resolveFolderId(physicalPath: string): Promise<string> {
+  private async resolveFolderId(
+    physicalPath: string,
+    budget: SubrequestBudget,
+  ): Promise<string> {
     const rootId = this.client.getRootId()
     const clean =
       "/" +
@@ -107,7 +170,9 @@ export class Pan123Driver implements StorageDriver {
         .split("/")
         .filter(Boolean)
         .join("/")
-    if (clean === "/" || clean === `/${rootId}`) {
+    // F-199：物理路径是相对 root_id 的，不带 rootId 段。只有 "/" 是根；
+    // 把 "/<rootId>" 也当根会让顶层同名目录永远打不开。
+    if (clean === "/") {
       return rootId
     }
 
@@ -141,7 +206,7 @@ export class Pan123Driver implements StorageDriver {
       const files = await this.client.getFiles(parentId, {
         findName: decodedName,
         findIsDir: true,
-        budget: this.budget,
+        budget,
       })
       const folder = files.find(
         (f) =>
@@ -166,7 +231,10 @@ export class Pan123Driver implements StorageDriver {
    * 与 resolveFolderId 的区别是——目录不存在时不抛 "folder not found"，
    * 而是调用 mkdir 创建。用于上传文件夹 / 上传到尚不存在的子目录。
    */
-  private async ensureFolderId(physicalPath: string): Promise<string> {
+  private async ensureFolderId(
+    physicalPath: string,
+    budget: SubrequestBudget,
+  ): Promise<string> {
     const rootId = this.client.getRootId()
     const clean =
       "/" +
@@ -174,7 +242,9 @@ export class Pan123Driver implements StorageDriver {
         .split("/")
         .filter(Boolean)
         .join("/")
-    if (clean === "/" || clean === `/${rootId}`) {
+    // F-199：物理路径是相对 root_id 的，不带 rootId 段。只有 "/" 是根；
+    // 把 "/<rootId>" 也当根会让顶层同名目录永远打不开。
+    if (clean === "/") {
       return rootId
     }
 
@@ -197,7 +267,7 @@ export class Pan123Driver implements StorageDriver {
         let files = await this.client.getFiles(parentId, {
           findName: decodedName,
           findIsDir: true,
-          budget: this.budget,
+          budget,
         })
         let folder = files.find(
           (f) =>
@@ -221,7 +291,7 @@ export class Pan123Driver implements StorageDriver {
             files = await this.client.getFiles(parentId, {
               findName: decodedName,
               findIsDir: true,
-              budget: this.budget,
+              budget,
             })
             folder = files.find(
               (f) => f.Type === 1 && f.FileName === decodedName,
@@ -243,7 +313,10 @@ export class Pan123Driver implements StorageDriver {
    * Resolve a physical path to a file: parent folder id + matching file.
    * physicalPath segments: rootId/name1/name2/.../targetName
    */
-  private async resolveFile(physicalPath: string): Promise<{
+  private async resolveFile(
+    physicalPath: string,
+    budget: SubrequestBudget,
+  ): Promise<{
     file: Pan123File
     parentId: string
     name: string
@@ -261,10 +334,10 @@ export class Pan123Driver implements StorageDriver {
       }
     })()
     const parentPath = "/" + segs.slice(0, segs.length - 1).join("/")
-    const parentId = await this.resolveFolderId(parentPath)
+    const parentId = await this.resolveFolderId(parentPath, budget)
     const files = await this.client.getFiles(parentId, {
       findName: decodedName,
-      budget: this.budget,
+      budget,
     })
     const file = files.find(
       (f) =>
@@ -278,10 +351,10 @@ export class Pan123Driver implements StorageDriver {
   }
 
   async list(_virtualPath: string, physicalPath: string): Promise<FileItem[]> {
-    // 每次外部调用重置 subrequest 预算（45 页上限，低于 CF 50 次限制）
-    this.budget.used = 0
-    const folderId = await this.resolveFolderId(physicalPath)
-    const files = await this.client.getFiles(folderId, { budget: this.budget })
+    // F-193：预算为调用局部对象，绝不共享实例状态
+    const budget = newBudget()
+    const folderId = await this.resolveFolderId(physicalPath, budget)
+    const files = await this.client.getFiles(folderId, { budget })
     const items = files.map(pan123FileToFileItem)
     return sortFileItems(
       items,
@@ -291,16 +364,15 @@ export class Pan123Driver implements StorageDriver {
   }
 
   async get(_virtualPath: string, physicalPath: string): Promise<FileItem> {
-    // 每次外部调用重置 subrequest 预算
-    this.budget.used = 0
+    const budget = newBudget()
     const segs = String(physicalPath || "")
       .split("/")
       .filter(Boolean)
-    // Storage root → folder
-    if (
-      segs.length === 0 ||
-      segs[segs.length - 1] === this.client.getRootId()
-    ) {
+    // Storage root → folder。
+    // F-199：只有「路径为空」才是根。此前用「最后一段 == rootId」判定，会把
+    // 顶层名为 "0"（默认 root_id）的条目误判成根目录——该条目既拿不到元信息
+    // 也无法下载。
+    if (segs.length === 0) {
       const rootId = this.client.getRootId()
       return {
         name: rootId,
@@ -313,7 +385,7 @@ export class Pan123Driver implements StorageDriver {
       }
     }
 
-    const { file } = await this.resolveFile(physicalPath)
+    const { file } = await this.resolveFile(physicalPath, budget)
     const item = pan123FileToFileItem(file)
     if (file.Type !== 1) {
       try {
@@ -340,13 +412,13 @@ export class Pan123Driver implements StorageDriver {
   }
 
   async mkdir(_virtualPath: string, physicalPath: string): Promise<void> {
-    this.budget.used = 0
+    const budget = newBudget()
     const segs = String(physicalPath || "")
       .split("/")
       .filter(Boolean)
     const dirName = segs.pop() || "新文件夹"
     const parentPath = "/" + segs.join("/")
-    const parentId = await this.resolveFolderId(parentPath)
+    const parentId = await this.resolveFolderId(parentPath, budget)
     await this.client.mkdir(parentId, dirName)
   }
 
@@ -355,8 +427,8 @@ export class Pan123Driver implements StorageDriver {
     physicalPath: string,
     newName: string,
   ): Promise<void> {
-    this.budget.used = 0
-    const { file } = await this.resolveFile(physicalPath)
+    const budget = newBudget()
+    const { file } = await this.resolveFile(physicalPath, budget)
     await this.client.rename(String(file.FileId), newName)
   }
 
@@ -365,8 +437,8 @@ export class Pan123Driver implements StorageDriver {
     physicalPath: string,
     _names: string[],
   ): Promise<void> {
-    this.budget.used = 0
-    const { file } = await this.resolveFile(physicalPath)
+    const budget = newBudget()
+    const { file } = await this.resolveFile(physicalPath, budget)
     await this.client.remove(String(file.FileId), file)
   }
 
@@ -377,10 +449,10 @@ export class Pan123Driver implements StorageDriver {
     srcPhysical: string,
     _dstPhysical: string,
   ): Promise<void> {
-    this.budget.used = 0
-    const { file } = await this.resolveFile(srcPhysical)
+    const budget = newBudget()
+    const { file } = await this.resolveFile(srcPhysical, budget)
     const dstParts = String(dstDir).split("/").filter(Boolean)
-    const targetParentId = await this.resolveFolderId("/" + dstParts.join("/"))
+    const targetParentId = await this.resolveFolderId("/" + dstParts.join("/"), budget)
     await this.client.move([String(file.FileId)], targetParentId)
   }
 
@@ -393,7 +465,7 @@ export class Pan123Driver implements StorageDriver {
     physicalPath: string,
     content: Buffer,
   ): Promise<void> {
-    this.budget.used = 0
+    const budget = newBudget()
     const segs = String(physicalPath || "")
       .split("/")
       .filter(Boolean)
@@ -407,7 +479,7 @@ export class Pan123Driver implements StorageDriver {
       }
     })()
     const parentPath = "/" + segs.slice(0, segs.length - 1).join("/")
-    const parentId = await this.ensureFolderId(parentPath)
+    const parentId = await this.ensureFolderId(parentPath, budget)
     await this.client.uploadFile(parentId, decodedName, content)
   }
 
@@ -434,14 +506,17 @@ export class Pan123Driver implements StorageDriver {
     chunkSize: number
     session: string
   }> {
-    this.budget.used = 0
-    const parentId = await this.ensureFolderId(physicalDir || "/")
+    const budget = newBudget()
+    const parentId = await this.ensureFolderId(physicalDir || "/", budget)
     const upload = await this.client.createUpload(
       fileName,
       parentId,
       size,
       md5 || "",
     )
+    // 名义分片大小仅用于会话令牌的兜底 partCount：调用方（fs / seed）按
+    // 自己的分片大小切片且不读取该值，真正的单/多分片判定在 uploadPart /
+    // completeUploadSession 中按实际收到的分片完成（见 Pan123ObservedUpload）。
     const chunkSize = 16 * 1024 * 1024 // 16MB
     // 秒传命中或未分配 Key：文件已存在，无需实际上传
     if (upload.Reuse || upload.Key === "") {
@@ -463,38 +538,73 @@ export class Pan123Driver implements StorageDriver {
 
   /**
    * 上传单个分片：获取该片的预签名 URL 并把内容转发给 123pan。
+   *
+   * 调用方的实际分片大小可能与本驱动名义上的 16MB 不同（fs 默认 10MB、
+   * seed 8MB、前端可配置到 64MB），因此这里按实际内容推断片数：
+   * 只有「第 1 片且长度等于文件大小」才是单文件上传，其余一律走分片预签名
+   * 接口。completeUploadSession 使用同一份观测状态判定 isMultipart。
    */
   async uploadPart(
     session: string,
     partNumber: number,
     content: Buffer,
   ): Promise<void> {
-    this.budget.used = 0
     const s = decodeSession(session)
+    if (!Number.isInteger(partNumber) || partNumber < 1) {
+      throw new Error(`[123Pan] 分片序号无效: ${partNumber}`)
+    }
+    const rawLength = content?.length ?? 0
+    if (rawLength > s.size) {
+      throw new Error(
+        `[123Pan] 第 ${partNumber} 分片大小 ${rawLength} 超过文件大小 ${s.size}`,
+      )
+    }
+    if (rawLength === 0 && s.size > 0) {
+      throw new Error(`[123Pan] 第 ${partNumber} 分片内容为空`)
+    }
+    const isMultipart = partNumber > 1 || rawLength < s.size
     const url = await this.client.getPartUploadUrl(
       sessionToUpload(s),
       partNumber,
-      s.partCount,
+      isMultipart ? 2 : 1,
     )
     const res = await fetch(url, { method: "PUT", body: content as any })
     if (res.status !== 200) {
       const text = await res.text().catch(() => "")
       throw new Error(
-        `[123Pan] 上传第 ${partNumber}/${s.partCount} 分片失败：HTTP ${res.status} ${text}`,
+        `[123Pan] 上传第 ${partNumber} 分片失败：HTTP ${res.status} ${text}`,
       )
     }
+    // 仅在分片真正落盘成功后登记，失败/未重试的分片会让 complete 的字节
+    // 校验失败，而不是把不完整文件登记为上传成功。
+    observePart(s, partNumber, rawLength)
   }
 
   /**
    * 完成分片上传会话。
+   *
+   * isMultipart 以**实际收到的分片数**为准（而不是建会话时按 16MB 推算的
+   * 名义 partCount），并在收尾前校验已收分片字节数之和等于文件大小，避免
+   * 在分片缺失时把不完整文件登记为上传完成。
    */
   async completeUploadSession(session: string): Promise<void> {
-    this.budget.used = 0
     const s = decodeSession(session)
-    await this.client.completeUpload(
-      sessionToUpload(s),
-      s.size,
-      s.partCount > 1,
-    )
+    const key = observedKey(s)
+    const observed = observedUploads.get(key)
+    let isMultipart = s.partCount > 1
+    if (observed && observed.partBytes.size > 0) {
+      const totalBytes = Array.from(observed.partBytes.values()).reduce(
+        (sum, n) => sum + n,
+        0,
+      )
+      if (totalBytes !== s.size) {
+        throw new Error(
+          `[123Pan] 分片不完整：已收 ${totalBytes} 字节，应为 ${s.size} 字节`,
+        )
+      }
+      isMultipart = observed.partBytes.size > 1
+    }
+    await this.client.completeUpload(sessionToUpload(s), s.size, isMultipart)
+    observedUploads.delete(key)
   }
 }

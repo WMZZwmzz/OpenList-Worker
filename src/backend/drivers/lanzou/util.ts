@@ -1,4 +1,4 @@
-import { safeRedirectUrl } from "../../pkg/http"
+import { isSafeUrl, safeRedirectUrl } from "../../pkg/http"
 import {
   LanzouAddition,
   LanzouFileOrFolder,
@@ -11,9 +11,18 @@ import {
   removeNotes,
   removeJSComment,
   calcAcwScV2,
+  isAcwScV2Challenge,
   htmlJsonToMap,
   getJSFunctionByName,
 } from "./help"
+
+/** 请求是否被 WAF/网关以 403/405 拦截（F-164：不再对整条 message 做裸子串匹配） */
+export function isWafBlockedError(err: any): boolean {
+  if (err?.status === 403 || err?.status === 405) return true
+  // 只认本文件自己构造的 "… 返回 HTTP 403/405" 文案：分享 ID 里的 "403"
+  // 不会被匹配，避免把任意错误误判为拦截并触发域名轮换。
+  return /\bHTTP (?:403|405)\b/.test(String(err?.message || ""))
+}
 
 /** 蓝奏云分享页候选域名（分享 ID 全局可用，任一域名都能访问同一分享）。
  *  数据中心出口 IP（如 CF Workers）被某个 CDN 域名 WAF 拦截时，可自动切换到其他域名重试。 */
@@ -174,12 +183,26 @@ export class LanzouClient {
     for (const raw of candidates) {
       try {
         const u = new URL(raw)
-        return `${u.protocol}//${u.host}`
+        const origin = `${u.protocol}//${u.host}`
+        // F-158：候选域名来自远端页面（文件名等用户可控内容可被反射进页面），
+        // 必须过 SSRF 校验，不能把内网/元数据地址当作分享域。
+        if (!isSafeUrl(origin)) continue
+        return origin
       } catch {
         // 继续下一个候选
       }
     }
     return ""
+  }
+
+  /**
+   * F-158：由远端内容派生的请求目标统一做 SSRF 校验，不合法直接报错。
+   */
+  private assertSafeTarget(url: string, what: string): string {
+    if (!isSafeUrl(url)) {
+      throw new Error(`[Lanzou] ${what} 指向受限或内网地址，已拒绝: ${url}`)
+    }
+    return url
   }
 
   /**
@@ -218,7 +241,9 @@ export class LanzouClient {
       this.updateCookie(res.headers.get("set-cookie"), "up.woozooo.com")
       const bodyStr = await res.text()
 
-      if (bodyStr.includes("acw_sc__v2")) {
+      // F-163：只有真正带 arg1 的挑战页才求解；普通响应里出现
+      // "acw_sc__v2" 字样（说明文本等）不再被误当挑战页吞掉
+      if (isAcwScV2Challenge(bodyStr)) {
         this.acwMap.set("up.woozooo.com", calcAcwScV2(bodyStr))
         continue
       }
@@ -325,9 +350,7 @@ export class LanzouClient {
       return await tryUrl(effectiveUrl)
     } catch (err: any) {
       // 仅在分享页请求（非 baseUrl API）且确实被 WAF/403/405 拒绝时换域名重试
-      const blocked =
-        isShareDomainReq &&
-        (err?.status === 403 || err?.status === 405 || /403|405/.test(err?.message || ""))
+      const blocked = isShareDomainReq && isWafBlockedError(err)
       if (!blocked) throw err
       for (const domain of shareCandidates) {
         const altUrl = targetUrlWithDomain(effectiveUrl, domain)
@@ -337,9 +360,7 @@ export class LanzouClient {
           this.workingShareHost = domain
           return result
         } catch (e2: any) {
-          const stillBlocked =
-            e2?.status === 403 || e2?.status === 405 || /403|405/.test(e2?.message || "")
-          if (!stillBlocked) throw e2
+          if (!isWafBlockedError(e2)) throw e2
           // 继续尝试下一个域名
         }
       }
@@ -437,7 +458,9 @@ export class LanzouClient {
 
       const bodyStr = await res.text()
 
-      if (bodyStr.includes("acw_sc__v2")) {
+      // F-163：只有真正带 arg1 的 WAF 挑战页才去求解，普通响应包含
+      // "acw_sc__v2" 字面量（脚本/说明文本）不再被吞。
+      if (isAcwScV2Challenge(bodyStr)) {
         this.acwMap.set(host, calcAcwScV2(bodyStr))
         continue
       }
@@ -450,8 +473,11 @@ export class LanzouClient {
 
   /**
    * 执行 doupload.php 后台任务
+   *
+   * @param attempts 已自动重登的次数。F-159：旧实现对 zt=9 无限递归重登，
+   *  如今最多自动重登 1 次，仍失败则给出明确错误。
    */
-  async doupload(params: Record<string, string>): Promise<any> {
+  async doupload(params: Record<string, string>, attempts: number = 0): Promise<any> {
     const url = `${this.getBaseUrl()}/doupload.php?uid=${this.uid}&vei=${this.vei}`
     const bodyStr = await this.request(url, "POST", params)
     let data: any
@@ -463,9 +489,14 @@ export class LanzouClient {
 
     if (data.zt === 9) {
       if (this.addition.type === "account") {
+        if (attempts >= 1) {
+          throw new Error(
+            `${COOKIE_EXPIRED_MSG}（已自动重新登录 ${attempts} 次仍返回 zt=9）`,
+          )
+        }
         await this.login()
         await this.initVeiAndUid()
-        return this.doupload(params)
+        return this.doupload(params, attempts + 1)
       }
       throw new Error(COOKIE_EXPIRED_MSG)
     }
@@ -678,10 +709,16 @@ export class LanzouClient {
     customShareDomain?: string,
   ): Promise<LanzouFileOrFolder> {
     const cleanShareId = shareId.replace(/^\//, "")
-    const shareBaseDomain = (
+    let shareBaseDomain = (
       customShareDomain ||
       (await this.probeShareDomain(cleanShareId))
     ).replace(/\/+$/, "")
+    // F-158：分享域名可能来自远端页面 / 调用方传入，先做 SSRF 校验；
+    // 不合法时回退到管理员配置的兜底域名，而不是直接请求。
+    if (!isSafeUrl(shareBaseDomain)) {
+      shareBaseDomain = this.getShareUrl()
+    }
+    this.assertSafeTarget(shareBaseDomain, "分享域名")
     const sharePageUrl = `${shareBaseDomain}/${cleanShareId}`
     let pageData = cachedPageData
     if (!pageData) {
@@ -738,7 +775,7 @@ export class LanzouClient {
       }
 
       fileResult.name_all = resp.inf || "download"
-      baseUrl = `${resp.dom}/file`
+      baseUrl = `${this.assertSafeTarget(String(resp.dom || ""), "下载域名")}/file`
       downloadUrl = `${baseUrl}/${resp.url}`
     } else {
       const iframeMatch =
@@ -750,7 +787,14 @@ export class LanzouClient {
       }
 
       const iframePath = iframeMatch[1]
-      const iframeFullUrl = `${shareBaseDomain}${iframePath.startsWith("/") ? "" : "/"}${iframePath}`
+      // F-158：iframe 目标来自远端页面，绝对地址直接校验，相对/协议相对
+      // 地址按分享域补全后再校验（防止 //host 或 ../ 逃逸到内网）。
+      const iframeFullUrl = /^https?:\/\//i.test(iframePath)
+        ? this.assertSafeTarget(iframePath, "下载页 iframe")
+        : this.assertSafeTarget(
+            `${shareBaseDomain}${iframePath.startsWith("/") ? "" : "/"}${iframePath}`,
+            "下载页 iframe",
+          )
       const nextPageData = await this.request(
         iframeFullUrl,
         "GET",
@@ -786,7 +830,7 @@ export class LanzouClient {
         )
       }
 
-      baseUrl = `${resp.dom}/file`
+      baseUrl = `${this.assertSafeTarget(String(resp.dom || ""), "下载域名")}/file`
       downloadUrl = `${baseUrl}/${resp.url}`
 
       const nameMatch = pageData.match(
@@ -813,6 +857,7 @@ export class LanzouClient {
     // 解析 302 重定向获得真实直链。
     // 蓝奏云直链服务器（dom 返回的 lanrar.com 等）偶发限流/超时，
     // 网络错误必须重试而非直接失败，避免"直链解析失败"随机出现。
+    this.assertSafeTarget(downloadUrl, "下载直链")
     let realDirectUrl = downloadUrl
     let vs = ""
     let resolved = false
@@ -853,6 +898,9 @@ export class LanzouClient {
         if (loc) {
           const safeLoc = safeRedirectUrl(loc, downloadUrl)
           if (safeLoc) {
+            // F-155：成功路径不再读体，未消费的响应体必须主动取消，
+            // 否则在 Workers 上会一直占用上游连接
+            await cancelProbeBody(probeRes)
             realDirectUrl = safeLoc
             resolved = true
             break
@@ -860,18 +908,9 @@ export class LanzouClient {
         }
       }
 
-      if (
-        probeRes.status === 200 &&
-        probeRes.url &&
-        probeRes.url !== downloadUrl
-      ) {
-        realDirectUrl = probeRes.url
-        resolved = true
-        break
-      }
-
       // 429/5xx 偶发限流：退避重试
       if (probeRes.status === 429 || probeRes.status >= 500) {
+        await cancelProbeBody(probeRes)
         if (i < 2) {
           await new Promise((resolve) => setTimeout(resolve, 400 * (i + 1)))
           continue
@@ -881,8 +920,22 @@ export class LanzouClient {
         )
       }
 
+      // F-155：redirect:"manual" 下 response.url 恒等于请求 URL，旧实现
+      // 「200 且 url 已变化」分支永不成立；且任何 200 都会把响应体整读进
+      // 内存（文件直出时最多 3 次全量下载）。改为按 content-type 区分：
+      // 非 HTML 的 200 视为文件直出——链接本身可用，直接返回；只有疑似
+      // WAF 挑战 / ajax 兜底页（HTML）才读响应体。
+      const contentType = probeRes.headers.get("content-type") || ""
+      const looksLikeHtml = /text\/html|application\/xhtml/i.test(contentType)
+      if (probeRes.status === 200 && !looksLikeHtml) {
+        await cancelProbeBody(probeRes)
+        realDirectUrl = downloadUrl
+        resolved = true
+        break
+      }
+
       const bodyText = await probeRes.text()
-      if (bodyText.includes("acw_sc__v2")) {
+      if (isAcwScV2Challenge(bodyText)) {
         vs = calcAcwScV2(bodyText)
         continue
       }
@@ -901,9 +954,10 @@ export class LanzouClient {
         )
         const ajaxData = JSON.parse(ajaxResStr)
         if (ajaxData.url) {
-          realDirectUrl = ajaxData.url.startsWith("http")
+          const nextUrl = ajaxData.url.startsWith("http")
             ? ajaxData.url
             : new URL(ajaxData.url, baseUrl).toString()
+          realDirectUrl = this.assertSafeTarget(nextUrl, "ajax 直链")
           resolved = true
           break
         }
@@ -932,6 +986,8 @@ export class LanzouClient {
     downUrl: string,
   ): Promise<{ size?: number; time?: string }> {
     try {
+      // F-158：downUrl 可能来自远端列表响应，HEAD 前同样做 SSRF 校验
+      if (!isSafeUrl(downUrl)) return {}
       const res = await fetch(downUrl, {
         method: "HEAD",
         headers: { "User-Agent": this.getUserAgent() },
@@ -1010,5 +1066,14 @@ function safeHost(url: string): string {
     return new URL(url).host
   } catch {
     return ""
+  }
+}
+
+/** F-155：取消未消费的响应体，避免在 Workers 上挂住上游连接 */
+async function cancelProbeBody(res: Response): Promise<void> {
+  try {
+    await res.body?.cancel()
+  } catch {
+    // 取消失败不影响主流程
   }
 }

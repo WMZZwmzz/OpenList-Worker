@@ -8,6 +8,9 @@ import { SpaceTypeFamily, SpaceTypePersonal, SortRules } from "./consts"
 import { WoPanAddition, WoPanFile } from "./types"
 import { WoPanClient } from "./util"
 
+/** CF Workers 免费版单次 invocation 子请求预算（留余量，F-219） */
+const SUBREQUEST_LIMIT = 45
+
 function parseWoPanDate(str: string): string {
   if (!str) return new Date().toISOString()
   if (str.length >= 14) {
@@ -42,13 +45,24 @@ function wopanFileToFileItem(f: WoPanFile): FileItem {
   }
 }
 
+/** 目标条目物理路径 → 父目录物理路径（用于 move/copy 解析目标文件夹） */
+function parentPathOf(physicalPath: string): string {
+  const parts = String(physicalPath || "")
+    .split("/")
+    .filter(Boolean)
+  parts.pop()
+  return parts.join("/")
+}
+
 export function normalizeWoPanAddition(a: any): WoPanAddition {
   const norm = { ...(a || {}) } as any
-  norm.root_folder_id = norm.root_folder_id || "0"
-  norm.refresh_token = (norm.refresh_token || "").trim()
-  norm.family_id = (norm.family_id || "").trim()
-  norm.sort_rule = norm.sort_rule || "name_asc"
-  norm.access_token = (norm.access_token || "").trim()
+  norm.root_folder_id = String(norm.root_folder_id ?? "0")
+  // F-217：addition 是用户 JSON，family_id 等字段可能被写成数字；
+  // 先 String() 归一再去空白，避免对数字调用 .trim() 抛 TypeError。
+  norm.refresh_token = String(norm.refresh_token ?? "").trim()
+  norm.family_id = String(norm.family_id ?? "").trim()
+  norm.sort_rule = String(norm.sort_rule ?? "name_asc")
+  norm.access_token = String(norm.access_token ?? "").trim()
   return norm as WoPanAddition
 }
 
@@ -58,6 +72,8 @@ export class WoPanDriver implements StorageDriver {
   private defaultFamilyId: string = ""
   private pathFileMapCache = new Map<string, WoPanFile>()
   private pathFolderIdCache = new Map<string, string>()
+  /** F-219：per-request 子请求预算（每个公开操作入口重置） */
+  private budget = { used: 0, limit: SUBREQUEST_LIMIT }
 
   constructor(
     addition: WoPanAddition,
@@ -97,7 +113,19 @@ export class WoPanDriver implements StorageDriver {
     }
   }
 
+  /** F-219：占用一个子请求额度；用尽返回 false（由调用方报明确错误）。 */
+  private reserve(): boolean {
+    if (this.budget.used >= this.budget.limit) return false
+    this.budget.used++
+    return true
+  }
+
+  private resetBudget(): void {
+    this.budget.used = 0
+  }
+
   async list(_virtualPath: string, physicalPath: string): Promise<FileItem[]> {
+    this.resetBudget()
     const folderId = await this.resolveFolderId(physicalPath)
     const files = await this.fetchFolderFiles(folderId)
 
@@ -120,6 +148,7 @@ export class WoPanDriver implements StorageDriver {
   }
 
   async get(_virtualPath: string, physicalPath: string): Promise<FileItem> {
+    this.resetBudget()
     const clean = physicalPath.split("/").filter(Boolean).join("/")
     if (!clean) {
       // Root folder
@@ -169,6 +198,7 @@ export class WoPanDriver implements StorageDriver {
   }
 
   async mkdir(_virtualPath: string, physicalPath: string): Promise<void> {
+    this.resetBudget()
     const parts = physicalPath.split("/").filter(Boolean)
     const name = parts.pop() || "新文件夹"
     const parentPath = parts.join("/")
@@ -187,6 +217,7 @@ export class WoPanDriver implements StorageDriver {
     physicalPath: string,
     newName: string,
   ): Promise<void> {
+    this.resetBudget()
     const file = await this.resolveWoPanFile(physicalPath)
     if (!file) {
       throw new Error(`[WoPan] Item not found for rename: ${physicalPath}`)
@@ -206,6 +237,7 @@ export class WoPanDriver implements StorageDriver {
     physicalPath: string,
     _names: string[],
   ): Promise<void> {
+    this.resetBudget()
     const file = await this.resolveWoPanFile(physicalPath)
     if (!file) {
       throw new Error(`[WoPan] Item not found for deletion: ${physicalPath}`)
@@ -226,13 +258,16 @@ export class WoPanDriver implements StorageDriver {
     dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
+    this.resetBudget()
     const file = await this.resolveWoPanFile(srcPhysical)
     if (!file) {
       throw new Error(`[WoPan] Source item not found for move: ${srcPhysical}`)
     }
-    const dstFolderId = await this.resolveFolderId(dstDir)
+    // F-214：dstDir 是站点虚拟路径（含挂载前缀），dstPhysical 才是目标
+    // 条目自身的物理路径；取父目录解析目标文件夹 ID。
+    const dstFolderId = await this.resolveFolderId(parentPathOf(dstPhysical))
     const dirList: string[] = []
     const fileList: string[] = []
     if (file.type === 0) {
@@ -257,13 +292,15 @@ export class WoPanDriver implements StorageDriver {
     dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
+    this.resetBudget()
     const file = await this.resolveWoPanFile(srcPhysical)
     if (!file) {
       throw new Error(`[WoPan] Source item not found for copy: ${srcPhysical}`)
     }
-    const dstFolderId = await this.resolveFolderId(dstDir)
+    // 同 move：从物理目标路径推导目标父目录
+    const dstFolderId = await this.resolveFolderId(parentPathOf(dstPhysical))
     const dirList: string[] = []
     const fileList: string[] = []
     if (file.type === 0) {
@@ -288,6 +325,7 @@ export class WoPanDriver implements StorageDriver {
     physicalPath: string,
     content: Buffer,
   ): Promise<void> {
+    this.resetBudget()
     const parts = physicalPath.split("/").filter(Boolean)
     const name = parts.pop() || "upload"
     const parentPath = parts.join("/")
@@ -312,6 +350,13 @@ export class WoPanDriver implements StorageDriver {
     let pageNum = 0
     const pageSize = 100
     while (true) {
+      // F-219：每页一个子请求；预算用尽时给明确错误，而不是等 Workers
+      // 运行时抛 "Too many subrequests"（大目录/深路径下真实可触发）。
+      if (!this.reserve()) {
+        throw new Error(
+          `[WoPan] 已达 Cloudflare subrequest 预算上限(${this.budget.limit})，目录条目过多，列举被中止`,
+        )
+      }
       const data = await this.client.queryAllFiles(
         this.getSpaceType(),
         folderId,

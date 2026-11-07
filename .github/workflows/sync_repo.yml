@@ -14,6 +14,13 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     name: Sync Repository
+    env:
+      # 目标地址硬编码为 workflow 常量，不再读取仓库变量（vars.GITEE_REPO_URL）：
+      # 仓库变量可被有写权限者修改，等于把「全量源码推往任意服务器」的开关留在
+      # 仓库设置里（2026-10-31 深度安全审查报告 S-20）。如镜像路径不同，直接改
+      # 下面这一行；密钥是仓库 secrets 里配的 Gitee SSH key，推不动不属于该账号
+      # 的仓库。
+      GITEE_REPO_URL: git@gitee.com:WMZZwmzz/OpenList-Worker.git
     steps:
       # 按 commit SHA 固定（见 build-verify.yml 的说明）：本任务持有
       # GITEE_SSH_PRIVATE_KEY，绝不能让浮动标签的上游变更决定它的执行环境。
@@ -52,12 +59,10 @@ KNOWN_HOSTS
           fi
 
       - name: Create single commit and push
-        env:
-          GITEE_REPO_URL: ${{ vars.GITEE_REPO_URL }}
         run: |
           set -euo pipefail
-          # 仓库地址是仓库变量（可被有写权限者修改）：先校验协议，再作为参数
-          # 交给 git，避免被解析成额外参数或命令。
+          # 目标地址已硬编码为 job 级 env（见上方说明）；此处保留协议校验作为
+          # 纵深防御，防止常量被改成含元字符的值。
           case "$GITEE_REPO_URL" in
             https://* | ssh://* | git@*) ;;
             *)

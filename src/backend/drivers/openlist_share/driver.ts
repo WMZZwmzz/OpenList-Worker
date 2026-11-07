@@ -47,30 +47,32 @@ export class DriverOpenlistShare implements StorageDriver {
     const name = parts[parts.length - 1] || "root"
     const parentPath = "/" + parts.slice(0, -1).join("/")
 
-    try {
-      const files = await this.client.list(
-        parentPath === "//" ? "/" : parentPath,
-      )
-      const target = files.find((f) => f.name === name)
-      if (target) {
-        const item = fileToItem(target)
-        if (!item.is_dir) {
-          item.raw_url = this.client.downloadUrl(path)
-        }
-        return item
+    // F-482：父目录列表失败（网络/密码错/父目录不存在）必须向上抛，
+    // 不能和「列表成功但没有这个名字」共用同一个假目录。
+    const files = await this.client.list(parentPath === "//" ? "/" : parentPath)
+    const target = files.find((f) => f.name === name)
+    if (target) {
+      const item = fileToItem(target)
+      if (!item.is_dir) {
+        item.raw_url = this.client.downloadUrl(path)
       }
-    } catch {
-      // fall through
+      return item
     }
 
-    return {
-      name,
-      size: 0,
-      is_dir: true,
-      modified: new Date().toISOString(),
-      sign: "",
-      type: 1,
-      raw_url: "",
+    // 未命中：列目标路径本身，目录会成功；仍失败说明确实不存在 → 404。
+    try {
+      await this.client.list(path)
+      return {
+        name,
+        size: 0,
+        is_dir: true,
+        modified: new Date().toISOString(),
+        sign: "",
+        type: 1,
+        raw_url: "",
+      }
+    } catch {
+      throw new Error(`[OpenListShare] '${path}' not found`)
     }
   }
 

@@ -17,6 +17,8 @@ export interface ProtonAuthResp {
   TokenType: string
   Scopes: string[]
   UID: string
+  /** H(A | M | S) — proves the server knows the SRP verifier. */
+  ServerProof?: string
 }
 
 export interface Proton2FAChallengeResp {
@@ -87,6 +89,10 @@ export interface ProtonLink {
   FileProperties?: {
     ContentKeyPacket?: string
     ContentKeyPacketSignature?: string
+  }
+  FolderProperties?: {
+    /** Armored OpenPGP message containing the 32-byte name-hash key. */
+    NodeHashKey?: string
   }
   XAttr?: string
 }

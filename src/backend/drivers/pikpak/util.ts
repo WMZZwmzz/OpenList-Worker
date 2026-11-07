@@ -51,6 +51,48 @@ export const PC_ALGORITHMS = [
 // client_id / client_secret 已移除内置默认值，须通过 addition.client_id / addition.client_secret 提供自有 OAuth 应用凭据。
 export const ANDROID_CLIENT_VERSION = "1.53.2"
 export const ANDROID_PACKAGE_NAME = "com.pikcloud.pikpak"
+
+/**
+ * 计算 PikPak / 迅雷使用的 GCID（分块双重 SHA-1）。
+ *
+ * F-254：PikPak 的 files 创建接口按 GCID 匹配秒传，裸 SHA-1 永远不命中。
+ * 算法（与 OpenList pkg/utils/hash/gcid.go 一致）：
+ * - 块大小 256KB 起步，size/psize > 512 且 psize < 2MB 时倍增；
+ * - 每块 SHA-1，把 20 字节摘要依次拼进外层哈希，最后再 SHA-1 一次。
+ */
+export async function calcGcid(
+  content: Uint8Array,
+  chunkSizeOverride?: number,
+): Promise<string> {
+  const size = content.length
+  let psize =
+    chunkSizeOverride && chunkSizeOverride > 0 ? chunkSizeOverride : 0x40000
+  if (!chunkSizeOverride) {
+    while (size / psize > 0x200 && psize < 0x200000) {
+      psize = psize << 1
+    }
+  }
+
+  const digests: Uint8Array[] = []
+  for (let offset = 0; offset < size; offset += psize) {
+    const chunk = content.subarray(offset, Math.min(offset + psize, size))
+    const hex = await sha1(chunk)
+    const bytes = new Uint8Array(hex.length / 2)
+    for (let i = 0; i < bytes.length; i++) {
+      bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16)
+    }
+    digests.push(bytes)
+  }
+
+  const combined = new Uint8Array(digests.reduce((sum, d) => sum + d.length, 0))
+  let pos = 0
+  for (const d of digests) {
+    combined.set(d, pos)
+    pos += d.length
+  }
+  return (await sha1(combined)).toUpperCase()
+}
+
 export const ANDROID_SDK_VERSION = "2.0.6.206003"
 
 export const WEB_CLIENT_VERSION = "2.0.0"
@@ -60,6 +102,30 @@ export const WEB_SDK_VERSION = "8.0.3"
 export const PC_CLIENT_VERSION = "undefined"
 export const PC_PACKAGE_NAME = "mypikpak.com"
 export const PC_SDK_VERSION = "8.0.3"
+
+/**
+ * F-259：登录/刷新令牌等裸 fetch 响应统一读取。
+ * 非 2xx 或非 JSON 时抛出包含 HTTP 状态与响应片段的错误，
+ * 不再让 `res.json()` 抛出掩盖真相的 SyntaxError。
+ */
+export async function readPikPakJson(
+  res: Response,
+  label: string,
+): Promise<any> {
+  const text = await res.text()
+  if (!res.ok) {
+    throw new Error(
+      `PikPak ${label} failed with HTTP ${res.status}: ${text.slice(0, 200)}`,
+    )
+  }
+  try {
+    return JSON.parse(text)
+  } catch {
+    throw new Error(
+      `PikPak ${label} returned non-JSON response (HTTP ${res.status}): ${text.slice(0, 200)}`,
+    )
+  }
+}
 
 export async function generateDeviceSign(
   deviceId: string,
@@ -134,6 +200,10 @@ export class PikPakApiClient {
   private accessToken: string = ""
   private refreshTokenVal: string = ""
   private captchaTokenVal: string = ""
+  /** F-255：进行中的 token 刷新（并发请求共享同一个 Promise，避免 refresh_token 轮换竞态） */
+  private refreshTokenPromise: Promise<void> | null = null
+  /** F-255：进行中的 captcha 刷新，按 action+meta 去重 */
+  private captchaRefreshPromises = new Map<string, Promise<string>>()
   private onTokenRefreshed?: (tokens: {
     accessToken: string
     refreshToken: string
@@ -203,6 +273,21 @@ export class PikPakApiClient {
     action: string,
     metas: Record<string, string>,
   ): Promise<string> {
+    // F-255：并发 captcha 刷新共享同一个 Promise，避免重复打 captcha/init。
+    const key = `${action}|${JSON.stringify(metas)}`
+    const inflight = this.captchaRefreshPromises.get(key)
+    if (inflight) return inflight
+    const promise = this.doRefreshCaptchaToken(action, metas).finally(() => {
+      this.captchaRefreshPromises.delete(key)
+    })
+    this.captchaRefreshPromises.set(key, promise)
+    return promise
+  }
+
+  private async doRefreshCaptchaToken(
+    action: string,
+    metas: Record<string, string>,
+  ): Promise<string> {
     const param = {
       action,
       captcha_token: this.captchaTokenVal,
@@ -225,7 +310,10 @@ export class PikPakApiClient {
       },
     )
 
-    const data: PikPakCaptchaTokenResp & PikPakErrResp = await res.json()
+    const data: PikPakCaptchaTokenResp & PikPakErrResp = await readPikPakJson(
+      res,
+      "captcha init",
+    )
     if (data.error_code && data.error_code !== 0) {
       throw new Error(
         `Captcha error ${data.error_code}: ${data.error_description || data.error}`,
@@ -308,7 +396,10 @@ export class PikPakApiClient {
       },
     )
 
-    const data: PikPakTokenResp & PikPakErrResp = await res.json()
+    const data: PikPakTokenResp & PikPakErrResp = await readPikPakJson(
+      res,
+      "login",
+    )
     if (data.error_code && data.error_code !== 0) {
       throw new Error(
         `PikPak login failed (${data.error_code}): ${data.error_description || data.error}`,
@@ -329,6 +420,17 @@ export class PikPakApiClient {
   }
 
   async refreshToken(): Promise<void> {
+    // F-255：并发 4122/4121/16 重试共享同一次刷新，避免两次并行
+    // /v1/auth/token 携带同一个旧 refresh_token 互相作废。
+    if (!this.refreshTokenPromise) {
+      this.refreshTokenPromise = this.doRefreshToken().finally(() => {
+        this.refreshTokenPromise = null
+      })
+    }
+    return this.refreshTokenPromise
+  }
+
+  private async doRefreshToken(): Promise<void> {
     if (!this.refreshTokenVal) {
       await this.login()
       return
@@ -353,7 +455,10 @@ export class PikPakApiClient {
       },
     )
 
-    const data: PikPakTokenResp & PikPakErrResp = await res.json()
+    const data: PikPakTokenResp & PikPakErrResp = await readPikPakJson(
+      res,
+      "token refresh",
+    )
     if (data.error_code && data.error_code !== 0) {
       if (data.error_code === 4126 && this.addition.username) {
         await this.login()

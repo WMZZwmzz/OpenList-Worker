@@ -1,6 +1,6 @@
 // Based on: https://github.com/OpenListTeam/OpenList/tree/main/drivers/s3
 import { S3Addition, S3File, S3ListResult } from "./types"
-import { presignS3Url, rfc3986UriEncode, signS3Headers } from "./sigv4"
+import { presignS3Url, rfc3986UriEncode, signS3Headers, buildCanonicalQueryString } from "./sigv4"
 import { decodePathFully, hasParentSegment } from "../../pkg/path"
 
 const maxCopyObjectSize = 5 * 1000 * 1000 * 1000 // 5GB
@@ -62,13 +62,49 @@ function parseXmlBlocks(xml: string, tag: string): string[] {
   return results
 }
 
+/**
+ * F-153：XML 实体必须单遍解码。链式 replace 会把 `&amp;lt;` 先解成 `&lt;`
+ * 再解成 `<`（一次解码做两遍），文件名本身含 `&lt;` 这类字面子串时名字被改写，
+ * 后续 get/copy/delete 全部寻址到不存在的 key。
+ */
 function unescapeXml(str: string): string {
-  return str
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
+  const named: Record<string, string> = {
+    amp: "&",
+    lt: "<",
+    gt: ">",
+    quot: '"',
+    apos: "'",
+  }
+  return str.replace(
+    /&(amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);/g,
+    (match, entity: string) => {
+      if (entity[0] !== "#") return named[entity] ?? match
+      const code =
+        entity[1] === "x" || entity[1] === "X"
+          ? parseInt(entity.slice(2), 16)
+          : parseInt(entity.slice(1), 10)
+      if (!Number.isFinite(code) || code < 0 || code > 0x10ffff) return match
+      try {
+        return String.fromCodePoint(code)
+      } catch {
+        return match
+      }
+    },
+  )
+}
+
+/**
+ * F-152 / F-150：key 必须按 RFC 3986 逐段编码后再拼进 URL 路径。
+ *
+ * 不能依赖 URL 构造器对 pathname 的「规范化」：它会把裸 `%` 原样保留，
+ * 也**不会**把已经合法的三元组（如文件名 `a%2Fb.txt`）再编码一层，于是线上
+ * 请求路径解码后指向另一个对象（`a/b.txt`）。
+ */
+export function encodeKeyPath(key: string): string {
+  return key
+    .split("/")
+    .map((seg) => rfc3986UriEncode(seg))
+    .join("/")
 }
 
 export function parseS3Error(xml: string, status: number): Error {
@@ -82,11 +118,35 @@ export function parseS3Error(xml: string, status: number): Error {
   return err
 }
 
+/**
+ * F-151：分页回退 marker / start-after 必须用「本页 XML 中最后一条未过滤的原始
+ * key」。过滤后的 files 末项既可能来自 CommonPrefixes（无尾斜杠、字典序更小），
+ * 也可能已被占位符/marker 过滤掉——把它当 marker 会让下一页重列同样的条目，
+ * 甚至永远不前进（死循环 + 无限重复条目）。
+ */
+function getLastRawListKey(xml: string): string | undefined {
+  const blockRegex =
+    /<(?:[A-Za-z0-9_-]+:)?(?:Contents|CommonPrefixes)\b[^>]*>([\s\S]*?)<\/(?:[A-Za-z0-9_-]+:)?(?:Contents|CommonPrefixes)>/gi
+  let last: string | undefined
+  let match: RegExpExecArray | null
+  while ((match = blockRegex.exec(xml)) !== null) {
+    const key = parseXmlTag(match[1], "Key")
+    if (key !== undefined) {
+      last = unescapeXml(key)
+      continue
+    }
+    const prefix = parseXmlTag(match[1], "Prefix")
+    if (prefix !== undefined) last = unescapeXml(prefix)
+  }
+  return last
+}
+
 export function parseListObjectsV1(
   xml: string,
   dirPath: string,
   placeholder: string,
   showPlaceholder = false,
+  dirMarkers?: string[],
 ): S3ListResult {
   const files: S3File[] = []
   const placeholderName = getPlaceholderName(placeholder)
@@ -116,7 +176,12 @@ export function parseListObjectsV1(
     const key = parseXmlTag(block, "Key")
     if (!key) continue
     const decodedKey = unescapeXml(key)
-    if (decodedKey.endsWith("/")) continue // skip directory markers
+    if (decodedKey.endsWith("/")) {
+      // F-149：目录 marker（零字节的 "dir/" key）不是文件，但递归删除/复制必须
+      // 知道它的存在——调用方传入 dirMarkers 时收集原始 key（保留尾斜杠）。
+      if (dirMarkers) dirMarkers.push(decodedKey)
+      continue // skip directory markers from the file list
+    }
 
     const name = getBaseName(decodedKey)
     if (
@@ -148,8 +213,7 @@ export function parseListObjectsV1(
     files,
     isTruncated,
     nextMarker,
-    lastEvaluatedKey:
-      files.length > 0 ? files[files.length - 1].path : undefined,
+    lastEvaluatedKey: getLastRawListKey(xml),
   }
 }
 
@@ -158,6 +222,7 @@ export function parseListObjectsV2(
   dirPath: string,
   placeholder: string,
   showPlaceholder = false,
+  dirMarkers?: string[],
 ): S3ListResult {
   const files: S3File[] = []
   const placeholderName = getPlaceholderName(placeholder)
@@ -187,7 +252,11 @@ export function parseListObjectsV2(
     const key = parseXmlTag(block, "Key")
     if (!key) continue
     const decodedKey = unescapeXml(key)
-    if (decodedKey.endsWith("/")) continue
+    if (decodedKey.endsWith("/")) {
+      // F-149：同 v1——marker 从文件列表里剔除，但递归调用方需要原始 key。
+      if (dirMarkers) dirMarkers.push(decodedKey)
+      continue
+    }
 
     const name = getBaseName(decodedKey)
     if (
@@ -219,8 +288,7 @@ export function parseListObjectsV2(
     files,
     isTruncated,
     nextContinuationToken,
-    lastEvaluatedKey:
-      files.length > 0 ? files[files.length - 1].path : undefined,
+    lastEvaluatedKey: getLastRawListKey(xml),
   }
 }
 
@@ -307,7 +375,9 @@ export class S3Client {
     const epUrl = new URL(this.endpoint)
     let urlStr = ""
 
-    const cleanKey = key ? getKey(key, false) : ""
+    // F-152：own-encode 每一段（把 key 里已有的 `%` 也编成 `%25`），不依赖
+    // URL 构造器对「已编码形式」的规范化。
+    const cleanKey = key ? encodeKeyPath(getKey(key, false)) : ""
 
     if (this.isPathStyle) {
       const basePath = epUrl.pathname.replace(/\/+$/, "")
@@ -330,11 +400,17 @@ export class S3Client {
 
     const finalUrl = new URL(urlStr)
     if (queryParams) {
+      // F-148：必须按 RFC 3986 编码（空格 → %20、字面 "+" → %2B）拼 query。
+      // URLSearchParams 走 form 编码（空格 → "+"），而签名侧用的是 %20，
+      // 两者不一致时服务端返回 SignatureDoesNotMatch（任何名字带空格的
+      // 目录/文件名都会命中：listObjects 的 prefix、v1 marker、v2 start-after…）。
+      const pairs: Array<[string, string]> = []
       for (const [k, v] of Object.entries(queryParams)) {
         if (v !== undefined && v !== null) {
-          finalUrl.searchParams.set(k, v)
+          pairs.push([k, v])
         }
       }
+      finalUrl.search = buildCanonicalQueryString(pairs)
     }
     return finalUrl.toString()
   }
@@ -350,7 +426,7 @@ export class S3Client {
       customHeaders["user-agent"] = this.userAgent
     }
 
-    const { headers } = await signS3Headers({
+    const { headers, url: signedUrl } = await signS3Headers({
       method,
       url,
       region: this.region,
@@ -374,13 +450,16 @@ export class S3Client {
       reqInit.body = body as any
     }
 
-    return await fetch(url, reqInit)
+    // F-148：发签名函数回写的 URL（其 query 按 RFC 3986 归一化），而不是入参 URL，
+    // 保证「实际发送的字节」与「参与签名的 canonical query」完全一致。
+    return await fetch(signedUrl, reqInit)
   }
 
   public async listObjects(
     dirPath: string,
     version: "v1" | "v2" = "v1",
     showPlaceholder = false,
+    dirMarkers?: string[],
   ): Promise<S3File[]> {
     const prefix = getKey(dirPath, true)
     const files: S3File[] = []
@@ -416,6 +495,7 @@ export class S3Client {
           dirPath,
           placeholder,
           showPlaceholder,
+          dirMarkers,
         )
         files.push(...result.files)
 
@@ -428,15 +508,19 @@ export class S3Client {
           continue
         }
 
-        if (result.files.length === 0) {
+        // F-151：start-after 用本页最后一条「未过滤的原始 key」；marker 不前进
+        // 说明服务端忽略了 start-after，必须停下来，否则会无限重复同一页。
+        const nextStartAfter = result.lastEvaluatedKey
+        if (!nextStartAfter || nextStartAfter === startAfter) {
           break
         }
-        startAfter = result.lastEvaluatedKey
+        startAfter = nextStartAfter
       }
     } else {
       let marker: string | undefined
 
       while (true) {
+        const previousMarker = marker
         const queryParams: Record<string, string> = {
           prefix,
           delimiter: "/",
@@ -458,6 +542,7 @@ export class S3Client {
           dirPath,
           placeholder,
           showPlaceholder,
+          dirMarkers,
         )
         files.push(...result.files)
 
@@ -465,13 +550,13 @@ export class S3Client {
           break
         }
 
-        if (result.nextMarker) {
-          marker = result.nextMarker
-        } else if (result.files.length > 0) {
-          marker = result.files[result.files.length - 1].path
-        } else {
+        // F-151：优先 NextMarker，其次本页最后一条未过滤的原始 key（保留 "/"）；
+        // 两者都拿不到或 marker 未前进时立即终止，避免死循环。
+        const nextMarker = result.nextMarker || result.lastEvaluatedKey
+        if (!nextMarker || nextMarker === previousMarker) {
           break
         }
+        marker = nextMarker
       }
     }
 
@@ -709,9 +794,13 @@ export class S3Client {
           host = hostSplit[1].replace(/\/+$/, "")
         }
 
+        // F-150：该分支是裸字符串拼接（无签名），key 必须逐段 RFC3986 编码，
+        // 否则含空格 / `?` / `#` / 裸 `%` 的文件名会让浏览器在 query/fragment
+        // 处截断，请求打到错误对象（404 或错文件）。
+        const encodedKey = encodeKeyPath(cleanKey)
         let pathPart = this.isPathStyle
-          ? `/${this.bucket}/${cleanKey}`
-          : `/${cleanKey}`
+          ? `/${this.bucket}/${encodedKey}`
+          : `/${encodedKey}`
         if (removeBucket && pathPart.startsWith(`/${this.bucket}`)) {
           pathPart = pathPart.substring(`/${this.bucket}`.length)
           if (!pathPart) pathPart = "/"

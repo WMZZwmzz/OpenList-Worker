@@ -23,8 +23,15 @@ export class SeafileApiClient {
     }
   }
 
-  async getToken(): Promise<void> {
-    if (this.addition.token) {
+  /**
+   * 获取/刷新令牌。
+   *
+   * @param force 为 true 时忽略已配置的静态 token，强制用 username/password
+   *   重新认证。401 重试路径必须传 true —— 否则只会把同一个已失效的 token
+   *   再套用一次（F-363）。
+   */
+  async getToken(force = false): Promise<void> {
+    if (!force && this.addition.token) {
       this.authorization = `Token ${this.addition.token}`
       return
     }
@@ -120,7 +127,14 @@ export class SeafileApiClient {
     })
 
     if (res.status === 401 && retryCount < 1) {
-      await this.getToken()
+      // 只有持有可用的 username/password 才值得重试：强制重新认证会绕过
+      // 已配置（且大概率已被服务端吊销）的静态 token。仅有静态 token 时
+      // 重放同一 token 只会再 401 一次，直接抛出更诚实（F-363）。
+      if (!this.addition.username || !this.addition.password) {
+        const errText = await res.text().catch(() => "")
+        throw new Error(`Seafile request failed (401): ${errText}`)
+      }
+      await this.getToken(true)
       return this.request<T>(pathOrUrl, {
         ...options,
         retryCount: retryCount + 1,

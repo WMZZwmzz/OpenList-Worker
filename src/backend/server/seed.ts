@@ -36,7 +36,7 @@ import {
   encodeTorrent,
   parseSeed,
 } from "../internal/seed/codec"
-import { hashReadableStream, TorrentPieceHasher } from "../internal/seed/hash"
+import { hashReadableStream } from "../internal/seed/hash"
 import {
   applyHashMatrix,
   DEFAULT_PIECE_SIZE,
@@ -199,6 +199,12 @@ function contentBytes(value: unknown, encoding?: unknown): Uint8Array {
     return Uint8Array.from(value)
   }
   if (typeof value !== "string") throw new Error("Seed content is required")
+  // F-027：显式 encoding 必须优先于启发式。base64 串可以合法地以 "d" 开头
+  // （同理 '{' 不合法所以无影响），此前会被当成 UTF-8 文本编码，随后报出
+  // 与真实原因无关的解析错误。
+  if (encoding === "base64") {
+    return new Uint8Array(Buffer.from(value, "base64"))
+  }
   if (
     encoding === "text" ||
     value.trimStart().startsWith("{") ||
@@ -290,6 +296,28 @@ function hostAllowed(hostname: string, allowlist: string[]): boolean {
   )
 }
 
+/**
+ * 「本实例自产的可信下载地址」判定（F-022）。
+ *
+ * 同源且落在本实例的四种下载命名空间之一：
+ *  - `/p/`、`/api/p/`：代理直链
+ *  - `/d/`：直链（generateSeed 生成的内嵌直链就是 `${siteUrl}/d${path}`）
+ *  - `/sd/`、`/@s/`：分享下载
+ *
+ * 历史缺陷：validateSource 认得 `/d/`、`/sd/`，而 fetchSafe 的同源白名单只认
+ * `/p/` 与 `/@s/`——本实例生成、再转存自己种子的取流路径在默认部署（未配置
+ * SEED_SOURCE_ALLOWED_HOSTS）下 100% 被拦截。两处必须共用同一份判定。
+ */
+function isSameOpenListUrl(url: URL, requestUrl: URL): boolean {
+  return (
+    url.origin === requestUrl.origin &&
+    (/^\/(api\/)?p\//.test(url.pathname) ||
+      url.pathname.startsWith("/d/") ||
+      url.pathname.startsWith("/sd/") ||
+      url.pathname.startsWith("/@s/"))
+  )
+}
+
 function validateSource(c: any, source: SeedSource): URL {
   if (!source.url) throw new Error("Seed source URL is required")
   const requestUrl = new URL(c.req.url)
@@ -298,12 +326,7 @@ function validateSource(c: any, source: SeedSource): URL {
   if (url.username || url.password)
     throw new Error("Seed source URL credentials are not allowed")
   const type = source.type.toLowerCase()
-  const sameOpenList =
-    url.origin === requestUrl.origin &&
-    (/^\/(api\/)?p\//.test(url.pathname) ||
-      url.pathname.startsWith("/d/") ||
-      url.pathname.startsWith("/sd/") ||
-      url.pathname.startsWith("/@s/"))
+  const sameOpenList = isSameOpenListUrl(url, requestUrl)
   // Align with the Go backend: shares live under /sd/ (legacy /@s/ is still
   // accepted), direct sources under /d/.
   const shareSource =
@@ -315,6 +338,7 @@ function validateSource(c: any, source: SeedSource): URL {
   if (
     !shareSource &&
     !directSource &&
+    !sameOpenList &&
     !hostAllowed(url.hostname, allowedHosts(c))
   ) {
     throw new Error(
@@ -336,25 +360,41 @@ async function fetchSafe(
   restrictToSeedSources = false,
 ): Promise<Response> {
   let current = url
+  const initialOrigin = url.origin
   for (let redirect = 0; redirect <= 3; redirect++) {
     assertSafeUrl(current.toString(), "Seed fetch")
     if (restrictToSeedSources) {
       const requestUrl = new URL(c.req.url)
-      const sameOpenList =
-        current.origin === requestUrl.origin &&
-        (/^\/(api\/)?p\//.test(current.pathname) ||
-          current.pathname.startsWith("/@s/"))
+      // F-022：与 validateSource 共用同一份同源判定（含 /d/、/sd/）
+      const sameOpenList = isSameOpenListUrl(current, requestUrl)
       if (!sameOpenList && !hostAllowed(current.hostname, allowedHosts(c))) {
         throw new Error(
           "Seed fetch redirect left the approved source allowlist",
         )
       }
     }
-    const response = await fetch(current, { ...init, redirect: "manual" })
+    // F-021：跨域重定向时剥离凭证类请求头。浏览器的 fetch 规范会跨源剥离
+    // Authorization/Cookie，这里的手写重定向循环默认不会；驱动私有头
+    //（WebDAV Basic 认证、网盘 Cookie）同样不该被带到第三方 CDN。
+    const headers = new Headers(init.headers)
+    if (current.origin !== initialOrigin) {
+      for (const name of ["authorization", "cookie", "proxy-authorization"]) {
+        headers.delete(name)
+      }
+    }
+    const response = await fetch(current, {
+      ...init,
+      headers,
+      redirect: "manual",
+    })
     if (response.status < 300 || response.status >= 400) return response
     const location = response.headers.get("Location")
     if (!location)
       throw new Error("Seed fetch redirect is missing a Location header")
+    // 3xx 响应体不读不取消会占住上游连接，交给 GC 之前一直滞留。
+    try {
+      await response.body?.cancel()
+    } catch {}
     current = new URL(location, current)
   }
   throw new Error("Seed fetch exceeded the redirect limit")
@@ -431,6 +471,15 @@ async function parseBodySeed(c: any, user: any, body: any) {
 }
 
 interface SourceFile {
+  /**
+   * 用户视角的虚拟路径（未拼接 base_path）。
+   *
+   * F-028：用户提交的 file_comments / share_files / direct_files 键是「自己
+   * 看到的路径」（如 /docs/a.txt），而 virtualPath 对 base_path 非根的租户是
+   * 拼接后的实际存储路径（/user1/docs/a.txt），拿它匹配必然静默失配。
+   */
+  matchPath: string
+  /** 实际存储路径（/d 直链、分享记录与报错定位必须用它） */
   virtualPath: string
   relativePath: string
   size: number
@@ -478,6 +527,7 @@ async function collectSourceFiles(
       if (!item.raw_url && c.req.header("Authorization"))
         headers.Authorization = c.req.header("Authorization")!
       result.push({
+        matchPath: virtualPath,
         virtualPath: actualPath,
         relativePath: normalizeSeedPath(relativePath),
         size: item.size,
@@ -627,6 +677,23 @@ async function resolveSeedMatrix(
   return normalizeHashMatrix(hasExplicit ? input : undefined, formats)
 }
 
+// F-025：分享记录写入的模块级串行化队列。getDb 在 TTL 内返回**同一个**跨请求
+// 共享对象，「读→改→写」必须按顺序执行，否则并发 generate 互相覆盖丢分享。
+let sharesWriteQueue: Promise<void> = Promise.resolve()
+
+function appendSharesSerialized(envCtx: any, pendingShares: any[]): Promise<void> {
+  const run = async () => {
+    const sharesDb = await getDb(envCtx)
+    if (!Array.isArray(sharesDb.shares)) sharesDb.shares = []
+    sharesDb.shares = [...sharesDb.shares, ...pendingShares]
+    await saveDb(sharesDb, envCtx)
+  }
+  const next = sharesWriteQueue.then(run, run)
+  // 队列本身不吞后续请求的错误，但也不让单次失败卡死整条链
+  sharesWriteQueue = next.catch(() => {})
+  return next
+}
+
 async function generateSeed(
   c: any,
   user: any,
@@ -675,7 +742,11 @@ async function generateSeed(
   const useGlobalDirect =
     directFiles.size === 0 &&
     (body.include_direct_source === true || body.include_sources === true)
-  let sharesDb: any | undefined
+  // F-025：分享记录先收集在本地，等全部文件校验通过后再一次性写入。
+  // 历史缺陷：循环内直接对 getDb 返回的跨请求共享缓存对象 push，中途抛错
+  // （后续文件缺哈希）会在缓存里留下未被持久化的幽灵分享，且并发时是无锁
+  // 的 read-modify-write。现在失败路径不再触碰共享对象。
+  const pendingShares: any[] = []
   const files: SeedFile[] = []
   const torrentPieces: string[] = []
   for (const file of sourceFiles) {
@@ -697,10 +768,17 @@ async function generateSeed(
           "the TS backend only reuses hashes provided by the storage driver",
       )
     const comment = String(
-      fileComments[file.relativePath] ?? fileComments[file.virtualPath] ?? "",
+      fileComments[file.relativePath] ??
+        fileComments[file.matchPath] ??
+        fileComments[file.virtualPath] ??
+        "",
     )
+    // F-028：键匹配同时接受用户视角路径与实际路径，租户的 /docs/a.txt 与
+    // 管理员的实际路径都能命中（historical: 只接受 actualPath）。
     const matches = (set: Set<string>) =>
-      set.has(file.virtualPath) || set.has(file.relativePath)
+      set.has(file.matchPath) ||
+      set.has(file.virtualPath) ||
+      set.has(file.relativePath)
     const sources: SeedSource[] = []
     if (useGlobalDirect || matches(directFiles)) {
       sources.push({
@@ -711,10 +789,8 @@ async function generateSeed(
       })
     }
     if (useGlobalShare || matches(shareFiles)) {
-      if (!sharesDb) sharesDb = await getDb(c.env)
       const shareId = generateShareId()
-      if (!sharesDb.shares) sharesDb.shares = []
-      sharesDb.shares.push({
+      pendingShares.push({
         id: shareId,
         new_id: shareId,
         creator: user.username || "user",
@@ -766,7 +842,15 @@ async function generateSeed(
     files.push(seedFile)
     torrentPieces.push(...seedFile.hashes.pieces.sha1)
   }
-  if (sharesDb) await saveDb(sharesDb, c.env)
+  if (pendingShares.length) {
+    // 全部文件校验通过后才写入分享记录；shares 换成新数组，避免就地修改
+    // 共享缓存对象持有的数组（F-025）。
+    // getDb→追加→saveDb 是跨请求共享对象上的 read-modify-write：两个并发
+    // /generate 会在 await 点交错，后写者用旧副本覆盖先写者的分享。这里用
+    // 模块级 promise 链把同 isolate 内的写入串行化（跨 isolate 无锁可用，
+    // 与 pwdFailures 的单实例语义一致，属尽力而为）。
+    await appendSharesSerialized(c.env, pendingShares)
+  }
   return {
     torrentPieces,
     seed: normalizeSeed({
@@ -877,106 +961,144 @@ async function uploadStreamToDriver(
     }
 
     let uploadSession: any
-    if (typeof dynamic.createUploadSession === "function") {
-      uploadSession = await dynamic.createUploadSession(
-        dir,
-        resolvedDir.physical,
-        name,
-        file.size,
-        file.hashes.md5,
-      )
-      if (uploadSession?.reuse)
-        return { status: "reused", method: "multipart-rapid" }
-    }
-    if (rapidOnly)
-      throw new Error(
-        "capability unavailable: target driver did not reuse the available hashes",
-      )
-    if (!source)
-      throw new Error(
-        "capability unavailable: no rapid-upload match and no approved source URL",
-      )
-    const response = await fetchSafe(c, source.url, {}, true)
-    if (!response.ok || !response.body)
-      throw new Error(`Source download failed with HTTP ${response.status}`)
-
-    if (
-      uploadSession?.session &&
-      typeof dynamic.uploadPart === "function" &&
-      typeof dynamic.completeUploadSession === "function"
-    ) {
-      const chunkSize = Math.min(
-        envNumber(c, "SEED_TRANSFER_CHUNK_SIZE", DEFAULT_TRANSFER_CHUNK_SIZE),
-        16 * 1024 * 1024,
-      )
-      const reader = response.body.getReader()
-      let pending = new Uint8Array(0)
-      let partNumber = 1
-      let transferred = 0
-      const partMd5s: string[] = []
-      while (true) {
-        const { done, value } = await reader.read()
-        if (value?.length) {
-          transferred += value.length
-          if (transferred > file.size)
-            throw new Error("Source exceeds the declared file size")
-          const combined = new Uint8Array(pending.length + value.length)
-          combined.set(pending)
-          combined.set(value, pending.length)
-          pending = combined
-          while (pending.length >= chunkSize) {
-            const part = pending.slice(0, chunkSize)
-            pending = pending.slice(chunkSize)
-            const result = await dynamic.uploadPart(
-              uploadSession.session,
-              partNumber++,
-              Buffer.from(part),
-            )
-            if (result?.partMd5) partMd5s.push(result.partMd5)
-          }
-        }
-        if (done) break
-      }
-      if (transferred !== file.size)
-        throw new Error("Source size does not match seed metadata")
-      if (pending.length || file.size === 0) {
-        const result = await dynamic.uploadPart(
-          uploadSession.session,
-          partNumber,
-          Buffer.from(pending),
+    // F-026：会话建立之后的每条失败路径（rapidOnly 未命中、单分片失败、
+    // 尺寸校验失败、putStream 抛错）都必须中止驱动侧会话并取消未读完的
+    // reader，否则对象存储上留下计费的孤儿分片、连接滞留到 GC。
+    let sessionCompleted = false
+    let activeReader: ReadableStreamDefaultReader<Uint8Array> | undefined
+    let activeBody: ReadableStream<Uint8Array> | undefined
+    try {
+      if (typeof dynamic.createUploadSession === "function") {
+        uploadSession = await dynamic.createUploadSession(
+          dir,
+          resolvedDir.physical,
+          name,
+          file.size,
+          file.hashes.md5,
         )
-        if (result?.partMd5) partMd5s.push(result.partMd5)
+        if (uploadSession?.reuse)
+          return { status: "reused", method: "multipart-rapid" }
       }
-      await dynamic.completeUploadSession(uploadSession.session, partMd5s)
-      return { status: "saved", method: "multipart-stream" }
-    }
+      if (rapidOnly)
+        throw new Error(
+          "capability unavailable: target driver did not reuse the available hashes",
+        )
+      if (!source)
+        throw new Error(
+          "capability unavailable: no rapid-upload match and no approved source URL",
+        )
+      const response = await fetchSafe(c, source.url, {}, true)
+      if (!response.ok || !response.body)
+        throw new Error(`Source download failed with HTTP ${response.status}`)
+      activeBody = response.body
 
-    if (typeof dynamic.putStream === "function") {
-      await dynamic.putStream(
-        actualTarget,
-        resolved.physical,
-        response.body,
-        file.size,
-        metadata,
+      if (
+        uploadSession?.session &&
+        typeof dynamic.uploadPart === "function" &&
+        typeof dynamic.completeUploadSession === "function"
+      ) {
+        const chunkSize = Math.min(
+          envNumber(c, "SEED_TRANSFER_CHUNK_SIZE", DEFAULT_TRANSFER_CHUNK_SIZE),
+          16 * 1024 * 1024,
+        )
+        const reader = response.body.getReader()
+        activeReader = reader
+        let pending = new Uint8Array(0)
+        let partNumber = 1
+        let transferred = 0
+        const partMd5s: string[] = []
+        while (true) {
+          const { done, value } = await reader.read()
+          if (value?.length) {
+            transferred += value.length
+            if (transferred > file.size)
+              throw new Error("Source exceeds the declared file size")
+            const combined = new Uint8Array(pending.length + value.length)
+            combined.set(pending)
+            combined.set(value, pending.length)
+            pending = combined
+            while (pending.length >= chunkSize) {
+              const part = pending.slice(0, chunkSize)
+              pending = pending.slice(chunkSize)
+              const result = await dynamic.uploadPart(
+                uploadSession.session,
+                partNumber++,
+                Buffer.from(part),
+              )
+              if (result?.partMd5) partMd5s.push(result.partMd5)
+            }
+          }
+          if (done) break
+        }
+        if (transferred !== file.size)
+          throw new Error("Source size does not match seed metadata")
+        if (pending.length || file.size === 0) {
+          const result = await dynamic.uploadPart(
+            uploadSession.session,
+            partNumber,
+            Buffer.from(pending),
+          )
+          if (result?.partMd5) partMd5s.push(result.partMd5)
+        }
+        await dynamic.completeUploadSession(uploadSession.session, partMd5s)
+        sessionCompleted = true
+        return { status: "saved", method: "multipart-stream" }
+      }
+
+      if (typeof dynamic.putStream === "function") {
+        await dynamic.putStream(
+          actualTarget,
+          resolved.physical,
+          response.body,
+          file.size,
+          metadata,
+        )
+        activeBody = undefined
+        return { status: "saved", method: "putStream" }
+      }
+
+      const bufferedMax = envNumber(
+        c,
+        "SEED_BUFFERED_TRANSFER_MAX",
+        DEFAULT_BUFFERED_TRANSFER_MAX,
       )
-      return { status: "saved", method: "putStream" }
+      if (file.size <= bufferedMax) {
+        const bytes = new Uint8Array(await response.arrayBuffer())
+        activeBody = undefined
+        if (bytes.byteLength !== file.size)
+          throw new Error("Source size does not match seed metadata")
+        await driver.put(actualTarget, resolved.physical!, Buffer.from(bytes))
+        return { status: "saved", method: "bounded-buffer" }
+      }
+      throw new Error(
+        "capability unavailable: target driver has no streaming or multipart upload API",
+      )
+    } catch (err) {
+      if (activeReader) {
+        try {
+          await activeReader.cancel()
+        } catch {}
+      } else if (activeBody) {
+        try {
+          await activeBody.cancel()
+        } catch {}
+      }
+      if (uploadSession?.session && !sessionCompleted) {
+        const abort = dynamic.abortUploadSession
+        if (typeof abort === "function") {
+          try {
+            await abort.call(dynamic, uploadSession.session)
+          } catch {}
+        } else {
+          // 驱动均未提供中止接口：至少把待清理的上游会话记进日志（不打印
+          // session token 本身），便于运维按存储侧配额人工回收。
+          console.warn(
+            `[seed] orphan upload session left behind for "${name}" on driver "${resolved.storage.driver}" (no abortUploadSession API)`,
+          )
+        }
+      }
+      throw err
     }
-
-    const bufferedMax = envNumber(
-      c,
-      "SEED_BUFFERED_TRANSFER_MAX",
-      DEFAULT_BUFFERED_TRANSFER_MAX,
-    )
-    if (file.size <= bufferedMax) {
-      const bytes = new Uint8Array(await response.arrayBuffer())
-      if (bytes.byteLength !== file.size)
-        throw new Error("Source size does not match seed metadata")
-      await driver.put(actualTarget, resolved.physical!, Buffer.from(bytes))
-      return { status: "saved", method: "bounded-buffer" }
-    }
-    throw new Error(
-      "capability unavailable: target driver has no streaming or multipart upload API",
-    )
   } finally {
     await flushPendingDriverState(
       resolved.storage.driver,
@@ -995,6 +1117,10 @@ seedRouter.get("/capabilities", async (c) => {
   if (path) {
     try {
       const actual = getActualPath(user, normalizeVirtualPath(path))
+      // F-023：带 path 的探测会返回该路径所属存储的驱动名与能力，等同于读
+      // 存储拓扑。此前没有任何读权限校验，guest 即可枚举挂载结构；这里与
+      // 文件内其余路径端点走同一套读 ACL（密码 / read_users）。
+      await assertSeedReadable(c, user, actual)
       const resolved = await resolvePath(actual)
       if (!resolved.isVirtual && resolved.storage) {
         const driver = await getDriver(
@@ -1517,11 +1643,24 @@ async function transferBody(
         ? body.files.map((path: unknown) => String(path))
         : [],
     )
-    const selectedIndexes = new Set<number>(
-      Array.isArray(body.selected_files)
-        ? body.selected_files.map((index: unknown) => Number(index))
-        : [],
-    )
+    // F-030：先校验原始条目再转数字。Number(null)/Number("")/Number(false)
+    // 都是 0，会把畸形输入静默解释成「选中第 0 个文件」，本该 400 的请求
+    // 变成转存计划外的文件。只接受整数或纯十进制数字串。
+    const selectedIndexes = new Set<number>()
+    if (Array.isArray(body.selected_files)) {
+      for (const raw of body.selected_files) {
+        const numeric =
+          typeof raw === "number"
+            ? raw
+            : typeof raw === "string" && /^\d+$/.test(raw.trim())
+              ? Number(raw.trim())
+              : Number.NaN
+        if (!Number.isSafeInteger(numeric) || numeric < 0) {
+          throw new Error("selected_files contains an invalid index")
+        }
+        selectedIndexes.add(numeric)
+      }
+    }
     if (
       [...selectedIndexes].some(
         (index) =>
@@ -1823,7 +1962,10 @@ const updateSeedHandler = async (c: any) => {
           recalcMap.set(String(rf.path), rf.source_path)
         }
       }
-      const torrentHasher = await TorrentPieceHasher.create(pieceSize)
+      // F-029：不再创建 TorrentPieceHasher。它是跨文件全局分片哈希器，
+      // digest() 从未被调用，实际进入种子的分片哈希完全来自
+      // hashReadableStream 自建的 per-file 分片 hasher——传进去只是给每个
+      // 字节多算一遍 SHA-1（重算路径的纯浪费）。
       const maxBytes = envNumber(
         c,
         "SEED_MAX_HASH_BYTES",
@@ -1850,7 +1992,6 @@ const updateSeedHandler = async (c: any) => {
           pieceSize,
           sf.size,
           maxBytes,
-          torrentHasher,
         )
         file.hashes = applyHashMatrix(
           { ...file, hashes: result.hashes },
@@ -2006,6 +2147,16 @@ torrentLegacyRouter.post("/generate", async (c) => {
       { ...body, paths },
       ["torrent"],
     )
+    // F-024：主 /generate 在编码前按格式跑 conversionDiagnostics，legacy 路由
+    // 此前直接 encodeTorrent(seed, torrentPieces)。带 generatedPieceHashes 时
+    // encodeTorrent 会跳过对齐校验，多文件种子中任一非末尾文件大小不是
+    // piece_size 整数倍就会产出边界错位的坏种子。这里补上同一道门禁。
+    const diagnostics = conversionDiagnostics(seed, "torrent")
+    if (diagnostics.length) {
+      throw new Error(
+        `cannot convert seed to torrent: ${diagnostics.join("; ")}`,
+      )
+    }
     const bytes = await encodeTorrent(seed, torrentPieces)
     await saveEncodedSeed(c, user, body.save_path || body.output_path, bytes)
     return c.json({
@@ -2022,6 +2173,8 @@ export const seedTestHelpers = {
   contentBytes,
   decodeOss,
   hostAllowed,
+  isSameOpenListUrl,
   normalizeVirtualPath,
   seedFormatsForFiles,
+  validateSource,
 }

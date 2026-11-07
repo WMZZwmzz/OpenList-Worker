@@ -138,14 +138,17 @@ try {
 
   console.log("=== E. worker 禁内存 ===")
   for (const [n, e] of [
-    ["__requestOrigin", { __requestOrigin: origin }],
+    // F-077：__requestOrigin 来自客户端可控的 Host 头，不再作为 serverless
+    // 证据；EdgeOne Makers 的请求上下文（__requestContext）才是可信标记。
+    ["__requestContext", { __requestContext: { platform: "edgeone" } }],
     ["EDGEONE_BLOB", { EDGEONE_BLOB: {} }],
     ["ESA_BLOB", { ESA_BLOB: {} }],
     ["TENCENTCLOUD_SCF_FUNCTIONNAME", { TENCENTCLOUD_SCF_FUNCTIONNAME: "f" }],
   ]) check(`识别 ${n}`, backendMod.isServerlessRuntime(e) === true)
   check("本地不误判", backendMod.isServerlessRuntime({}) === false)
+  check("__requestOrigin 不再视为 serverless（F-077）", backendMod.isServerlessRuntime({ __requestOrigin: origin }) === false)
   let e1 = false
-  try { await backendMod.getStorageBackend({ __requestOrigin: origin }) } catch (x) { e1 = String(x.message).includes("No storage backend is available") }
+  try { await backendMod.getStorageBackend({ __requestContext: { platform: "edgeone" } }) } catch (x) { e1 = String(x.message).includes("No storage backend is available") }
   check("worker 无存储抛错", e1)
 
   console.log("=== F. 显式驱动不回退 ===")

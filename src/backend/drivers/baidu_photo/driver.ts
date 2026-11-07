@@ -61,7 +61,7 @@ function parseSign(sign: string): {
   kind: "album" | "file" | "albumfile"
   fsid: number
   albumId: string
-  tid: number
+  tid: string
   uk: number
 } {
   if (sign.startsWith("albumfile:")) {
@@ -70,19 +70,20 @@ function parseSign(sign: string): {
       kind: "albumfile",
       fsid: Number(fsid),
       albumId,
-      tid: Number(tid),
+      // tid 是 18 位 int64，必须保持字符串（F-300）
+      tid,
       uk: Number(uk),
     }
   }
   if (sign.startsWith("album:")) {
     const [albumId, tid] = sign.slice("album:".length).split("|")
-    return { kind: "album", fsid: 0, albumId, tid: Number(tid), uk: 0 }
+    return { kind: "album", fsid: 0, albumId, tid, uk: 0 }
   }
   return {
     kind: "file",
     fsid: Number(sign.slice("file:".length)),
     albumId: "",
-    tid: 0,
+    tid: "",
     uk: 0,
   }
 }
@@ -90,7 +91,12 @@ function parseSign(sign: string): {
 export class DriverBaiduPhoto implements StorageDriver {
   private client: ClientBaiduPhoto
   private showType: string
-  private albumCache = new Map<string, BaiduPhotoAlbum>()
+  /** 相册名 → { 相册, 过期时间 }（F-302：加短 TTL，外部改动不会永久陈旧） */
+  private albumCache = new Map<
+    string,
+    { album: BaiduPhotoAlbum; expires: number }
+  >()
+  private static readonly ALBUM_CACHE_TTL_MS = 5 * 60 * 1000
 
   constructor(addition: DriverBaiduPhotoAddition) {
     this.client = new ClientBaiduPhoto(addition)
@@ -109,7 +115,7 @@ export class DriverBaiduPhoto implements StorageDriver {
       if (this.showType !== "root_only_file") {
         const albums = await this.client.getAllAlbum()
         for (const a of albums) {
-          this.albumCache.set(a.title, a)
+          this.setAlbumCache(a)
           items.push(albumToItem(a))
         }
       }
@@ -127,10 +133,25 @@ export class DriverBaiduPhoto implements StorageDriver {
     return files.map(albumFileToItem)
   }
 
-  async get(_virtualPath: string, physicalPath: string): Promise<FileItem> {
+  async get(virtualPath: string, physicalPath: string): Promise<FileItem> {
     const parts = physicalPath.split("/").filter(Boolean)
     const name = parts[parts.length - 1] || "root"
     const parentPath = parts.slice(0, -1).join("/")
+
+    if (parts.length === 0) {
+      // 存储根：合法目录条目（不是伪造的不存在路径）
+      const rootName =
+        virtualPath.split("/").filter(Boolean).pop() || "root"
+      return {
+        name: rootName,
+        size: 0,
+        is_dir: true,
+        modified: new Date().toISOString(),
+        sign: "",
+        type: 1,
+        raw_url: "",
+      }
+    }
 
     if (!parentPath) {
       // root 层：相册或根文件
@@ -180,22 +201,22 @@ export class DriverBaiduPhoto implements StorageDriver {
       }
     }
 
-    return {
-      name,
-      size: 0,
-      is_dir: true,
-      modified: new Date().toISOString(),
-      sign: "",
-      type: 1,
-      raw_url: "",
-    }
+    // F-301：不存在的路径必须报 not-found，而不是伪造一个 is_dir:true 的
+    // 目录条目（后者会被 op 层当作真实目录写入直链/元数据缓存）。
+    throw new Error(`[BaiduPhoto] '${name}' not found`)
   }
 
   async mkdir(_virtualPath: string, physicalPath: string): Promise<void> {
-    const clean = physicalPath.split("/").filter(Boolean).join("/")
-    if (clean) throw new Error("[BaiduPhoto] 相册不支持创建子目录")
-    const name = "new_album"
-    // 简单处理：mkdir 在 root 创建相册（名字由上层传入时用 name，这里用路径最后一段）
+    // F-298：physicalPath 是【要新建的目录】的完整物理路径，最后一段才是
+    // 相册名；只拦截多段嵌套路径（相册不支持子目录）。
+    const parts = physicalPath.split("/").filter(Boolean)
+    if (parts.length > 1) {
+      throw new Error("[BaiduPhoto] 相册不支持创建子目录")
+    }
+    const name = parts[parts.length - 1]
+    if (!name) {
+      throw new Error("[BaiduPhoto] 缺少相册名称")
+    }
     const album = await this.client.createAlbum(name)
     this.albumCache.clear()
     void album
@@ -332,7 +353,8 @@ export class DriverBaiduPhoto implements StorageDriver {
       album = await this.findAlbum(parentPath)
       if (!album) throw new Error(`[BaiduPhoto] 相册 '${parentPath}' 未找到`)
     }
-    await this.client.upload(album, name, new Uint8Array(content))
+    // F-304：Buffer 本身就是 Uint8Array，直接传入即可，避免整文件再拷贝一份。
+    await this.client.upload(album, name, content)
     this.albumCache.clear()
   }
 
@@ -373,11 +395,23 @@ export class DriverBaiduPhoto implements StorageDriver {
     throw new Error(`[BaiduPhoto] '${name}' not found`)
   }
 
-  /** 通过相册名查找相册（带缓存） */
+  /** 通过相册名查找相册（带 TTL 缓存；陈旧条目过期后重新拉取，F-302） */
   private async findAlbum(name: string): Promise<BaiduPhotoAlbum | null> {
-    if (this.albumCache.has(name)) return this.albumCache.get(name)!
+    const cached = this.albumCache.get(name)
+    if (cached && cached.expires > Date.now()) {
+      return cached.album
+    }
+    if (cached) this.albumCache.delete(name)
     const albums = await this.client.getAllAlbum()
-    for (const a of albums) this.albumCache.set(a.title, a)
-    return this.albumCache.get(name) || null
+    for (const a of albums) this.setAlbumCache(a)
+    const fresh = this.albumCache.get(name)
+    return fresh && fresh.expires > Date.now() ? fresh.album : null
+  }
+
+  private setAlbumCache(album: BaiduPhotoAlbum): void {
+    this.albumCache.set(album.title, {
+      album,
+      expires: Date.now() + DriverBaiduPhoto.ALBUM_CACHE_TTL_MS,
+    })
   }
 }

@@ -56,25 +56,17 @@ export class DriverNeteaseMusic implements StorageDriver {
 
     const songs = await this.client.getSongObjs(this.songLimit)
     const target = songs.find((f) => f.fileName === name)
-    if (target) {
-      const item = songToItem(target)
-      try {
-        item.raw_url = await this.client.getSongLink(item.sign)
-      } catch {
-        item.raw_url_error = "[NeteaseMusic] failed to resolve song url"
-      }
-      return item
+    if (!target) {
+      // Never fabricate a 0-byte item: upper layers must surface 404.
+      throw new Error(`[NeteaseMusic] file not found: ${name}`)
     }
-
-    return {
-      name,
-      size: 0,
-      is_dir: false,
-      modified: new Date().toISOString(),
-      sign: "",
-      type: 0,
-      raw_url: "",
+    const item = songToItem(target)
+    try {
+      item.raw_url = await this.client.getSongLink(item.sign)
+    } catch {
+      item.raw_url_error = "[NeteaseMusic] failed to resolve song url"
     }
+    return item
   }
 
   async mkdir(): Promise<void> {

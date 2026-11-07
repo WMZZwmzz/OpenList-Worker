@@ -56,6 +56,12 @@ function keyFor(target: CacheTarget, env?: any): string {
   return buildCacheKey("ln", target.storage.id, target.cleanPath, cfg.prefix)
 }
 
+/** 存储修订号（`storage.modified`），用于缓存信封的修订校验（F-104）。 */
+function revisionOf(target: CacheTarget): string {
+  const modified = (target?.storage as any)?.modified
+  return modified === undefined || modified === null ? "" : String(modified)
+}
+
 /**
  * 读取下载链接缓存。未命中 / 已过期 / 异常均返回 null。
  *
@@ -67,7 +73,9 @@ export async function getCachedLink(
 ): Promise<FileItem | null> {
   if (!isLinkCacheable(target, env)) return null
   try {
-    const hit = await cacheGetEnvelope<FileItem>(keyFor(target, env), env)
+    const hit = await cacheGetEnvelope<FileItem>(keyFor(target, env), env, {
+      revision: revisionOf(target),
+    })
     if (!hit || !hit.v || typeof hit.v !== "object") return null
     return { ...hit.v }
   } catch {
@@ -92,7 +100,9 @@ export async function setCachedLink(
   const ttlMinutes = resolveLinkTtlMinutes(env)
   if (ttlMinutes <= 0) return
   try {
-    await cacheSetEnvelope(keyFor(target, env), item, ttlMinutes * 60_000, env)
+    await cacheSetEnvelope(keyFor(target, env), item, ttlMinutes * 60_000, env, {
+      revision: revisionOf(target),
+    })
   } catch {
     // 缓存写入失败绝不影响业务
   }

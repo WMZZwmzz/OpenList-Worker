@@ -7,6 +7,7 @@ import {
   deriveConfigEncryptionKey,
   encrypt,
   encryptConfigValue,
+  setLegacyWeakKdfAllowed,
 } from "./crypto"
 import { hashPasswordSHA256, authRouter, getOrInitUsers } from "../server/auth"
 import { saveDb, getDb } from "../internal/model/db"
@@ -56,12 +57,25 @@ test("AES decrypt backwards compatibility with 2-segment legacy format", async (
       .join("")
   const legacyEncrypted = `${hexEncode(iv.buffer)}:${hexEncode(cipherBuf)}`
 
-  const decrypted = await decrypt(legacyEncrypted, secretKey)
-  assert.equal(
-    decrypted,
-    plaintext,
-    "Legacy format must be decrypted successfully",
+  // S-15：遗留弱 KDF 格式默认拒绝（fail-closed），需显式开关放行。
+  setLegacyWeakKdfAllowed(false)
+  await assert.rejects(
+    () => decrypt(legacyEncrypted, secretKey),
+    /DB_CIPHER_ALLOW_LEGACY/,
+    "legacy weak-KDF format must be refused unless explicitly allowed",
   )
+
+  setLegacyWeakKdfAllowed(true)
+  try {
+    const decrypted = await decrypt(legacyEncrypted, secretKey)
+    assert.equal(
+      decrypted,
+      plaintext,
+      "Legacy format must be decrypted successfully",
+    )
+  } finally {
+    setLegacyWeakKdfAllowed(false)
+  }
 })
 
 test("config encryption reuses one derived key with independent IVs", async () => {

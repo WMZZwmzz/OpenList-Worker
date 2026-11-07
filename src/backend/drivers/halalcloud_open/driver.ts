@@ -67,29 +67,33 @@ export class DriverHalalCloudOpen implements StorageDriver {
     const name = parts[parts.length - 1] || "root"
     const parentPath = "/" + parts.slice(0, -1).join("/")
 
-    try {
-      const files = await this.client.listFiles(
-        parentPath === "//" ? "/" : parentPath,
-      )
-      const target = files.find((f) => f.name === name)
-      if (target) {
-        const item = fileToItem(target)
-        if (!item.is_dir) {
-          try {
-            item.raw_url = await this.client.getDownloadUrl(
-              target.path || full,
-              target.identity || "",
-            )
-          } catch {
-            item.raw_url_error = "[HalalCloud] failed to resolve download url"
-          }
+    // F-337：父目录列表失败（token 刷新失败/网络错误/限流）必须向上抛，
+    // 不能与「列表成功但没有这个名字」共用同一个 is_dir 占位目录。
+    const files = await this.client.listFiles(
+      parentPath === "//" ? "/" : parentPath,
+    )
+    const target = files.find((f) => f.name === name)
+    if (target) {
+      const item = fileToItem(target)
+      if (!item.is_dir) {
+        try {
+          item.raw_url = await this.client.getDownloadUrl(
+            target.path || full,
+            target.identity || "",
+          )
+        } catch {
+          item.raw_url_error = "[HalalCloud] failed to resolve download url"
         }
-        return item
       }
-    } catch {
-      // fall through
+      return item
     }
 
+    // 列表成功但未命中：确认它是不是目录（列目标自身），否则 not found。
+    try {
+      await this.client.listFiles(full)
+    } catch {
+      throw new Error(`[HalalCloud] '${full}' not found`)
+    }
     return {
       name,
       size: 0,
@@ -130,30 +134,31 @@ export class DriverHalalCloudOpen implements StorageDriver {
 
   async move(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
+    // dstDir 是虚拟目录，dstPhysical 才是目标项自身的物理路径（op 层契约）；
+    // fullPath() 只接受物理路径，把虚拟 dstDir 传进来会重复拼入挂载前缀/root_folder_id。
     const srcFull = this.fullPath(srcPhysical)
-    const dstFull = this.fullPath(dstDir)
+    const dstFull = this.fullPath(dstPhysical)
     const entry = await this.resolveEntry(srcFull)
-    const name = srcFull.split("/").filter(Boolean).pop() || ""
-    await this.client.move(entry.path, joinPath(dstFull, name), entry.identity)
+    await this.client.move(entry.path, dstFull, entry.identity)
   }
 
   async copy(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
+    // 同 move：目标路径由 dstPhysical 推导，与 dropbox 驱动一致。
     const srcFull = this.fullPath(srcPhysical)
-    const dstFull = this.fullPath(dstDir)
+    const dstFull = this.fullPath(dstPhysical)
     const entry = await this.resolveEntry(srcFull)
-    const name = srcFull.split("/").filter(Boolean).pop() || ""
-    await this.client.copy(entry.path, joinPath(dstFull, name), entry.identity)
+    await this.client.copy(entry.path, dstFull, entry.identity)
   }
 
   async put(): Promise<void> {
@@ -179,12 +184,4 @@ export class DriverHalalCloudOpen implements StorageDriver {
       isDir: target.dir === true,
     }
   }
-}
-
-function joinPath(a: string, b: string): string {
-  const left = String(a || "").replace(/\/+$/, "")
-  const right = String(b || "").replace(/^\/+/, "")
-  if (!left) return "/" + right
-  if (!right) return left
-  return left + "/" + right
 }

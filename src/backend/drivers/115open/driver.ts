@@ -127,23 +127,48 @@ export class Pan115Driver implements StorageDriver {
   }
 
   private reserve(): boolean {
-    if (this.budget.used >= this.budget.limit) {
-      console.warn(
-        `[115open] 已达 Cloudflare subrequest 预算上限(${this.budget.limit})，结果已截断`,
-      )
-      return false
-    }
+    if (this.budget.used >= this.budget.limit) return false
     this.budget.used++
     return true
   }
 
+  /** 清理过期的下载链接缓存，并对总量设硬上限（长驻运行时防止无界增长） */
+  private pruneLinkCache(): void {
+    const now = Date.now()
+    for (const [key, value] of this.linkCache) {
+      if (value.expire <= now) this.linkCache.delete(key)
+    }
+    const MAX_LINK_CACHE = 512
+    if (this.linkCache.size <= MAX_LINK_CACHE) return
+    // Map 保持插入顺序：先删最早写入的条目
+    for (const key of this.linkCache.keys()) {
+      if (this.linkCache.size <= MAX_LINK_CACHE) break
+      this.linkCache.delete(key)
+    }
+  }
+
+  /** fidCache 同样是只增不减的 Map：按插入顺序做一次简单上限裁剪 */
+  private pruneFidCache(): void {
+    const MAX_FID_CACHE = 20000
+    if (this.fidCache.size <= MAX_FID_CACHE) return
+    for (const key of this.fidCache.keys()) {
+      if (this.fidCache.size <= MAX_FID_CACHE) break
+      this.fidCache.delete(key)
+    }
+  }
+
   async list(_virtualPath: string, physicalPath: string): Promise<FileItem[]> {
     this.budget.used = 0
+    this.pruneLinkCache()
     const cid = await this.resolveFolderId(physicalPath)
     const items: FileItem[] = []
     let offset = 0
+    let truncated = false
     for (;;) {
-      if (!this.reserve()) break
+      if (!this.reserve()) {
+        truncated = true
+        break
+      }
       const { files, count } = await this.client.getFiles({
         cid,
         limit: this.pageSize,
@@ -158,6 +183,16 @@ export class Pan115Driver implements StorageDriver {
       }
       if (items.length >= count || files.length === 0) break
       offset += files.length
+    }
+    this.pruneFidCache()
+    if (truncated) {
+      // 截断的目录列表不能被当成完整结果：上层会把它写入文件树缓存并在
+      // TTL 内持续返回缺失内容，因此这里显式失败而不是只打 warn。
+      throw new Error(
+        `[115open] 目录条目过多：已达到单次请求子请求预算上限(${this.budget.limit})，` +
+          `结果被截断（仅取到 ${items.length} 项）。请调大 page_size 或在没有 ` +
+          `50 子请求限制的运行时上使用该存储`,
+      )
     }
     return sortFileItems(
       items,
@@ -180,8 +215,12 @@ export class Pan115Driver implements StorageDriver {
     const cached = this.fidCache.get(clean)
     if (cached) return cached
 
-    // 用 GetFolderInfoByPath 一次性解析（Go Get 逻辑）
-    const fullPath = `/${rootId === "0" ? "" : rootId}${clean === "/" ? "" : clean}`
+    // 用 GetFolderInfoByPath 一次性解析（Go 逻辑）。路径必须按 Go 的
+    // stdpath.Join(d.parentPath, path) 语义构造：parentPath 是根目录的
+    // **目录名**路径（init 时由 folder/get_info 的 file_name + paths 拼出），
+    // 而不是数字 root_id——后者会构造出 "/2491234/photos" 这种语义错误的路径，
+    // root_id="0" 时更会产生双斜杠 "//target"。
+    const fullPath = `${this.parentPath === "/" ? "" : this.parentPath}${clean}`
     try {
       if (!this.reserve()) throw new Error("subrequest budget exceeded")
       const info = await this.client.getFolderInfoByPath(fullPath)
@@ -305,6 +344,7 @@ export class Pan115Driver implements StorageDriver {
       try {
         // 链接缓存（Go LinkCacheMode=UA）：同一 文件+UA 复用链接，节省 downurl 配额
         const cacheKey = `${file.fid}|${OPENLIST_UA}`
+        this.pruneLinkCache()
         const cached = this.linkCache.get(cacheKey)
         if (cached && cached.expire > Date.now()) {
           item.raw_url = cached.url
@@ -324,12 +364,17 @@ export class Pan115Driver implements StorageDriver {
         }
       } catch (e: any) {
         const msg = String(e?.message || e)
+        // 把真实原因写进 FileItem.raw_url_error：raw.ts 会优先展示它，
+        // 否则下载端点只能给出泛化的 404「未返回下载链接」。
         if (msg.includes("406")) {
           console.warn(
             "[115open] downurl 配额用尽（406）：已使用缓存或稍后重试",
           )
+          item.raw_url_error =
+            "115 网盘下载链接配额已用尽（code 406），请稍后重试"
         } else {
           console.warn(`[115open] downUrl warning for ${file.fn}:`, e.message)
+          item.raw_url_error = msg || "failed to resolve download url"
         }
       }
     }
@@ -370,30 +415,43 @@ export class Pan115Driver implements StorageDriver {
     await this.client.delFile(file.fid, file.pid || this.getRootId())
   }
 
+  /**
+   * dstPhys 是**目标项自身**的物理路径（已含文件名），目标父目录需取其
+   * dirname。dstDir 是用户视角的虚拟路径（含挂载点前缀），不能直接当
+   * 115 账号内的路径解析。
+   */
+  private parentPhysicalPath(physicalPath: string): string {
+    const segs = String(physicalPath || "")
+      .split("/")
+      .filter(Boolean)
+    segs.pop()
+    return "/" + segs.join("/")
+  }
+
   async move(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhys: string,
-    _dstPhys: string,
+    dstPhys: string,
   ): Promise<void> {
     this.budget.used = 0
     const file = await this.resolveFile(srcPhys)
-    const dstId = await this.resolveFolderId(dstDir)
+    const dstId = await this.resolveFolderId(this.parentPhysicalPath(dstPhys))
     if (!this.reserve()) throw new Error("subrequest budget exceeded")
     await this.client.move(file.fid, dstId)
   }
 
   async copy(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhys: string,
-    _dstPhys: string,
+    dstPhys: string,
   ): Promise<void> {
     this.budget.used = 0
     const file = await this.resolveFile(srcPhys)
-    const dstId = await this.resolveFolderId(dstDir)
+    const dstId = await this.resolveFolderId(this.parentPhysicalPath(dstPhys))
     if (!this.reserve()) throw new Error("subrequest budget exceeded")
     await this.client.copy(dstId, file.fid)
   }

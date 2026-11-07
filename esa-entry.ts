@@ -54,14 +54,15 @@ function detectEdgeKVCtor(): any {
   return candidates[0] || null
 }
 const MODULE_LEVEL_EDGE_KV = detectEdgeKVCtor()
-console.log(
-  `[ESA/entry] module loaded, module-level EdgeKV: ${!!MODULE_LEVEL_EDGE_KV}, ` +
-    `globalThis keys: ${
-      Object.keys(globalThis as any)
-        .filter((k) => /kv|edge|storage|env|alibaba|worker/i.test(k))
-        .join(",") || "(none matched)"
-    }`,
-)
+// L-02（深度审查报告）：模块加载即打印 globalThis 绑定名会把运行时绑定面
+// 泄漏到平台日志。改为仅在 ESA_LOG_ENV=1（排障开关）下输出，且不打印键名清单。
+if (
+  typeof process !== "undefined"
+    ? process.env?.ESA_LOG_ENV === "1"
+    : (globalThis as any).__env?.ESA_LOG_ENV === "1"
+) {
+  console.log(`[ESA/entry] module loaded, module-level EdgeKV: ${!!MODULE_LEVEL_EDGE_KV}`)
+}
 function getEdgeKVCtorAtRequestTime(): any {
   if (MODULE_LEVEL_EDGE_KV) return MODULE_LEVEL_EDGE_KV
   const g = globalThis as any
@@ -140,9 +141,10 @@ function wrapEsaEdgeKV(edgeKv: any, cache?: Map<string, string | null>) {
         return result
       } catch (e) {
         console.error(`[ESA/KV] get failed key=${key}:`, e)
-        // 4. 失败也缓存 null，避免同一请求内反复重试耗尽配额
+        // 只写请求级缓存（同请求内不重复重试），绝不写入跨请求的模块级缓存：
+        // 一次瞬时故障（超时/限流）若被缓存 60 秒，会把「读失败」放大成整个
+        // isolate 的「数据不存在」，被上层当成全新空库/密钥缺失处理。
         if (cache) cache.set(key, null)
-        setModuleKvCache(key, null)
         return null
       }
     },
@@ -166,8 +168,18 @@ function wrapEsaEdgeKV(edgeKv: any, cache?: Map<string, string | null>) {
     async delete(key: string): Promise<void> {
       try {
         await edgeKv.delete(key)
-      } catch {}
-      // delete 后使缓存失效
+      } catch (e: any) {
+        // 与 put 一致：删除失败必须让调用方看到，且不清缓存（底层值还在，
+        // 缓存也应保持一致）。吞掉异常 + 清缓存会让「删除成功」是假象，
+        // 下一次 get 会把本该删除的旧值读回来并重新缓存。
+        console.error(
+          `[ESA/KV] delete failed key=${key}:`,
+          e?.message || e,
+          e?.stack || ""
+        )
+        throw e
+      }
+      // delete 成功后使缓存失效
       if (cache) cache.delete(key)
       deleteModuleKvCache(key)
     },
@@ -247,10 +259,13 @@ export default {
         console.warn(
           `[ESA/req:${reqId}] EdgeKV constructor NOT found — KV falls back to memory mode`,
         )
-        const allKeys = Object.keys(globalThis as any)
-        console.log(
-          `[ESA/req:${reqId}] globalThis all keys (first 50): ${allKeys.slice(0, 50).join(",")}`,
-        )
+        // L-02：绑定名清单只在显式诊断开关下打印，避免泄漏运行时绑定面。
+        if (esaEnvLogEnabled(env)) {
+          const allKeys = Object.keys(globalThis as any)
+          console.log(
+            `[ESA/req:${reqId}] globalThis all keys (first 50): ${allKeys.slice(0, 50).join(",")}`,
+          )
+        }
       }
     } else if (isApiRequest) {
       console.warn(

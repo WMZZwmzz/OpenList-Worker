@@ -124,16 +124,22 @@ export class ClientGooglePhoto {
   }
 
   private getMedias(albumId: string): Promise<GooglePhotoMediaItem[]> {
+    // F-448：mediaItems:search 是 POST 接口，albumId/pageSize/pageToken 属于
+    // JSON 请求体（gRPC transcoding：有请求体时字段不再从 query 映射）。
+    // 以前把它们放在 query 且不带 body，服务端等价于「无过滤条件」，
+    // 返回的是整个媒体库而不是该相册的内容。query 只保留 fields。
     return this.fetchItems(
       "https://photoslibrary.googleapis.com/v1/mediaItems:search",
       {
         fields:
           "mediaItems(id,baseUrl,mimeType,mediaMetadata,filename),nextPageToken",
-        pageSize: "100",
-        albumId,
-        pageToken: "first",
       },
       "POST",
+      (pageToken) => ({
+        albumId,
+        pageSize: 100,
+        ...(pageToken ? { pageToken } : {}),
+      }),
     )
   }
 
@@ -163,17 +169,41 @@ export class ClientGooglePhoto {
     url: string,
     query: Record<string, string>,
     method: string,
+    bodyBuilder?: (pageToken: string) => unknown,
   ): Promise<GooglePhotoMediaItem[]> {
     const res: GooglePhotoMediaItem[] = []
-    let pageToken = query.pageToken
-    while (pageToken !== "") {
-      const q = { ...query }
-      if (q.pageToken === "first") {
-        q.pageToken = ""
+    // pageToken 初始值为占位符 "first"（首轮不带 token）；每轮必须使用上一轮
+    // 返回的 nextPageToken，否则结果超过一页时会无限重复请求第一页。
+    let pageToken = query.pageToken === "first" ? "" : query.pageToken || ""
+    let hasMore = true
+    const seenTokens = new Set<string>()
+    let pageCount = 0
+    while (hasMore) {
+      if (pageToken && seenTokens.has(pageToken)) {
+        throw new Error(`[GooglePhoto] pagination stuck on token: ${pageToken}`)
       }
-      const resp = await this.request(url, method, q)
+      if (pageToken) seenTokens.add(pageToken)
+      if (++pageCount > 1000) {
+        throw new Error("[GooglePhoto] pagination exceeded 1000 pages")
+      }
+      const q: Record<string, string> = { ...query }
+      if (!bodyBuilder) {
+        if (pageToken) {
+          q.pageToken = pageToken
+        } else {
+          delete q.pageToken
+        }
+      } else {
+        // POST 接口的分页参数只走请求体，不能同时出现在 query 里
+        delete q.pageToken
+        delete q.pageSize
+      }
+      // POST 接口（mediaItems:search）的分页参数必须随请求体发送。
+      const body = bodyBuilder ? bodyBuilder(pageToken) : undefined
+      const resp = await this.request(url, method, q, body)
       const data = (await resp.json()) as GooglePhotoItems
       pageToken = data.nextPageToken || ""
+      hasMore = pageToken !== ""
       if (data.mediaItems) res.push(...data.mediaItems)
       if (data.albums) res.push(...data.albums)
       if (data.sharedAlbums) res.push(...data.sharedAlbums)

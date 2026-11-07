@@ -35,6 +35,23 @@ export function joinPath(...parts: string[]): string {
   return cleanPath(parts.join("/"))
 }
 
+/**
+ * 路径段级父子判断（F-202）：`/aa/1x` 不是 `/aa/1` 的子路径。
+ * 仅字符串前缀判断会把名称互为前缀的兄弟目录误判为嵌套关系。
+ */
+export function isChildPath(parent: string, p: string): boolean {
+  const parentClean = cleanPath(parent)
+  const childClean = cleanPath(p)
+  if (parentClean === childClean) return false
+  const prefix = parentClean === "/" ? "/" : parentClean + "/"
+  return childClean.startsWith(prefix)
+}
+
+/** 模板变量替换：用函数形式避免 `$&`/`$'` 等替换模式被展开（F-206） */
+function replaceVar(msg: string, name: string, value: string | undefined): string {
+  return msg.replace(new RegExp(`\\{\\{\\.${name}\\}\\}`, "g"), () => value || "")
+}
+
 export function renderCommitMessage(
   tmpl: string | undefined,
   vars: MessageTemplateVars,
@@ -44,13 +61,13 @@ export function renderCommitMessage(
     return `${vars.UserName} ${defaultOp} ${vars.ObjPath}`
   }
   let msg = tmpl
-  msg = msg.replace(/\{\{\.UserName\}\}/g, vars.UserName || "")
-  msg = msg.replace(/\{\{\.ObjName\}\}/g, vars.ObjName || "")
-  msg = msg.replace(/\{\{\.ObjPath\}\}/g, vars.ObjPath || "")
-  msg = msg.replace(/\{\{\.ParentName\}\}/g, vars.ParentName || "")
-  msg = msg.replace(/\{\{\.ParentPath\}\}/g, vars.ParentPath || "")
-  msg = msg.replace(/\{\{\.TargetName\}\}/g, vars.TargetName || "")
-  msg = msg.replace(/\{\{\.TargetPath\}\}/g, vars.TargetPath || "")
+  msg = replaceVar(msg, "UserName", vars.UserName)
+  msg = replaceVar(msg, "ObjName", vars.ObjName)
+  msg = replaceVar(msg, "ObjPath", vars.ObjPath)
+  msg = replaceVar(msg, "ParentName", vars.ParentName)
+  msg = replaceVar(msg, "ParentPath", vars.ParentPath)
+  msg = replaceVar(msg, "TargetName", vars.TargetName)
+  msg = replaceVar(msg, "TargetPath", vars.TargetPath)
   return msg
 }
 
@@ -118,6 +135,24 @@ export function getPathCommonAncestor(
   return { ancestor, aChildName, bChildName, aRest, bRest }
 }
 
+/** 带 HTTP 状态码的请求错误（F-205）：便于只对 404 做「非分支引用」降级 */
+export class GithubRequestError extends Error {
+  readonly status: number
+
+  constructor(message: string, status: number) {
+    super(message)
+    this.name = "GithubRequestError"
+    this.status = status
+  }
+}
+
+/** 是否为 HTTP 404（兼容普通 Error 文本） */
+export function isNotFoundError(e: unknown): boolean {
+  if (e instanceof GithubRequestError) return e.status === 404
+  const msg = e instanceof Error ? e.message : String(e ?? "")
+  return /^404\b/.test(msg)
+}
+
 export class GithubApiClient {
   private addition: GithubAddition
   private token: string
@@ -131,8 +166,11 @@ export class GithubApiClient {
     this.repo = (addition.repo || "").trim()
   }
 
-  private get headers(): Record<string, string> {
-    const h: Record<string, string> = {
+  get hasToken(): boolean {
+    return !!this.token
+  }
+
+  private get headers(): Record<string, string> {    const h: Record<string, string> = {
       Accept: "application/vnd.github.object+json",
       "X-GitHub-Api-Version": "2022-11-28",
       "User-Agent": "OpenList-Github-Driver",
@@ -182,7 +220,7 @@ export class GithubApiClient {
           errMsg = `${res.status} ${res.statusText}: ${errJson.message}`
         }
       } catch {}
-      throw new Error(errMsg)
+      throw new GithubRequestError(errMsg, res.status)
     }
 
     if (res.status === 204) {
@@ -194,7 +232,16 @@ export class GithubApiClient {
 
   getContentApiUrl(path: string): string {
     const clean = cleanPath(path)
-    return `https://api.github.com/repos/${this.owner}/${this.repo}/contents${clean === "/" ? "" : clean}`
+    // F-201: 路径段必须逐段百分号编码。否则文件名里的 # / ? / % 会被
+    // WHATWG URL 解析成 fragment/query 或非法转义，请求到错误对象。
+    const encoded =
+      clean === "/"
+        ? ""
+        : clean
+            .split("/")
+            .map((seg) => encodeURIComponent(seg))
+            .join("/")
+    return `https://api.github.com/repos/${encodeURIComponent(this.owner)}/${encodeURIComponent(this.repo)}/contents${encoded}`
   }
 
   async getContents(path: string, ref?: string): Promise<GithubObject> {
@@ -218,6 +265,13 @@ export class GithubApiClient {
     return res.commit.sha
   }
 
+  /** 仓库分支列表；空仓库返回 []（F-204：区分「空仓库」与「ref 不存在」） */
+  async listBranches(): Promise<{ name: string }[]> {
+    return this.request<{ name: string }[]>(
+      `https://api.github.com/repos/${this.owner}/${this.repo}/branches?per_page=1`,
+    )
+  }
+
   async getAuthenticatedUser(): Promise<GithubUserResp> {
     return this.request<GithubUserResp>("https://api.github.com/user")
   }
@@ -225,6 +279,28 @@ export class GithubApiClient {
   async getTree(sha: string): Promise<GithubTreeResp> {
     return this.request<GithubTreeResp>(
       `https://api.github.com/repos/${this.owner}/${this.repo}/git/trees/${sha}`,
+    )
+  }
+
+  /**
+   * 取 blob 原始字节流（F-203：私有仓库没有 download_url 时的服务端回退）。
+   * 使用 `application/vnd.github.raw` 媒体类型，Authorization 由 this.headers 携带。
+   * 传入 range 时转发 Range 头；上游返回 200（忽略 Range）时由调用方裁剪。
+   */
+  async getBlobRaw(
+    sha: string,
+    range?: { start: number; end: number },
+  ): Promise<Response> {
+    const headers: Record<string, string> = {
+      ...this.headers,
+      Accept: "application/vnd.github.raw",
+    }
+    if (range) {
+      headers.Range = `bytes=${range.start}-${range.end}`
+    }
+    return fetch(
+      `https://api.github.com/repos/${this.owner}/${this.repo}/git/blobs/${encodeURIComponent(sha)}`,
+      { headers },
     )
   }
 
@@ -284,14 +360,17 @@ export class GithubApiClient {
   async createCommit(
     message: string,
     treeSha: string,
-    parentCommitSha: string,
+    parentCommitSha: string | null,
     committer?: { name: string; email: string },
     author?: { name: string; email: string },
   ): Promise<string> {
     const body: Record<string, any> = {
       message,
       tree: treeSha,
-      parents: [parentCommitSha],
+    }
+    // F-204：空仓库的首次提交没有 parent
+    if (parentCommitSha) {
+      body.parents = [parentCommitSha]
     }
     if (committer?.name) {
       body.committer = {
@@ -333,6 +412,21 @@ export class GithubApiClient {
     )
   }
 
+  /** 创建分支引用（F-204：空仓库首次提交后 PATCH 不存在，必须 POST） */
+  async createRef(branch: string, commitSha: string): Promise<void> {
+    await this.request(
+      `https://api.github.com/repos/${this.owner}/${this.repo}/git/refs`,
+      {
+        method: "POST",
+        body: {
+          ref: `refs/heads/${branch}`,
+          sha: commitSha,
+        },
+        headers: { Accept: "application/vnd.github+json" },
+      },
+    )
+  }
+
   /**
    * Recursively renew parent trees from path up until `until` directory.
    */
@@ -347,13 +441,18 @@ export class GithubApiClient {
     const targetUntil = cleanPath(until)
 
     while (currentPath !== targetUntil) {
+      // 子树 sha 完全由内容决定：内容相同的兄弟目录（例如两个都只含空 .gitkeep
+      // 的目录）sha 必然相同，只能按目录名定位待替换条目，否则同 sha 的兄弟目录
+      // 会被错误替换，提交落到别的目录。名字必须在向上爬之前取。
+      const childName = basename(currentPath)
+      if (!childName) break // 已到根目录
       currentPath = dirname(currentPath)
       const { tree, dirSha } = await this.getTreeDirectly(currentPath, ref)
 
-      const targetTreeObj = tree.tree.find((t) => t.sha === prevSha)
+      const targetTreeObj = tree.tree.find((t) => t.path === childName)
       if (!targetTreeObj) {
         throw new Error(
-          `Object with sha ${prevSha} not found in ${currentPath}`,
+          `Object '${childName}' (sha ${prevSha}) not found in ${currentPath}`,
         )
       }
 

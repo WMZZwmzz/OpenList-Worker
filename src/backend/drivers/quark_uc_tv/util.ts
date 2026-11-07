@@ -38,7 +38,7 @@ const CONFS: Record<"quark" | "uc", Conf> = {
     signKey: "kw2dvtd7p4t3pjl2d9ed9yc8yej8kw2d",
     appVer: "1.8.2.2",
     channel: "GENERAL",
-    codeApi: "http://api.extscreen.com/quarkdrive",
+    codeApi: "https://api.extscreen.com/quarkdrive",
   },
   uc: {
     api: "https://open-api-drive.uc.cn",
@@ -46,7 +46,7 @@ const CONFS: Record<"quark" | "uc", Conf> = {
     signKey: "l3srvtd7p42l0d0x1u8d7yc8ye9kki4d",
     appVer: "1.7.2.2",
     channel: "UCTVOFFICIALWEB",
-    codeApi: "http://api.extscreen.com/ucdrive",
+    codeApi: "https://api.extscreen.com/ucdrive",
   },
 }
 
@@ -106,6 +106,7 @@ export class ClientQuarkUcTv {
     pathname: string,
     method: string,
     extraQuery: Record<string, string> = {},
+    retried = false,
   ): Promise<T> {
     const { tm, token, reqId } = await this.generateSign(method, pathname)
     const qs = new URLSearchParams({
@@ -135,8 +136,14 @@ export class ClientQuarkUcTv {
       errInfo.includes("token无效") ||
       errInfo.includes("token 无效")
     if (tokenInvalid) {
+      // F-429：刷新后只重试一次；新令牌仍被拒时直接抛错，避免无界递归。
+      if (retried) {
+        throw new Error(
+          `[QuarkTV] ${data.error_info || "token refresh did not help"}`,
+        )
+      }
       await this.refreshToken()
-      return this.request<T>(pathname, method, extraQuery)
+      return this.request<T>(pathname, method, extraQuery, true)
     }
     if (data.status >= 400 || data.errno !== 0) {
       throw new Error(`[QuarkTV] ${data.error_info || `errno ${data.errno}`}`)

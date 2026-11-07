@@ -6,6 +6,14 @@ import {
 import { DriverKodboxAddition } from "./types"
 import { ClientKodbox } from "./util"
 
+/** 物理路径的父目录（根为 "/"），F-467 */
+export function parentPath(physicalPath: string): string {
+  const parts = String(physicalPath || "")
+    .split("/")
+    .filter(Boolean)
+  return parts.length > 1 ? "/" + parts.slice(0, -1).join("/") : "/"
+}
+
 export class DriverKodbox implements StorageDriver {
   private client: ClientKodbox
   private addition: DriverKodboxAddition
@@ -123,15 +131,17 @@ export class DriverKodbox implements StorageDriver {
 
   async move(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
+    // F-467：dstDir 是含挂载前缀的虚拟路径，fullPath() 再拼 root_path 后会指向
+    // 不存在的远端目录；目标父目录必须取自物理路径 dstPhysical。
     const srcFull = this.fullPath(srcPhysical)
     const srcParts = srcFull.split("/").filter(Boolean)
     const srcName = srcParts[srcParts.length - 1]
-    const dstFull = this.fullPath(dstDir)
+    const dstFull = this.fullPath(parentPath(dstPhysical))
     const targets = names.length ? names : [srcName]
     for (const n of targets) {
       const src = srcParts.length > 1 ? `/${srcParts.slice(0, -1).join("/")}/${n}` : `/${n}`
@@ -141,15 +151,16 @@ export class DriverKodbox implements StorageDriver {
 
   async copy(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
+    // F-467：同 move，目标父目录取物理路径。
     const srcFull = this.fullPath(srcPhysical)
     const srcParts = srcFull.split("/").filter(Boolean)
     const srcName = srcParts[srcParts.length - 1]
-    const dstFull = this.fullPath(dstDir)
+    const dstFull = this.fullPath(parentPath(dstPhysical))
     const targets = names.length ? names : [srcName]
     for (const n of targets) {
       const src = srcParts.length > 1 ? `/${srcParts.slice(0, -1).join("/")}/${n}` : `/${n}`

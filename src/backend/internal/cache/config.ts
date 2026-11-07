@@ -103,6 +103,37 @@ function readRaw(key: string, env?: any): string {
   return ""
 }
 
+/**
+ * 读取环境变量并区分「未设置」与「已设置但为空值」（F-106）。
+ *
+ * `readRaw` 把空字符串当作未设置（对大多数变量是正确的——空值应当回退默认），
+ * 但 `CACHE_EXCLUDE_DRIVERS` 在文档里明确承诺「传空字符串表示不排除任何驱动」。
+ * 用这个函数判断 `key in env` / hasOwnProperty，才能把「显式置空」与「没配」
+ * 分开。
+ */
+function readRawExplicit(
+  key: string,
+  env?: any,
+): { present: boolean; value: string } {
+  const e = env && typeof env === "object" ? env : {}
+  if (Object.prototype.hasOwnProperty.call(e, key)) {
+    const raw = e[key]
+    if (raw !== undefined && raw !== null) {
+      return { present: true, value: String(raw) }
+    }
+  }
+  if (typeof process !== "undefined" && process.env) {
+    const pe = process.env as any
+    if (Object.prototype.hasOwnProperty.call(pe, key)) {
+      const raw = pe[key]
+      if (raw !== undefined && raw !== null) {
+        return { present: true, value: String(raw) }
+      }
+    }
+  }
+  return { present: false, value: "" }
+}
+
 /** 解析布尔型环境变量（无法识别时回退默认值）。 */
 function readBool(key: string, fallback: boolean, env?: any): boolean {
   const raw = readRaw(key, env).trim().toLowerCase()
@@ -166,10 +197,28 @@ export function parseCacheBackends(raw: string): CacheBackendName[] {
   return out.length > 0 ? out : ["db"]
 }
 
-/** 解析 `CACHE_EXCLUDE_DRIVERS`（默认排除纯本地计算型驱动）。 */
-export function parseExcludeDrivers(raw: string): Set<string> {
+/**
+ * 解析 `CACHE_EXCLUDE_DRIVERS`（默认排除纯本地计算型驱动）。
+ *
+ * F-106：文档承诺「传空字符串表示不排除任何驱动」，但旧实现把空串当成未设置，
+ * 于是同一取值得到的是**默认排除清单**（virtual/alias/url_tree/strm/chunk）。
+ * `explicitEmpty` 为真时表示调用方明确设置过该变量（值可为空），此时空值按
+ * 文档语义返回空集。
+ */
+export function parseExcludeDrivers(
+  raw: string,
+  opts: { explicit?: boolean } = {},
+): Set<string> {
   const source = String(raw || "").trim()
-  const tokens = (source === "" ? DEFAULT_EXCLUDE_DRIVERS : source.split(","))
+  if (source === "") {
+    // 显式置空 → 不排除任何驱动；未设置 → 默认清单（同样要归一化：
+    // url_tree → urltree，与调用方的 driver 名比较规则一致）
+    return opts.explicit
+      ? new Set<string>()
+      : new Set(DEFAULT_EXCLUDE_DRIVERS.map(normalizeDriverName).filter(Boolean))
+  }
+  const tokens = source
+    .split(",")
     .map((s) => normalizeDriverName(s))
     .filter(Boolean)
   return new Set(tokens)
@@ -227,6 +276,8 @@ export function getCacheConfig(env?: any): CacheConfig {
   const backends = parseCacheBackends(readRaw("CACHE_DRIVER", env))
   const enabledRaw = readBool("CACHE_ENABLED", true, env)
   const prefix = parseCachePrefix(readRaw("CACHE_PREFIX", env))
+  // F-106：区分「CACHE_EXCLUDE_DRIVERS 显式设为空串」与「未设置」
+  const excludeRaw = readRawExplicit("CACHE_EXCLUDE_DRIVERS", env)
 
   const config: CacheConfig = {
     enabled: enabledRaw && backends.length > 0,
@@ -237,7 +288,9 @@ export function getCacheConfig(env?: any): CacheConfig {
     downloadLink: readBool("CACHE_DOWNLOAD_LINK", false, env),
     ttlMinutes: readInt("CACHE_TTL", 0, env),
     linkTtlMinutes: readInt("CACHE_LINK_TTL", DEFAULT_LINK_TTL_MINUTES, env),
-    excludeDrivers: parseExcludeDrivers(readRaw("CACHE_EXCLUDE_DRIVERS", env)),
+    excludeDrivers: parseExcludeDrivers(excludeRaw.value, {
+      explicit: excludeRaw.present,
+    }),
     prefix,
   }
 

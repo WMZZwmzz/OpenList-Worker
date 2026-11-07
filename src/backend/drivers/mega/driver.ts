@@ -85,15 +85,8 @@ export class MegaDriver implements StorageDriver {
       throw new Error(`Node not found: ${clean}`)
     }
 
-    let rawUrl = ""
-    if (!node.is_dir) {
-      try {
-        rawUrl = await this.client.getDownloadLink(node.id)
-      } catch (e) {
-        console.warn("[Mega] failed to get download link in get():", e)
-      }
-    }
-
+    // Mega 存储端点返回的是 AES 密文；不能把该 URL 作为 raw_url 返回，
+    // 下载统一走 createReadStream 做客户端解密（raw.ts 会优先使用它）。
     return {
       name: node.name,
       size: node.size,
@@ -101,22 +94,35 @@ export class MegaDriver implements StorageDriver {
       modified: node.modified,
       sign: node.id,
       type: calcFileType(node.name, node.is_dir),
-      raw_url: rawUrl,
+      raw_url: "",
     }
+  }
+
+  /**
+   * 服务端解密流：fetch Mega 的密文下载地址后按块 AES-CTR 解密并校验 MAC。
+   * Mega 没有可用的明文直链（零知识加密），因此 raw_url 恒为空。
+   */
+  async createReadStream(
+    physicalPath: string,
+    options?: { start?: number; end?: number },
+  ): Promise<ReadableStream<Uint8Array>> {
+    const node = this.resolveNodeByPath(this.cleanPath(physicalPath))
+    if (!node) {
+      throw new Error(`Node not found: ${physicalPath}`)
+    }
+    if (node.is_dir) throw new Error("Mega: cannot stream a directory")
+    return this.client.createReadStream(node.id, options)
   }
 
   async link(
     virtualPath: string,
     physicalPath: string,
   ): Promise<{ url: string; headers?: Record<string, string> }> {
-    const clean = this.cleanPath(physicalPath)
-    const node = this.resolveNodeByPath(clean)
-    if (!node || node.is_dir) {
-      throw new Error(`Cannot get link for non-file: ${clean}`)
-    }
-
-    const url = await this.client.getDownloadLink(node.id)
-    return { url }
+    // Mega 的下载 URL 只提供密文，无法给出浏览器可用的直链（Go 版本同样
+    // 标记 NoLinkURL 并强制走代理）。显式报错优于返回不可读的密文链接。
+    throw new Error(
+      "Mega driver: direct links are not supported (downloads are decrypted by the proxy)",
+    )
   }
 
   async mkdir(virtualPath: string, physicalPath: string): Promise<void> {
@@ -195,7 +201,8 @@ export class MegaDriver implements StorageDriver {
       // 找不到节点必须报错：静默返回会让调用方以为删除成功，而文件仍在
       throw new Error(`Mega driver: node not found for ${physicalPath}`)
     }
-    await this.client.deleteNode(node.id)
+    // move_to_trash 默认 true（对齐表单默认值）；false 时永久删除。
+    await this.client.deleteNode(node.id, this.addition.move_to_trash !== false)
   }
 
   async put(

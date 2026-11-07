@@ -1,3 +1,4 @@
+import { randomAlnum } from "../rand"
 import {
   PikPakShareAddition,
   PikPakShareFileItem,
@@ -15,7 +16,8 @@ export class PikPakShareApiClient {
   }
 
   private generateDeviceId(): string {
-    return "web_" + Math.random().toString(36).substring(2, 15)
+    // S-04 同类清单：设备标识改用 CSPRNG（原 Math.random）。
+    return "web_" + randomAlnum(13, "abcdefghijklmnopqrstuvwxyz0123456789")
   }
 
   async init(): Promise<void> {

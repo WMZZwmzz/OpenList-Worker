@@ -1,4 +1,5 @@
 import CryptoJS from "crypto-js"
+import { randomInt } from "../rand"
 import { DefaultClientSecret, ChannelAPIUser } from "./consts"
 
 const DEFAULT_IV = "wNSOYIB1k1DjY5lA"
@@ -24,10 +25,13 @@ export class WoPanCrypto {
   }
 
   setAccessToken(token: string): void {
+    // F-216：AES 密钥必须为 16 字节。短于 16 字符的 token 会被 CryptoJS
+    // 接受但产出服务器无法解密的密文，因此这里直接拒绝（置空），
+    // 由 initData 走 refresh_token 刷新。
     if (token && token.length >= 16) {
       this.accessKey = token.slice(0, 16)
-    } else if (token) {
-      this.accessKey = token
+    } else {
+      this.accessKey = ""
     }
   }
 
@@ -79,7 +83,8 @@ export class WoPanCrypto {
 
   calHeader(channel: string, key: string): HeaderResult {
     const resTime = Date.now()
-    const reqSeq = Math.floor(Math.random() * 8999) + 100000
+    // S-04 同类清单：签名序列号改用 CSPRNG（原 Math.random）。
+    const reqSeq = 100000 + randomInt(8999)
     const version = ""
     const sign = CryptoJS.MD5(
       `${key}${resTime}${reqSeq}${channel}${version}`,

@@ -159,3 +159,59 @@ test("无状态环境下 put 直接报错", async () => {
   const driver = new DriverCnbReleases(ADDITION)
   await assert.rejects(() => driver.put(), /asset upload not supported/)
 })
+
+test("F-406: get() 对不存在的 release/asset 抛 not found 而不是伪造条目", async () => {
+  const { restore } = installFetch()
+  try {
+    const driver = new DriverCnbReleases(ADDITION)
+    await assert.rejects(
+      () => driver.get("", "/no-such-release"),
+      /release not found/,
+    )
+    await assert.rejects(
+      () => driver.get("", "/v1.0.0/no-such-asset.zip"),
+      /asset not found/,
+    )
+  } finally {
+    restore()
+  }
+})
+
+test("F-406: findRelease 不再吞掉 API 错误（500 向上传播）", async () => {
+  const original = globalThis.fetch
+  globalThis.fetch = (async () =>
+    new Response("boom", { status: 500 })) as typeof fetch
+  try {
+    const driver = new DriverCnbReleases(ADDITION)
+    await assert.rejects(() => driver.get("", "/v1.0.0"), /500/)
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test("F-407: assets 为 null/缺省时 list/get 不抛 TypeError", async () => {
+  const original = globalThis.fetch
+  globalThis.fetch = (async (input: any) => {
+    const url = String(input)
+    if (url.endsWith("/org/repo/-/releases")) {
+      return new Response(
+        JSON.stringify([{ ...RELEASE, assets: null }, { ...RELEASE, id: "rel-2", name: "v2.0.0", tag_name: "v2.0.0", assets: undefined }]),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )
+    }
+    return new Response("", { status: 404 })
+  }) as typeof fetch
+  try {
+    const driver = new DriverCnbReleases(ADDITION)
+    const items = await driver.list("", "/")
+    assert.equal(items.length, 2)
+    assert.equal(items[0].size, 0)
+    const dir = await driver.get("", "/v1.0.0")
+    assert.equal(dir.is_dir, true)
+    assert.equal(dir.size, 0)
+    const children = await driver.list("/v1.0.0", "/v1.0.0")
+    assert.deepEqual(children, [])
+  } finally {
+    globalThis.fetch = original
+  }
+})

@@ -168,6 +168,12 @@ export interface StorageRequestContext {
    * write_users 白名单；内部调用（管理员任务、迁移、驱动自调）不传即保持原语义。
    */
   user?: UserPermissionObj | null
+  /**
+   * F-405 残留收尾：客户端 IP（来自 pkg/client-ip，可能为 "unknown"）。
+   * 驱动可选用它参与 CDN 防盗链签名（如 bunny_storage 的
+   * cdn_token_include_ip）；不传或 "unknown" 时驱动保持无 IP 签名行为。
+   */
+  clientIp?: string
 }
 
 /**
@@ -270,9 +276,14 @@ export async function getOrCreateDriver(
   cache.set(key, pending)
   try {
     return await pending
-  } catch (error) {
+  } finally {
+    // F-093：initCache 只承担「同一 key 的并发初始化去重」；pending settle 后
+    // 无论成功失败都移除，避免 storage.modified 变化产生的旧 key（管理员每次
+    // 保存存储都会产生一个）在长生命周期进程里无限累积。成功结果已由
+    // setDriverCache 写入 driverCache，保留 resolved Promise 还会让被 M-8
+    // 上限淘汰的驱动实例无法回收、也不会重新进 driverCache。
+    // 在途调用方在 set 之前已拿到同一个 pending，去重语义不受影响。
     if (cache.get(key) === pending) cache.delete(key)
-    throw error
   }
 }
 
@@ -284,1061 +295,909 @@ function parseAddition(storageConfig?: any): any {
     : additionStr
 }
 
-async function createDriver(
+function normalizeDriverName(driverName: string): string {
+  return (driverName || "").toLowerCase().replace(/[^a-z0-9]/g, "")
+}
+
+/**
+ * 驱动刷新凭据后的回写。
+ *
+ * F-090/F-271 重构：旧 createDriver 的每个 else-if 分支都内联一份
+ * getDb → 查存储 → 合并 addition → saveDb，这里抽成一处。行为保持不变：
+ * 找不到存储记录或持久化失败时只告警，不影响正在进行的请求。
+ */
+async function persistStorageAddition(
+  storageConfig: any,
+  logLabel: string,
+  mutate: (addition: any) => void,
+  options: {
+    /** 日志里的凭据种类，如 "token" / "refresh_token" / "cookie" */
+    what?: string
+    /** 同步更新 admin 更新流程正在使用的 storageConfig.addition */
+    syncInFlight?: boolean
+    /** onedrive/139：admin 更新路径自己会保存，此处跳过 saveDb */
+    respectDeferral?: boolean
+    /** 写库前对 addition 做规范化（baidu / wopan / weiyun） */
+    serialize?: (addition: any) => any
+  } = {},
+): Promise<void> {
+  try {
+    const db = await getDb()
+    const st = (db.storages || []).find((s: any) => s.id === storageConfig?.id)
+    if (!st) return
+    const stAddition =
+      typeof st.addition === "string"
+        ? JSON.parse(st.addition || "{}")
+        : st.addition || {}
+    mutate(stAddition)
+    st.addition = JSON.stringify(
+      options.serialize ? options.serialize(stAddition) : stAddition,
+    )
+    if (options.syncInFlight) storageConfig.addition = st.addition
+    if (options.respectDeferral && deferredTokenPersistence.has(storageConfig)) {
+      return
+    }
+    await saveDb(db)
+  } catch (e) {
+    console.warn(
+      `[${logLabel}] failed to persist ${options.what || "credentials"}:`,
+      e,
+    )
+  }
+}
+
+/** 构造驱动；init 由 createDriver 统一调用（autoInit=false 的条目除外）。 */
+type DriverFactory = (
+  addition: any,
+  storageConfig: any,
+) => StorageDriver | Promise<StorageDriver>
+
+export interface DriverRegistration {
+  /**
+   * 归一化（小写、仅 a-z0-9）后的可接受名称，第一个为规范名。
+   *
+   * 只允许精确匹配：不得再引入 startsWith/includes 之类的模糊分支。旧
+   * createDriver 的模糊匹配造成过两次 P1 路由事故：
+   *   - A5-1/F-271：`startsWith("115")` 抢走 "115open"/"115_share"，导致
+   *     Pan115Driver 对自己的主名永远不可达；
+   *   - F-090：`startsWith("onedrive")` / `startsWith("123")` 等把五个分享
+   *     驱动分支吞成个人版驱动。
+   */
+  names: readonly string[]
+  create: DriverFactory
+  /**
+   * create 之后是否调用 driver.init()，默认 true。
+   * local/sftp/ftp 的 helper 内部已经完成初始化，故置 false，避免二次 init。
+   */
+  autoInit?: boolean
+  /** init 抛错时打印的错误日志前缀（保留旧 onedrive 系的 console.error）。 */
+  initErrorLog?: string
+}
+
+/**
+ * 显式驱动注册表：规范名 + 精确别名 → 驱动构造器。
+ *
+ * 别名来源：旧 createDriver if-chain 中所有 `normDriver === "..."` 精确分支
+ * （即当时真正生效的名字），以及 admin driverConfigs 暴露的模板名。
+ * 旧的 startsWith/includes 模糊匹配全部删除；仅保留少数有明确含义的兼容
+ * 别名（如 "gdrive"、"xunlei"、"dubox"），并在条目注释中说明。
+ *
+ * 分享驱动（F-090）作为独立条目注册，与个人版驱动互不遮蔽：
+ *   115Share / 123PanShare / AliyundriveShare / OnedriveSharelink / PikPakShare
+ */
+const DRIVER_REGISTRY: readonly DriverRegistration[] = [
+  // ---------- 本地 / 传统协议 ----------
+  {
+    // 本地磁盘：仅 Node 容器可用（Cloudflare Workers 无 fs）。按 root 分实例缓存。
+    names: ["local"],
+    create: (addition) => {
+      if (typeof process === "undefined" || process.release?.name !== "node") {
+        throw new Error(
+          "Local storage driver requires Node.js runtime (not available in Cloudflare Workers)",
+        )
+      }
+      // S-08（深度安全审查报告）：root_folder_path 为空时物理根退化为文件系统
+      // 根——`GET /d/etc/passwd` 可读任意主机文件、有写权限的用户可写任意文件。
+      // 对齐 Go 版 `required:"true"`：空根一律拒绝挂载，管理员必须显式指定目录。
+      const localRoot =
+        typeof addition?.root_folder_path === "string"
+          ? addition.root_folder_path.trim()
+          : ""
+      if (!localRoot || localRoot === "/" || localRoot === "\\") {
+        throw new Error(
+          'Local storage requires a non-empty root_folder_path (mounting the filesystem root is rejected)',
+        )
+      }
+      return getLocalDriver(localRoot)
+    },
+    autoInit: false,
+  },
+  {
+    // SFTP：仅 Node 运行时可用；getSFTPDriver 内已 await init。
+    names: ["sftp"],
+    create: (_addition, storageConfig) => getSFTPDriver(storageConfig),
+    autoInit: false,
+  },
+  {
+    // FTP：仅 Node 运行时可用；getFTPDriver 内已 await init。
+    names: ["ftp"],
+    create: (_addition, storageConfig) => getFTPDriver(storageConfig),
+    autoInit: false,
+  },
+
+  // ---------- OneDrive ----------
+  {
+    // OneDrive 个人版（Graph API）。别名：onedrive / onedrive_sb /
+    // onedrive_business / onedrive_sharepoint。
+    names: ["onedrive", "onedrivesb", "onedrivebusiness", "onedrivesharepoint"],
+    create: (addition, storageConfig) =>
+      new Onedrive(addition, async (refreshToken: string) => {
+        await persistStorageAddition(
+          storageConfig,
+          "Onedrive",
+          (stAddition) => {
+            stAddition.refresh_token = refreshToken
+          },
+          {
+            what: "refresh token",
+            syncInFlight: true,
+            respectDeferral: true,
+          },
+        )
+      }),
+    initErrorLog: "onedrive init failed:",
+  },
+  {
+    // OneDrive APP（独立应用授权）。
+    names: ["onedriveapp"],
+    create: (addition) => new OnedriveAPP(addition),
+    initErrorLog: "onedrive_app init failed:",
+  },
+
+  // ---------- 阿里云盘 ----------
+  {
+    // 阿里云盘 OAuth2 Open API。别名为旧精确分支保留；
+    // "aliyundriveshare" 已移交给 AliyundriveShareDriver（F-090）。
+    names: [
+      "aliyundriveopen",
+      "aliyundrive",
+      "aliyun",
+      "aliyundriveshare2open",
+      "aliyundriveoauth2",
+    ],
+    // F-345：注册刷新令牌持久化回调（与 OneDrive 同一模式）。阿里盘 Open API
+    // 的 refresh_token 是**一次性轮换**的——不回写的话，令牌在实例 A 刷新后，
+    // 实例 B 的旧 refresh_token 立即失效，表现为多实例部署间歇性 401。
+    create: (addition, storageConfig) =>
+      new AliyundriveOpen(addition, async (refreshToken: string) => {
+        await persistStorageAddition(
+          storageConfig,
+          "AliyundriveOpen",
+          (stAddition) => {
+            stAddition.refresh_token = refreshToken
+          },
+          {
+            what: "refresh token",
+            syncInFlight: true,
+            respectDeferral: true,
+          },
+        )
+      }),
+  },
+
+  // ---------- Google ----------
+  {
+    // Google Photos。
+    names: ["googlephoto", "googlephotos", "gphoto"],
+    create: (addition) => new DriverGooglePhoto(addition),
+  },
+  {
+    // Google Drive。别名：google_drive / gdrive / google。
+    names: ["googledrive", "gdrive", "google"],
+    create: (addition) => new GoogleDrive(addition),
+  },
+
+  // ---------- 夸克 ----------
+  {
+    // 夸克网盘（Cookie）。别名：quark_uc / uc / quark_cookie。
+    names: ["quark", "quarkuc", "uc", "quarkcookie"],
+    create: (addition) => new QuarkDriver(addition),
+  },
+  {
+    // 夸克开放平台。别名：quark_open / quark_oa。
+    names: ["quarkopen", "quarkoa"],
+    create: (addition) => new DriverQuarkOpen(addition),
+  },
+  {
+    // 夸克 UC TV。别名：quark_uc_tv / quark_tv / uctv。
+    names: ["quarkuctv", "quarktv", "uctv"],
+    create: (addition) => new DriverQuarkUcTv(addition),
+  },
+
+  // ---------- 115 ----------
+  {
+    // 115 网盘 legacy 驱动（drivers/115）。
+    // 别名 115_cloud / 115_netdisk 是旧精确分支就有的兼容名。
+    // 注意："115open" 不在此处，它属于 Pan115Driver（F-271/A5-1）。
+    names: ["115", "115cloud", "115netdisk"],
+    create: (addition) => new Driver115(addition),
+  },
+  {
+    // 115 网盘 Open API 驱动（drivers/115open）。别名：115_open / 115pan。
+    names: ["115open", "115pan"],
+    create: (addition, storageConfig) =>
+      new Pan115Driver(addition, async (tokens) => {
+        await persistStorageAddition(
+          storageConfig,
+          "115open",
+          (stAddition) => {
+            stAddition.access_token = tokens.access_token
+            stAddition.refresh_token = tokens.refresh_token
+          },
+          { what: "token" },
+        )
+      }),
+  },
+
+  // ---------- Cloudreve / OpenList ----------
+  {
+    // Cloudreve V3。
+    names: ["cloudrevev3", "cloudreve"],
+    create: (addition, storageConfig) =>
+      new DriverCloudreveV3(addition, async (cookie: string) => {
+        await persistStorageAddition(
+          storageConfig,
+          "cloudreve",
+          (stAddition) => {
+            stAddition.cookie = cookie
+          },
+          { what: "cookie" },
+        )
+      }),
+  },
+  {
+    // Cloudreve V4。
+    names: ["cloudrevev4"],
+    create: (addition) => new DriverCloudreve(addition),
+  },
+  {
+    // OpenList 分享挂载。别名：openlist_share。
+    names: ["openlistshare"],
+    create: (addition) => new DriverOpenlistShare(addition),
+  },
+  {
+    // OpenList 实例。
+    names: ["openlist"],
+    create: (addition) => new DriverOpenlist(addition),
+  },
+
+  // ---------- 其他网盘 ----------
+  {
+    names: ["teldrive"],
+    create: (addition) => new DriverTeldrive(addition),
+  },
+  {
+    names: ["mediafire"],
+    create: (addition) => new DriverMediafire(addition),
+  },
+  {
+    names: ["githubreleases"],
+    create: (addition) => new DriverGithubReleases(addition),
+  },
+  {
+    names: ["cnbreleases"],
+    create: (addition) => new DriverCnbReleases(addition),
+  },
+  {
+    // Kodbox。别名 "kodo" 历史上先于 S3 分支匹配，行为保持不变
+    // （因此 S3 条目不再注册 "kodo"，避免注册表重复名）。
+    names: ["kodbox", "kodo"],
+    create: (addition) => new DriverKodbox(addition),
+  },
+  {
+    // IPFS。别名：ipfs_api。
+    names: ["ipfs", "ipfsapi"],
+    create: (addition) => new DriverIpfs(addition),
+  },
+  {
+    // 联想 NAS 分享。别名：lenovonas_share。
+    names: ["lenovonasshare"],
+    create: (addition) => new DriverLenovoNasShare(addition),
+  },
+  {
+    names: ["misskey"],
+    create: (addition) => new DriverMisskey(addition),
+  },
+  {
+    // 豆包。别名：doubao_new / doubao_share。
+    names: ["doubao", "doubaonew", "doubaoshare"],
+    create: (addition) => new DriverDoubao(addition),
+  },
+  {
+    names: ["123open", "123cloudopen"],
+    create: (addition) => new Driver123Open(addition),
+  },
+  {
+    // Teambition。别名 "tb"。
+    names: ["teambition", "tb"],
+    create: (addition) => new DriverTeambition(addition),
+  },
+  {
+    // 网易云音乐。别名：netease / netease_cloud_music / netease_music。
+    names: ["neteasemusic", "netease", "neteasecloudmusic"],
+    create: (addition) => new DriverNeteaseMusic(addition),
+  },
+  {
+    // 海拉云盘。别名：halalcloud_open / halalcloud_open_api。
+    names: ["halalcloudopen", "halalcloudopenapi"],
+    create: (addition, storageConfig) =>
+      new DriverHalalCloudOpen(addition, async (refreshToken: string) => {
+        await persistStorageAddition(
+          storageConfig,
+          "HalalCloud",
+          (stAddition) => {
+            stAddition.refresh_token = refreshToken
+          },
+          { what: "refresh_token" },
+        )
+      }),
+  },
+  {
+    names: ["degoo"],
+    create: (addition, storageConfig) =>
+      new DriverDegoo(addition, async (tokens) => {
+        await persistStorageAddition(
+          storageConfig,
+          "degoo",
+          (stAddition) => {
+            if (tokens.accessToken) stAddition.access_token = tokens.accessToken
+            if (tokens.refreshToken)
+              stAddition.refresh_token = tokens.refreshToken
+          },
+          { what: "tokens" },
+        )
+      }),
+  },
+  {
+    // FebBox。别名 "febboxpan"。
+    names: ["febbox", "febboxpan"],
+    create: (addition, storageConfig) =>
+      new DriverFebBox(addition, async (refreshToken: string) => {
+        await persistStorageAddition(
+          storageConfig,
+          "febbox",
+          (stAddition) => {
+            stAddition.refresh_token = refreshToken
+          },
+          { what: "refresh_token" },
+        )
+      }),
+  },
+  {
+    // 超星。别名：chaoxing_group_drive / chaoxing_group。
+    names: ["chaoxing", "chaoxinggroupdrive", "chaoxinggroup"],
+    create: (addition, storageConfig) =>
+      new DriverChaoXing(addition, async (cookie: string) => {
+        await persistStorageAddition(
+          storageConfig,
+          "chaoxing",
+          (stAddition) => {
+            stAddition.cookie = cookie
+          },
+          { what: "cookie" },
+        )
+      }),
+  },
+  {
+    // 123 云盘（个人版）。别名 "123"。
+    // "123PanShare"/"123panshare" 已移交给 Pan123ShareDriver（F-090），
+    // 不再使用 startsWith("123") 模糊匹配。
+    names: ["123pan", "123"],
+    create: (addition, storageConfig) =>
+      new Pan123Driver(addition, async (token: string) => {
+        // 回写刷新后的 access_token，冷启动可跳过密码登录
+        // （避免海外 IP 触发 123 风控）。
+        await persistStorageAddition(
+          storageConfig,
+          "123Pan",
+          (stAddition) => {
+            stAddition.access_token = token
+          },
+          { what: "access_token" },
+        )
+      }),
+  },
+  {
+    // 百度网盘相册。
+    names: ["baiduphoto", "baiduphotos"],
+    create: (addition) => new DriverBaiduPhoto(addition),
+  },
+  {
+    // 百度网盘。别名：baidu / baidu_yun / baidu_share。
+    names: ["baidunetdisk", "baidu", "baiduyun", "baidushare"],
+    create: (addition, storageConfig) =>
+      new BaiduDriver(addition, async (tokens) => {
+        await persistStorageAddition(
+          storageConfig,
+          "baidu_netdisk",
+          (stAddition) => {
+            stAddition.access_token = tokens.access_token
+            stAddition.refresh_token = tokens.refresh_token
+          },
+          { what: "token", serialize: normalizeBaiduAddition },
+        )
+      }),
+  },
+  {
+    // GitHub API。
+    names: ["github", "githubapi"],
+    create: (addition) => new GithubDriver(addition),
+  },
+  {
+    // 迅雷（专家版）。别名：thunder_browser_expert / thunder_x_expert。
+    names: ["thunderexpert", "thunderbrowserexpert", "thunderxexpert"],
+    create: (addition, storageConfig) =>
+      new ThunderExpertDriver(addition, async (tokens) => {
+        if (tokens.device_id) addition.device_id = tokens.device_id
+        if (tokens.refresh_token) addition.refresh_token = tokens.refresh_token
+        if (tokens.captcha_token) addition.captcha_token = tokens.captcha_token
+        storageConfig.addition = JSON.stringify(addition)
+        await persistStorageAddition(
+          storageConfig,
+          "thunderexpert",
+          (stAddition) => {
+            if (tokens.refresh_token)
+              stAddition.refresh_token = tokens.refresh_token
+            if (tokens.captcha_token)
+              stAddition.captcha_token = tokens.captcha_token
+            if (tokens.device_id) stAddition.device_id = tokens.device_id
+          },
+          { what: "token" },
+        )
+      }),
+  },
+  {
+    // 迅雷。别名：xunlei / thunder_browser / thunder_x。
+    names: ["thunder", "xunlei", "thunderbrowser", "thunderx"],
+    create: (addition, storageConfig) =>
+      new ThunderDriver(addition, async (tokens) => {
+        if (tokens.device_id) addition.device_id = tokens.device_id
+        if (tokens.refresh_token) addition.refresh_token = tokens.refresh_token
+        if (tokens.captcha_token) addition.captcha_token = tokens.captcha_token
+        storageConfig.addition = JSON.stringify(addition)
+        await persistStorageAddition(
+          storageConfig,
+          "thunder",
+          (stAddition) => {
+            if (tokens.refresh_token)
+              stAddition.refresh_token = tokens.refresh_token
+            if (tokens.captcha_token)
+              stAddition.captcha_token = tokens.captcha_token
+            if (tokens.device_id) stAddition.device_id = tokens.device_id
+          },
+          { what: "token" },
+        )
+      }),
+  },
+  {
+    // 蓝奏云。别名：lanzou_pan / ilanzou / lanzoui / lanzous。
+    names: ["lanzou", "lanzoupan", "ilanzou", "lanzoui", "lanzous"],
+    create: (addition, storageConfig) =>
+      new LanzouDriver(addition, async (cookie) => {
+        await persistStorageAddition(
+          storageConfig,
+          "Lanzou",
+          (stAddition) => {
+            stAddition.cookie = cookie
+          },
+          { what: "cookie" },
+        )
+      }),
+  },
+  {
+    // 城通网盘。别名：ctfile_pan / ctfile_driver / 400gb。
+    names: ["ctfile", "ctfilepan", "ctfiledriver", "400gb"],
+    create: (addition) => new CtFileDriver(addition),
+  },
+  {
+    // 天翼云盘（TV 版）。别名：cloud189_tv / 189_tv_cloud。
+    names: ["189tv", "cloud189tv", "189tvcloud"],
+    create: (addition, storageConfig) =>
+      new Driver189TV(addition, async (accessToken: string) => {
+        await persistStorageAddition(
+          storageConfig,
+          "189TV",
+          (stAddition) => {
+            stAddition.access_token = accessToken
+          },
+          { what: "access_token" },
+        )
+      }),
+  },
+  {
+    // 天翼云盘。别名：189_cloud / cloud189 / ctyun / 189_pan /
+    // 189_cloud_pc / 189_cloud_app。
+    names: [
+      "189",
+      "189cloud",
+      "cloud189",
+      "ctyun",
+      "189pan",
+      "189cloudpc",
+      "189cloudapp",
+    ],
+    create: (addition) => new Cloud189Driver(addition),
+  },
+  {
+    // WebDAV。别名 "webdav_driver"。
+    names: ["webdav", "webdavdriver"],
+    create: (addition) => new WebdavDriver(addition),
+  },
+  {
+    // Cloudflare R2。别名：cloudflare_r2 / cfr2 / r2_native。
+    names: ["r2", "cloudflarer2", "cfr2", "r2native"],
+    create: (addition) => new R2Driver(addition),
+  },
+  {
+    // S3 兼容家族（r2 已由上一独立条目接管）。
+    names: ["s3", "doge", "dogecloud", "minio", "ceph", "aws", "b2", "cos", "oss"],
+    create: (addition, storageConfig) =>
+      new S3Driver(addition, storageConfig.driver || "S3"),
+  },
+  {
+    // 联通云盘。别名：unicom / unicom_cloud / woyun / china_unicom。
+    names: ["wopan", "unicom", "unicomcloud", "woyun", "chinaunicom"],
+    create: (addition, storageConfig) =>
+      new WoPanDriver(addition, async (accessToken, refreshToken) => {
+        await persistStorageAddition(
+          storageConfig,
+          "WoPan",
+          (stAddition) => {
+            stAddition.access_token = accessToken
+            stAddition.refresh_token = refreshToken
+          },
+          { what: "tokens", serialize: normalizeWoPanAddition },
+        )
+      }),
+  },
+  {
+    // 腾讯微云。别名：tencent_weiyun / tx_weiyun。
+    names: ["weiyun", "tencentweiyun", "txweiyun"],
+    create: (addition, storageConfig) =>
+      new WeiyunDriver(addition, async (cookie) => {
+        await persistStorageAddition(
+          storageConfig,
+          "WeiYun",
+          (stAddition) => {
+            stAddition.cookies = cookie
+          },
+          { what: "cookies", serialize: normalizeWeiyunAddition },
+        )
+      }),
+  },
+  {
+    // PikPak 个人版。分享版独立注册在下方（F-090）。
+    names: ["pikpak"],
+    create: (addition, storageConfig) =>
+      new PikPakDriver(addition, async (tokens) => {
+        await persistStorageAddition(
+          storageConfig,
+          "PikPak",
+          (stAddition) => {
+            stAddition.refresh_token = tokens.refreshToken
+            if (tokens.captchaToken) {
+              stAddition.captcha_token = tokens.captchaToken
+            }
+          },
+          { what: "tokens" },
+        )
+      }),
+  },
+  {
+    names: ["seafile"],
+    create: (addition, storageConfig) =>
+      new SeafileDriver(addition, async (token) => {
+        await persistStorageAddition(
+          storageConfig,
+          "Seafile",
+          (stAddition) => {
+            stAddition.token = token
+          },
+          { what: "token" },
+        )
+      }),
+  },
+  {
+    // Yandex Disk。别名：yandex_disk / yandex_drive。
+    names: ["yandex", "yandexdisk", "yandexdrive"],
+    create: (addition, storageConfig) =>
+      new YandexDriver(addition, async (tokens) => {
+        await persistStorageAddition(
+          storageConfig,
+          "Yandex",
+          (stAddition) => {
+            stAddition.refresh_token = tokens.refreshToken
+          },
+          { what: "token" },
+        )
+      }),
+  },
+  {
+    // Terabox。别名 "dubox"。
+    names: ["terabox", "dubox"],
+    create: (addition) => new TeraboxDriver(addition),
+  },
+  {
+    // 115 分享（F-090：独立条目，不再被 startsWith("115") 截胡）。
+    names: ["115share", "115sharelink"],
+    create: (addition) => new Pan115ShareDriver(addition),
+  },
+  {
+    // 123 分享（F-090：不再被 startsWith("123")/123panshare 个人分支截胡）。
+    names: ["123share", "123panshare", "123link"],
+    create: (addition) => new Pan123ShareDriver(addition),
+  },
+  {
+    // 阿里云盘分享（F-090：不再被 includes("aliyun") 截胡）。
+    names: ["aliyundriveshare", "aliyunshare", "alishare"],
+    create: (addition) => new AliyundriveShareDriver(addition),
+  },
+  {
+    // OneDrive 分享链接（F-090：不再被 startsWith("onedrive") 截胡）。
+    names: ["onedrivesharelink", "onedriveshare", "sharepointshare"],
+    create: (addition) => new OnedriveSharelinkDriver(addition),
+  },
+  {
+    // PikPak 分享（F-090：不再被 includes("pikpak") 截胡）。
+    names: ["pikpakshare"],
+    create: (addition) => new PikPakShareDriver(addition),
+  },
+  {
+    // MediaTrack。别名 "fenmiao"。
+    names: ["mediatrack", "fenmiao"],
+    create: (addition) => new MediatrackDriver(addition),
+  },
+  {
+    names: ["alias"],
+    create: (addition) => new AliasDriver(addition),
+  },
+  {
+    names: ["dropbox"],
+    create: (addition, storageConfig) =>
+      new DropboxDriver(addition, async (tokens) => {
+        await persistStorageAddition(
+          storageConfig,
+          "Dropbox",
+          (stAddition) => {
+            stAddition.access_token = tokens.accessToken
+            stAddition.refresh_token = tokens.refreshToken
+          },
+          { what: "token" },
+        )
+      }),
+  },
+  {
+    // WPS。别名 "kdocs"（旧实现靠 includes("kdocs") 命中）。
+    names: ["wps", "kdocs"],
+    create: (addition) => new WpsDriver(addition),
+  },
+  {
+    // 移动云盘。别名：mobile_cloud / cmcc / china_mobile。
+    names: ["mopan", "mobilecloud", "cmcc", "chinamobile"],
+    create: (addition, storageConfig) =>
+      new MoPanDriver(addition, async (deviceInfo, token) => {
+        await persistStorageAddition(
+          storageConfig,
+          "MoPan",
+          (stAddition) => {
+            stAddition.device_info = deviceInfo
+            // 去掉 Bearer 前缀后再入库
+            stAddition.token = token.replace(/^Bearer\s+/i, "")
+          },
+          { what: "tokens" },
+        )
+      }),
+  },
+  {
+    // 139 云盘。别名：139_yun / caiyun / hecaiyun。
+    names: ["139", "139yun", "caiyun", "hecaiyun"],
+    create: (addition, storageConfig) =>
+      new Yun139Driver(addition, async (authorization) => {
+        await persistStorageAddition(
+          storageConfig,
+          "139",
+          (stAddition) => {
+            stAddition.authorization = authorization
+          },
+          {
+            what: "refreshed authorization",
+            syncInFlight: true,
+            respectDeferral: true,
+          },
+        )
+      }),
+  },
+  {
+    // MEGA。别名 "mega_nz"。
+    names: ["mega", "meganz"],
+    create: (addition) => new MegaDriver(addition),
+  },
+  {
+    // SMB/CIFS。别名 "samba" / "cifs"。
+    names: ["smb", "samba", "cifs"],
+    create: (addition) => new SMBDriver(addition),
+  },
+  {
+    names: ["crypt"],
+    create: (addition) => new CryptDriver(addition),
+  },
+  {
+    names: ["virtual"],
+    create: (addition) => new VirtualDriver(addition),
+  },
+  {
+    // AList V3/V2。别名 "alist" / "alist_v2"。
+    names: ["alistv3", "alist", "alistv2"],
+    create: (addition, storageConfig) =>
+      new AListV3Driver(addition, async (token: string) => {
+        await persistStorageAddition(
+          storageConfig,
+          "alist_v3",
+          (stAddition) => {
+            stAddition.token = token
+          },
+          { what: "token" },
+        )
+      }),
+  },
+  {
+    // URL 树。别名 "urls_tree"。
+    names: ["urltree", "urlstree"],
+    create: (addition, storageConfig) =>
+      new UrlTreeDriver(addition, async (urlStructure: string) => {
+        await persistStorageAddition(
+          storageConfig,
+          "url_tree",
+          (stAddition) => {
+            stAddition.url_structure = urlStructure
+          },
+          { what: "structure" },
+        )
+      }),
+  },
+  {
+    names: ["strm"],
+    create: (addition) => new StrmDriver(addition),
+  },
+  {
+    names: ["chunk"],
+    create: (addition) => new ChunkDriver(addition),
+  },
+  {
+    // Azure Blob。别名：azure / azblob。
+    names: ["azureblob", "azure", "azblob"],
+    create: (addition) => new AzureBlobDriver(addition),
+  },
+  {
+    // 又拍云 USS。别名 "upyun"。
+    names: ["uss", "upyun"],
+    create: (addition) => new UssDriver(addition),
+  },
+  {
+    // Nginx autoindex。别名 "nginx_autoindex"。
+    names: ["autoindex", "nginxautoindex"],
+    create: (addition) => new AutoIndexDriver(addition),
+  },
+  {
+    // Proton Drive。别名 "proton"。
+    names: ["protondrive", "proton"],
+    create: (addition) => new ProtonDriveDriver(addition),
+  },
+  {
+    // 阿里文档。别名 "dingtalk_doc"。
+    names: ["alidoc", "dingtalkdoc"],
+    create: (addition) => new AliDocDriver(addition),
+  },
+  {
+    // Emby。别名 "jellyfin"。
+    names: ["emby", "jellyfin"],
+    create: (addition) => new EmbyDriver(addition),
+  },
+  {
+    // Bunny Storage。别名：bunny_cdn / bunny。
+    names: ["bunnystorage", "bunnycdn", "bunny"],
+    create: (addition) => new BunnyStorageDriver(addition),
+  },
+  {
+    // Cloudflare ImgBed。别名：cf_imgbed / cloudflare_image。
+    names: ["cloudflareimgbed", "cfimgbed", "cloudflareimage"],
+    create: (addition) => new CFImgBedDriver(addition),
+  },
+  {
+    // 光雅盘。别名 "guangya"。
+    names: ["guangyapan", "guangya"],
+    create: (addition, storageConfig) =>
+      new GuangYaPanDriver(addition, async (changes) => {
+        await persistStorageAddition(
+          storageConfig,
+          "GuangYaPan",
+          (stAddition) => {
+            // 合并需要持久化的字段（access_token/refresh_token/verification_id/
+            // captcha_token/send_code 等），空串用于显式清除一次性字段
+            Object.assign(stAddition, changes)
+          },
+          { what: "changes" },
+        )
+      }),
+  },
+]
+
+/** 归一化名称 → 注册项。注册表在模块加载时构建，重复名直接抛错（防止遮蔽回归）。 */
+const driverNameIndex = new Map<string, DriverRegistration>()
+for (const registration of DRIVER_REGISTRY) {
+  for (const name of registration.names) {
+    if (driverNameIndex.has(name)) {
+      throw new Error(`duplicate driver name '${name}' in DRIVER_REGISTRY`)
+    }
+    driverNameIndex.set(name, registration)
+  }
+}
+
+/**
+ * 按名称精确解析驱动注册项（仅供测试/诊断；运行期走 createDriver）。
+ */
+export function findDriverRegistration(
+  driverName: string,
+): DriverRegistration | undefined {
+  return driverNameIndex.get(normalizeDriverName(driverName))
+}
+
+/**
+ * 创建并初始化存储驱动。
+ *
+ * F-090/F-271/A5-1：从顺序 if/else-if 链重写为显式注册表，只做归一化后的
+ * 精确匹配。name 的规范化仍保持旧语义：小写 + 去掉所有非 a-z0-9 字符
+ * （"115_share" → "115share"、"115Open" → "115open"）。
+ */
+export async function createDriver(
   driverName: string,
   storageConfig?: any,
 ): Promise<StorageDriver> {
-  const normDriver = (driverName || "").toLowerCase().replace(/[^a-z0-9]/g, "")
-  if (normDriver === "local") {
-    // Only available in Node.js container — not in Cloudflare Workers
-    if (typeof process !== "undefined" && process.release?.name === "node") {
-      // 存储根随配置传入：驱动内部据此做软链越界校验（M-9）
-      const root = parseAddition(storageConfig)?.root_folder_path
-      return getLocalDriver(typeof root === "string" ? root : undefined)
-    }
-    throw new Error(
-      "Local storage driver requires Node.js runtime (not available in Cloudflare Workers)",
-    )
-  }
-  if (normDriver === "sftp") {
-    return getSFTPDriver(storageConfig)
-  }
-  if (normDriver === "ftp") {
-    return getFTPDriver(storageConfig)
-  }
+  const normDriver = normalizeDriverName(driverName)
 
-  if (!storageConfig) {
+  // local/sftp/ftp 历史上允许不带 storageConfig（由环境/驱动默认值决定）。
+  if (
+    !storageConfig &&
+    normDriver !== "local" &&
+    normDriver !== "sftp" &&
+    normDriver !== "ftp"
+  ) {
     throw new Error(
       "failed get driver: storage config not found for driver " + driverName,
     )
   }
 
-  let driver: StorageDriver
-  if (normDriver === "onedriveapp") {
-    driver = new OnedriveAPP(parseAddition(storageConfig))
-    try {
-      await driver.init?.()
-    } catch (e) {
-      console.error("onedrive_app init failed:", e)
-      throw e
-    }
-  } else if (
-    normDriver === "onedrive" ||
-    normDriver === "onedrivesb" ||
-    normDriver === "onedrivebusiness" ||
-    normDriver === "onedrivesharepoint" ||
-    (normDriver.startsWith("onedrive") && normDriver !== "onedriveapp")
-  ) {
-    driver = new Onedrive(
-      parseAddition(storageConfig),
-      async (refreshToken) => {
-        try {
-          const db = await getDb()
-          const st = (db.storages || []).find(
-            (s: any) => s.id === storageConfig?.id,
-          )
-          if (!st) return
-          const stAddition =
-            typeof st.addition === "string"
-              ? JSON.parse(st.addition || "{}")
-              : st.addition || {}
-          stAddition.refresh_token = refreshToken
-          st.addition = JSON.stringify(stAddition)
-          // The admin update path persists updatedStorage after driver init.
-          // Keep that object in sync so its final save cannot restore the old
-          // refresh token over the rotated token saved here.
-          storageConfig.addition = st.addition
-          if (deferredTokenPersistence.has(storageConfig)) return
-          await saveDb(db)
-        } catch (e) {
-          console.warn("[Onedrive] failed to persist refresh token:", e)
-        }
-      },
-    )
-    try {
-      await driver.init?.()
-    } catch (e) {
-      console.error("onedrive init failed:", e)
-      throw e
-    }
-  } else if (
-    normDriver === "aliyundrive" ||
-    normDriver === "aliyundriveopen" ||
-    normDriver === "aliyundriveshare" ||
-    normDriver === "aliyun" ||
-    normDriver === "aliyundriveshare2open" ||
-    normDriver === "aliyundriveoauth2" ||
-    normDriver.includes("aliyun")
-  ) {
-    // 统一只保留阿里云盘 OAuth2 (AliyundriveOpen)
-    driver = new AliyundriveOpen(parseAddition(storageConfig))
-    await driver.init?.()
-  } else if (
-    normDriver === "googlephoto" ||
-    normDriver === "googlephotos" ||
-    normDriver === "gphoto" ||
-    normDriver === "google_photo"
-  ) {
-    driver = new DriverGooglePhoto(parseAddition(storageConfig))
-    await driver.init?.()
-  } else if (
-    normDriver === "googledrive" ||
-    normDriver === "gdrive" ||
-    normDriver === "google" ||
-    normDriver.startsWith("google")
-  ) {
-    driver = new GoogleDrive(parseAddition(storageConfig))
-    await driver.init?.()
-  } else if (
-    normDriver === "quark" ||
-    normDriver === "quarkuc" ||
-    normDriver === "uc" ||
-    normDriver === "quarkcookie"
-  ) {
-    driver = new QuarkDriver(parseAddition(storageConfig))
-    await driver.init?.()
-  } else if (
-    normDriver === "115" ||
-    normDriver === "115cloud" ||
-    normDriver === "115open" ||
-    normDriver === "115netdisk"
-  ) {
-    driver = new Driver115(parseAddition(storageConfig))
-    await driver.init?.()
-  } else if (
-    normDriver === "cloudreve" ||
-    normDriver === "cloudrevev3" ||
-    normDriver === "cloudreve_v3"
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new DriverCloudreveV3(addition, async (cookie: string) => {
-      try {
-        const db = await getDb()
-        const st = (db.storages || []).find(
-          (s: any) => s.id === storageConfig?.id,
-        )
-        if (!st) return
-        const stAddition =
-          typeof st.addition === "string"
-            ? JSON.parse(st.addition || "{}")
-            : st.addition || {}
-        stAddition.cookie = cookie
-        st.addition = JSON.stringify(stAddition)
-        await saveDb(db)
-      } catch (e) {
-        console.warn("[cloudreve] failed to persist cookie:", e)
-      }
-    })
-    await driver.init?.()
-  } else if (normDriver === "cloudrevev4" || normDriver === "cloudreve_v4") {
-    driver = new DriverCloudreve(parseAddition(storageConfig))
-    await driver.init?.()
-  } else if (
-    normDriver === "openlistshare" ||
-    normDriver === "openlist_share"
-  ) {
-    driver = new DriverOpenlistShare(parseAddition(storageConfig))
-    await driver.init?.()
-  } else if (normDriver === "openlist") {
-    driver = new DriverOpenlist(parseAddition(storageConfig))
-    await driver.init?.()
-  } else if (normDriver === "teldrive") {
-    driver = new DriverTeldrive(parseAddition(storageConfig))
-    await driver.init?.()
-  } else if (normDriver === "mediafire") {
-    driver = new DriverMediafire(parseAddition(storageConfig))
-    await driver.init?.()
-  } else if (
-    normDriver === "githubreleases" ||
-    normDriver === "github_releases"
-  ) {
-    driver = new DriverGithubReleases(parseAddition(storageConfig))
-    await driver.init?.()
-  } else if (normDriver === "cnbreleases" || normDriver === "cnb_releases") {
-    driver = new DriverCnbReleases(parseAddition(storageConfig))
-    await driver.init?.()
-  } else if (normDriver === "kodbox" || normDriver === "kodo") {
-    driver = new DriverKodbox(parseAddition(storageConfig))
-    await driver.init?.()
-  } else if (
-    normDriver === "ipfs" ||
-    normDriver === "ipfsapi" ||
-    normDriver === "ipfs_api"
-  ) {
-    driver = new DriverIpfs(parseAddition(storageConfig))
-    await driver.init?.()
-  } else if (
-    normDriver === "lenovonasshare" ||
-    normDriver === "lenovonas_share"
-  ) {
-    driver = new DriverLenovoNasShare(parseAddition(storageConfig))
-    await driver.init?.()
-  } else if (normDriver === "misskey") {
-    driver = new DriverMisskey(parseAddition(storageConfig))
-    await driver.init?.()
-  } else if (
-    normDriver === "doubao" ||
-    normDriver === "doubaonew" ||
-    normDriver === "doubao_new" ||
-    normDriver === "doubaoshare" ||
-    normDriver === "doubao_share"
-  ) {
-    driver = new DriverDoubao(parseAddition(storageConfig))
-    await driver.init?.()
-  } else if (
-    normDriver === "quarkopen" ||
-    normDriver === "quark_open" ||
-    normDriver === "quarkoa"
-  ) {
-    driver = new DriverQuarkOpen(parseAddition(storageConfig))
-    await driver.init?.()
-  } else if (
-    normDriver === "quarktv" ||
-    normDriver === "quarkuctv" ||
-    normDriver === "uctv" ||
-    normDriver === "quark_uc_tv"
-  ) {
-    driver = new DriverQuarkUcTv(parseAddition(storageConfig))
-    await driver.init?.()
-  } else if (
-    normDriver === "123open" ||
-    normDriver === "123_open" ||
-    normDriver === "123cloudopen"
-  ) {
-    driver = new Driver123Open(parseAddition(storageConfig))
-    await driver.init?.()
-  } else if (normDriver === "teambition" || normDriver === "tb") {
-    driver = new DriverTeambition(parseAddition(storageConfig))
-    await driver.init?.()
-  } else if (
-    normDriver === "neteasemusic" ||
-    normDriver === "netease" ||
-    normDriver === "neteasecloudmusic" ||
-    normDriver === "netease_music"
-  ) {
-    driver = new DriverNeteaseMusic(parseAddition(storageConfig))
-    await driver.init?.()
-  } else if (
-    normDriver === "halalcloudopen" ||
-    normDriver === "halalcloud_open" ||
-    normDriver === "halalcloudopenapi"
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new DriverHalalCloudOpen(
-      addition,
-      async (refreshToken: string) => {
-        try {
-          const db = await getDb()
-          const st = (db.storages || []).find(
-            (s: any) => s.id === storageConfig?.id,
-          )
-          if (!st) return
-          const stAddition =
-            typeof st.addition === "string"
-              ? JSON.parse(st.addition || "{}")
-              : st.addition || {}
-          stAddition.refresh_token = refreshToken
-          st.addition = JSON.stringify(stAddition)
-          await saveDb(db)
-        } catch (e) {
-          console.warn("[HalalCloud] failed to persist refresh_token:", e)
-        }
-      },
-    )
-    await driver.init?.()
-  } else if (normDriver === "degoo") {
-    const addition = parseAddition(storageConfig)
-    driver = new DriverDegoo(
-      addition,
-      async (tokens: { accessToken?: string; refreshToken?: string }) => {
-        try {
-          const db = await getDb()
-          const st = (db.storages || []).find(
-            (s: any) => s.id === storageConfig?.id,
-          )
-          if (!st) return
-          const stAddition =
-            typeof st.addition === "string"
-              ? JSON.parse(st.addition || "{}")
-              : st.addition || {}
-          if (tokens.accessToken) stAddition.access_token = tokens.accessToken
-          if (tokens.refreshToken)
-            stAddition.refresh_token = tokens.refreshToken
-          st.addition = JSON.stringify(stAddition)
-          await saveDb(db)
-        } catch (e) {
-          console.warn("[degoo] failed to persist tokens:", e)
-        }
-      },
-    )
-    await driver.init?.()
-  } else if (normDriver === "febbox" || normDriver === "febboxpan") {
-    const addition = parseAddition(storageConfig)
-    driver = new DriverFebBox(addition, async (refreshToken: string) => {
-      try {
-        const db = await getDb()
-        const st = (db.storages || []).find(
-          (s: any) => s.id === storageConfig?.id,
-        )
-        if (!st) return
-        const stAddition =
-          typeof st.addition === "string"
-            ? JSON.parse(st.addition || "{}")
-            : st.addition || {}
-        stAddition.refresh_token = refreshToken
-        st.addition = JSON.stringify(stAddition)
-        await saveDb(db)
-      } catch (e) {
-        console.warn("[febbox] failed to persist refresh_token:", e)
-      }
-    })
-    await driver.init?.()
-  } else if (
-    normDriver === "chaoxing" ||
-    normDriver === "chaoxinggroupdrive" ||
-    normDriver === "chaoxinggroup" ||
-    normDriver.startsWith("chaoxing")
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new DriverChaoXing(addition, async (cookie: string) => {
-      try {
-        const db = await getDb()
-        const st = (db.storages || []).find(
-          (s: any) => s.id === storageConfig?.id,
-        )
-        if (!st) return
-        const stAddition =
-          typeof st.addition === "string"
-            ? JSON.parse(st.addition || "{}")
-            : st.addition || {}
-        stAddition.cookie = cookie
-        st.addition = JSON.stringify(stAddition)
-        await saveDb(db)
-      } catch (e) {
-        console.warn("[chaoxing] failed to persist cookie:", e)
-      }
-    })
-    await driver.init?.()
-  } else if (
-    normDriver === "123pan" ||
-    normDriver === "123" ||
-    normDriver === "123panshare" ||
-    normDriver.startsWith("123")
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new Pan123Driver(addition, async (token: string) => {
-      // Persist the refreshed 123Pan access_token back to the storage config
-      // so subsequent cold starts skip password login (avoiding overseas-IP
-      // risk control in Cloudflare Workers).
-      try {
-        const db = await getDb()
-        const st = (db.storages || []).find(
-          (s: any) => s.id === storageConfig?.id,
-        )
-        if (!st) return
-        const stAddition =
-          typeof st.addition === "string"
-            ? JSON.parse(st.addition || "{}")
-            : st.addition || {}
-        stAddition.access_token = token
-        st.addition = JSON.stringify(stAddition)
-        await saveDb(db)
-      } catch (e) {
-        console.warn("[123Pan] failed to persist access_token:", e)
-      }
-    })
-    await driver.init?.()
-  } else if (
-    normDriver === "baiduphoto" ||
-    normDriver === "baidu_photo" ||
-    normDriver === "baiduphotos"
-  ) {
-    driver = new DriverBaiduPhoto(parseAddition(storageConfig))
-    await driver.init?.()
-  } else if (
-    normDriver === "baidunetdisk" ||
-    normDriver === "baidu" ||
-    normDriver === "baiduyun" ||
-    normDriver === "baidushare" ||
-    normDriver.startsWith("baidu")
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new BaiduDriver(addition, async (tokens) => {
-      // Persist refreshed tokens (and normalized defaults) back to the
-      // storage config so cold starts skip OAuth entirely.
-      try {
-        const db = await getDb()
-        const st = (db.storages || []).find(
-          (s: any) => s.id === storageConfig?.id,
-        )
-        if (!st) return
-        const stAddition =
-          typeof st.addition === "string"
-            ? JSON.parse(st.addition || "{}")
-            : st.addition || {}
-        stAddition.access_token = tokens.access_token
-        stAddition.refresh_token = tokens.refresh_token
-        st.addition = JSON.stringify(normalizeBaiduAddition(stAddition))
-        await saveDb(db)
-      } catch (e) {
-        console.warn("[baidu_netdisk] failed to persist token:", e)
-      }
-    })
-    await driver.init?.()
-  } else if (
-    normDriver === "115open" ||
-    normDriver === "115" ||
-    normDriver === "115pan" ||
-    normDriver === "115cloud" ||
-    normDriver.startsWith("115")
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new Pan115Driver(addition, async (tokens) => {
-      // 持久化刷新后的 access_token / refresh_token，避免冷启动重复刷新
-      try {
-        const db = await getDb()
-        const st = (db.storages || []).find(
-          (s: any) => s.id === storageConfig?.id,
-        )
-        if (!st) return
-        const stAddition =
-          typeof st.addition === "string"
-            ? JSON.parse(st.addition || "{}")
-            : st.addition || {}
-        stAddition.access_token = tokens.access_token
-        stAddition.refresh_token = tokens.refresh_token
-        st.addition = JSON.stringify(stAddition)
-        await saveDb(db)
-      } catch (e) {
-        console.warn("[115open] failed to persist token:", e)
-      }
-    })
-    await driver.init?.()
-  } else if (
-    normDriver === "github" ||
-    normDriver === "githubapi" ||
-    normDriver === "github_api"
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new GithubDriver(addition)
-    await driver.init?.()
-  } else if (
-    normDriver === "thunderexpert" ||
-    normDriver === "thunderbrowserexpert" ||
-    normDriver === "thunderxexpert" ||
-    (normDriver.includes("thunder") && normDriver.includes("expert")) ||
-    (normDriver.includes("xunlei") && normDriver.includes("expert"))
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new ThunderExpertDriver(addition, async (tokens) => {
-      try {
-        if (tokens.device_id) addition.device_id = tokens.device_id
-        if (tokens.refresh_token) addition.refresh_token = tokens.refresh_token
-        if (tokens.captcha_token) addition.captcha_token = tokens.captcha_token
-        storageConfig.addition = JSON.stringify(addition)
-
-        const db = await getDb()
-        const st = (db.storages || []).find(
-          (s: any) => s.id === storageConfig?.id,
-        )
-        if (st) {
-          const stAddition =
-            typeof st.addition === "string"
-              ? JSON.parse(st.addition || "{}")
-              : st.addition || {}
-          if (tokens.refresh_token)
-            stAddition.refresh_token = tokens.refresh_token
-          if (tokens.captcha_token)
-            stAddition.captcha_token = tokens.captcha_token
-          if (tokens.device_id) stAddition.device_id = tokens.device_id
-          st.addition = JSON.stringify(stAddition)
-          await saveDb(db)
-        }
-      } catch (e) {
-        console.warn("[thunderexpert] failed to persist token:", e)
-      }
-    })
-    await driver.init?.()
-  } else if (
-    normDriver === "thunder" ||
-    normDriver === "xunlei" ||
-    normDriver === "thunderbrowser" ||
-    normDriver === "thunderx" ||
-    normDriver.includes("thunder") ||
-    normDriver.includes("xunlei")
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new ThunderDriver(addition, async (tokens) => {
-      try {
-        if (tokens.device_id) addition.device_id = tokens.device_id
-        if (tokens.refresh_token) addition.refresh_token = tokens.refresh_token
-        if (tokens.captcha_token) addition.captcha_token = tokens.captcha_token
-        storageConfig.addition = JSON.stringify(addition)
-
-        const db = await getDb()
-        const st = (db.storages || []).find(
-          (s: any) => s.id === storageConfig?.id,
-        )
-        if (st) {
-          const stAddition =
-            typeof st.addition === "string"
-              ? JSON.parse(st.addition || "{}")
-              : st.addition || {}
-          if (tokens.refresh_token)
-            stAddition.refresh_token = tokens.refresh_token
-          if (tokens.captcha_token)
-            stAddition.captcha_token = tokens.captcha_token
-          if (tokens.device_id) stAddition.device_id = tokens.device_id
-          st.addition = JSON.stringify(stAddition)
-          await saveDb(db)
-        }
-      } catch (e) {
-        console.warn("[thunder] failed to persist token:", e)
-      }
-    })
-    await driver.init?.()
-  } else if (
-    normDriver === "lanzou" ||
-    normDriver === "lanzoupan" ||
-    normDriver === "ilanzou" ||
-    normDriver === "lanzoui" ||
-    normDriver === "lanzous"
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new LanzouDriver(addition, async (cookie) => {
-      try {
-        const db = await getDb()
-        const st = (db.storages || []).find(
-          (s: any) => s.id === storageConfig?.id,
-        )
-        if (!st) return
-        const stAddition =
-          typeof st.addition === "string"
-            ? JSON.parse(st.addition || "{}")
-            : st.addition || {}
-        stAddition.cookie = cookie
-        st.addition = JSON.stringify(stAddition)
-        await saveDb(db)
-      } catch (e) {
-        console.warn("[Lanzou] failed to persist cookie:", e)
-      }
-    })
-    await driver.init?.()
-  } else if (
-    normDriver === "ctfile" ||
-    normDriver === "ctfilepan" ||
-    normDriver === "ctfiledriver" ||
-    normDriver === "400gb" ||
-    normDriver.includes("ctfile")
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new CtFileDriver(addition)
-    await driver.init?.()
-  } else if (
-    normDriver === "189tv" ||
-    normDriver === "cloud189tv" ||
-    normDriver === "189tvcloud" ||
-    normDriver === "189_tv"
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new Driver189TV(addition, async (accessToken: string) => {
-      try {
-        const db = await getDb()
-        const st = (db.storages || []).find(
-          (s: any) => s.id === storageConfig?.id,
-        )
-        if (!st) return
-        const stAddition =
-          typeof st.addition === "string"
-            ? JSON.parse(st.addition || "{}")
-            : st.addition || {}
-        stAddition.access_token = accessToken
-        st.addition = JSON.stringify(stAddition)
-        await saveDb(db)
-      } catch (e) {
-        console.warn("[189TV] failed to persist access_token:", e)
-      }
-    })
-    await driver.init?.()
-  } else if (
-    normDriver === "189" ||
-    normDriver === "189cloud" ||
-    normDriver === "cloud189" ||
-    normDriver === "ctyun" ||
-    normDriver === "189pan" ||
-    normDriver === "189cloudpc" ||
-    normDriver === "189cloudapp" ||
-    normDriver.startsWith("189") ||
-    normDriver.includes("cloud189")
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new Cloud189Driver(addition)
-    await driver.init?.()
-  } else if (normDriver === "webdav" || normDriver === "webdavdriver") {
-    const addition = parseAddition(storageConfig)
-    driver = new WebdavDriver(addition)
-    await driver.init?.()
-  } else if (
-    // Cloudflare R2 独立驱动（"Cloudflare R2" / "r2" / "cloudflare_r2" / "cfr2"
-    // 归一化后都会落到这里）。必须在下面的 S3 分支之前匹配。
-    normDriver === "r2" ||
-    normDriver === "cloudflarer2" ||
-    normDriver === "cfr2" ||
-    normDriver === "r2native"
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new R2Driver(addition)
-    await driver.init?.()
-  } else if (
-    // S3 兼容家族。注意：`r2` 已由上一分支接管，这里不能再列它
-    // （会被上方分支拦截成死代码，且让「r2 走哪条路」变得难读）。
-    normDriver === "s3" ||
-    normDriver === "doge" ||
-    normDriver === "dogecloud" ||
-    normDriver === "minio" ||
-    normDriver === "ceph" ||
-    normDriver === "aws" ||
-    normDriver === "b2" ||
-    normDriver === "cos" ||
-    normDriver === "oss" ||
-    normDriver === "kodo"
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new S3Driver(addition, storageConfig.driver || "S3")
-    await driver.init?.()
-  } else if (
-    normDriver === "wopan" ||
-    normDriver === "unicom" ||
-    normDriver === "unicomcloud" ||
-    normDriver === "woyun" ||
-    normDriver === "chinaunicom"
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new WoPanDriver(addition, async (accessToken, refreshToken) => {
-      try {
-        const db = await getDb()
-        const st = (db.storages || []).find(
-          (s: any) => s.id === storageConfig?.id,
-        )
-        if (!st) return
-        const stAddition =
-          typeof st.addition === "string"
-            ? JSON.parse(st.addition || "{}")
-            : st.addition || {}
-        stAddition.access_token = accessToken
-        stAddition.refresh_token = refreshToken
-        st.addition = JSON.stringify(normalizeWoPanAddition(stAddition))
-        await saveDb(db)
-      } catch (e) {
-        console.warn("[WoPan] failed to persist tokens:", e)
-      }
-    })
-    await driver.init?.()
-  } else if (
-    normDriver === "weiyun" ||
-    normDriver === "tencentweiyun" ||
-    normDriver === "txweiyun" ||
-    normDriver.includes("weiyun")
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new WeiyunDriver(addition, async (cookie) => {
-      try {
-        const db = await getDb()
-        const st = (db.storages || []).find(
-          (s: any) => s.id === storageConfig?.id,
-        )
-        if (!st) return
-        const stAddition =
-          typeof st.addition === "string"
-            ? JSON.parse(st.addition || "{}")
-            : st.addition || {}
-        stAddition.cookies = cookie
-        st.addition = JSON.stringify(normalizeWeiyunAddition(stAddition))
-        await saveDb(db)
-      } catch (e) {
-        console.warn("[WeiYun] failed to persist cookies:", e)
-      }
-    })
-    await driver.init?.()
-  } else if (
-    normDriver === "pikpak" ||
-    normDriver === "pikpakshare" ||
-    normDriver.includes("pikpak")
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new PikPakDriver(addition, async (tokens) => {
-      try {
-        const db = await getDb()
-        const st = (db.storages || []).find(
-          (s: any) => s.id === storageConfig?.id,
-        )
-        if (!st) return
-        const stAddition =
-          typeof st.addition === "string"
-            ? JSON.parse(st.addition || "{}")
-            : st.addition || {}
-        stAddition.refresh_token = tokens.refreshToken
-        if (tokens.captchaToken) {
-          stAddition.captcha_token = tokens.captchaToken
-        }
-        st.addition = JSON.stringify(stAddition)
-        await saveDb(db)
-      } catch (e) {
-        console.warn("[PikPak] failed to persist tokens:", e)
-      }
-    })
-    await driver.init?.()
-  } else if (normDriver === "seafile" || normDriver.includes("seafile")) {
-    const addition = parseAddition(storageConfig)
-    driver = new SeafileDriver(addition, async (token) => {
-      try {
-        const db = await getDb()
-        const st = (db.storages || []).find(
-          (s: any) => s.id === storageConfig?.id,
-        )
-        if (!st) return
-        const stAddition =
-          typeof st.addition === "string"
-            ? JSON.parse(st.addition || "{}")
-            : st.addition || {}
-        stAddition.token = token
-        st.addition = JSON.stringify(stAddition)
-        await saveDb(db)
-      } catch (e) {
-        console.warn("[Seafile] failed to persist token:", e)
-      }
-    })
-    await driver.init?.()
-  } else if (
-    normDriver === "yandex" ||
-    normDriver === "yandexdisk" ||
-    normDriver === "yandexdrive" ||
-    normDriver.includes("yandex")
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new YandexDriver(addition, async (tokens) => {
-      try {
-        const db = await getDb()
-        const st = (db.storages || []).find(
-          (s: any) => s.id === storageConfig?.id,
-        )
-        if (!st) return
-        const stAddition =
-          typeof st.addition === "string"
-            ? JSON.parse(st.addition || "{}")
-            : st.addition || {}
-        stAddition.refresh_token = tokens.refreshToken
-        st.addition = JSON.stringify(stAddition)
-        await saveDb(db)
-      } catch (e) {
-        console.warn("[Yandex] failed to persist token:", e)
-      }
-    })
-    await driver.init?.()
-  } else if (
-    normDriver === "terabox" ||
-    normDriver === "dubox" ||
-    normDriver.includes("terabox")
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new TeraboxDriver(addition)
-    await driver.init?.()
-  } else if (
-    normDriver === "mediatrack" ||
-    normDriver === "fenmiao" ||
-    normDriver.includes("mediatrack")
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new MediatrackDriver(addition)
-    await driver.init?.()
-  } else if (normDriver === "alias" || normDriver.includes("alias")) {
-    const addition = parseAddition(storageConfig)
-    driver = new AliasDriver(addition)
-    await driver.init?.()
-  } else if (normDriver === "dropbox" || normDriver.includes("dropbox")) {
-    const addition = parseAddition(storageConfig)
-    driver = new DropboxDriver(addition, async (tokens) => {
-      try {
-        const db = await getDb()
-        const st = (db.storages || []).find(
-          (s: any) => s.id === storageConfig?.id,
-        )
-        if (!st) return
-        const stAddition =
-          typeof st.addition === "string"
-            ? JSON.parse(st.addition || "{}")
-            : st.addition || {}
-        stAddition.access_token = tokens.accessToken
-        stAddition.refresh_token = tokens.refreshToken
-        st.addition = JSON.stringify(stAddition)
-        await saveDb(db)
-      } catch (e) {
-        console.warn("[Dropbox] failed to persist token:", e)
-      }
-    })
-    await driver.init?.()
-  } else if (
-    normDriver === "wps" ||
-    normDriver.includes("wps") ||
-    normDriver.includes("kdocs")
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new WpsDriver(addition)
-    await driver.init?.()
-  } else if (
-    normDriver === "mopan" ||
-    normDriver === "mobilecloud" ||
-    normDriver === "cmcc" ||
-    normDriver === "chinamobile" ||
-    normDriver.includes("mopan")
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new MoPanDriver(addition, async (deviceInfo, token) => {
-      try {
-        const db = await getDb()
-        const st = (db.storages || []).find(
-          (s: any) => s.id === storageConfig?.id,
-        )
-        if (!st) return
-        const stAddition =
-          typeof st.addition === "string"
-            ? JSON.parse(st.addition || "{}")
-            : st.addition || {}
-        stAddition.device_info = deviceInfo
-        // Extract Bearer token if present
-        const cleanToken = token.replace(/^Bearer\s+/i, "")
-        stAddition.token = cleanToken
-        st.addition = JSON.stringify(stAddition)
-        await saveDb(db)
-      } catch (e) {
-        console.warn("[MoPan] failed to persist tokens:", e)
-      }
-    })
-    await driver.init?.()
-  } else if (
-    normDriver === "139" ||
-    normDriver === "139yun" ||
-    normDriver === "caiyun" ||
-    normDriver === "hecaiyun" ||
-    normDriver.includes("139")
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new Yun139Driver(addition, async (authorization) => {
-      try {
-        const db = await getDb()
-        const st = (db.storages || []).find(
-          (s: any) => s.id === storageConfig?.id,
-        )
-        if (!st) return
-        const stAddition =
-          typeof st.addition === "string"
-            ? JSON.parse(st.addition || "{}")
-            : st.addition || {}
-        stAddition.authorization = authorization
-        st.addition = JSON.stringify(stAddition)
-        // Keep the in-flight admin update object in sync so it cannot overwrite
-        // the newly refreshed authorization with the previous value.
-        storageConfig.addition = st.addition
-        if (deferredTokenPersistence.has(storageConfig)) return
-        await saveDb(db)
-      } catch (e) {
-        console.warn("[139] failed to persist refreshed authorization:", e)
-      }
-    })
-    await driver.init?.()
-  } else if (
-    normDriver === "mega" ||
-    normDriver === "meganz" ||
-    normDriver.includes("mega")
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new MegaDriver(addition)
-    await driver.init?.()
-  } else if (
-    normDriver === "115share" ||
-    normDriver === "115sharelink" ||
-    (normDriver.includes("115") && normDriver.includes("share"))
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new Pan115ShareDriver(addition)
-    await driver.init?.()
-  } else if (
-    normDriver === "123share" ||
-    normDriver === "123panshare" ||
-    normDriver === "123link" ||
-    (normDriver.includes("123") && normDriver.includes("share"))
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new Pan123ShareDriver(addition)
-    await driver.init?.()
-  } else if (
-    normDriver === "aliyundriveshare" ||
-    normDriver === "aliyunshare" ||
-    normDriver === "alishare" ||
-    (normDriver.includes("ali") && normDriver.includes("share"))
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new AliyundriveShareDriver(addition)
-    await driver.init?.()
-  } else if (
-    normDriver === "onedrivesharelink" ||
-    normDriver === "onedriveshare" ||
-    normDriver === "sharepointshare" ||
-    (normDriver.includes("onedrive") && normDriver.includes("share"))
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new OnedriveSharelinkDriver(addition)
-    await driver.init?.()
-  } else if (
-    normDriver === "pikpakshare" ||
-    (normDriver.includes("pikpak") && normDriver.includes("share"))
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new PikPakShareDriver(addition)
-    await driver.init?.()
-  } else if (
-    normDriver === "smb" ||
-    normDriver === "samba" ||
-    normDriver === "cifs" ||
-    normDriver.includes("smb")
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new SMBDriver(addition)
-    await driver.init?.()
-  } else if (normDriver === "crypt") {
-    const addition = parseAddition(storageConfig)
-    driver = new CryptDriver(addition)
-    await driver.init?.()
-  } else if (normDriver === "virtual") {
-    const addition = parseAddition(storageConfig)
-    driver = new VirtualDriver(addition)
-  } else if (
-    normDriver === "alistv3" ||
-    normDriver === "alist" ||
-    normDriver === "alistv2"
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new AListV3Driver(addition, async (token: string) => {
-      try {
-        const db = await getDb()
-        const st = (db.storages || []).find(
-          (s: any) => s.id === storageConfig?.id,
-        )
-        if (!st) return
-        const stAddition =
-          typeof st.addition === "string"
-            ? JSON.parse(st.addition || "{}")
-            : st.addition || {}
-        stAddition.token = token
-        st.addition = JSON.stringify(stAddition)
-        await saveDb(db)
-      } catch (e) {
-        console.warn("[alist_v3] failed to persist token:", e)
-      }
-    })
-    await driver.init?.()
-  } else if (normDriver === "urltree" || normDriver === "urlstree") {
-    const addition = parseAddition(storageConfig)
-    driver = new UrlTreeDriver(addition, async (urlStructure: string) => {
-      try {
-        const db = await getDb()
-        const st = (db.storages || []).find(
-          (s: any) => s.id === storageConfig?.id,
-        )
-        if (!st) return
-        const stAddition =
-          typeof st.addition === "string"
-            ? JSON.parse(st.addition || "{}")
-            : st.addition || {}
-        stAddition.url_structure = urlStructure
-        st.addition = JSON.stringify(stAddition)
-        await saveDb(db)
-      } catch (e) {
-        console.warn("[url_tree] failed to persist structure:", e)
-      }
-    })
-    await driver.init?.()
-  } else if (normDriver === "strm") {
-    const addition = parseAddition(storageConfig)
-    driver = new StrmDriver(addition)
-    await driver.init?.()
-  } else if (normDriver === "chunk") {
-    const addition = parseAddition(storageConfig)
-    driver = new ChunkDriver(addition)
-    await driver.init?.()
-  } else if (
-    normDriver === "azureblob" ||
-    normDriver === "azure" ||
-    normDriver === "azblob"
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new AzureBlobDriver(addition)
-    await driver.init?.()
-  } else if (normDriver === "uss" || normDriver === "upyun") {
-    const addition = parseAddition(storageConfig)
-    driver = new UssDriver(addition)
-    await driver.init?.()
-  } else if (normDriver === "autoindex" || normDriver === "nginxautoindex") {
-    const addition = parseAddition(storageConfig)
-    driver = new AutoIndexDriver(addition)
-    await driver.init?.()
-  } else if (normDriver === "protondrive" || normDriver === "proton") {
-    const addition = parseAddition(storageConfig)
-    driver = new ProtonDriveDriver(addition)
-    await driver.init?.()
-  } else if (normDriver === "alidoc" || normDriver === "dingtalkdoc") {
-    const addition = parseAddition(storageConfig)
-    driver = new AliDocDriver(addition)
-    await driver.init?.()
-  } else if (normDriver === "emby" || normDriver === "jellyfin") {
-    const addition = parseAddition(storageConfig)
-    driver = new EmbyDriver(addition)
-    await driver.init?.()
-  } else if (
-    normDriver === "bunnystorage" ||
-    normDriver === "bunnycdn" ||
-    normDriver === "bunny"
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new BunnyStorageDriver(addition)
-    await driver.init?.()
-  } else if (
-    normDriver === "cloudflareimgbed" ||
-    normDriver === "cfimgbed" ||
-    normDriver === "cloudflareimage"
-  ) {
-    const addition = parseAddition(storageConfig)
-    driver = new CFImgBedDriver(addition)
-    await driver.init?.()
-  } else if (normDriver === "guangyapan" || normDriver === "guangya") {
-    const addition = parseAddition(storageConfig)
-    driver = new GuangYaPanDriver(addition, async (changes) => {
-      try {
-        const db = await getDb()
-        const st = (db.storages || []).find(
-          (s: any) => s.id === storageConfig?.id,
-        )
-        if (!st) return
-        const stAddition =
-          typeof st.addition === "string"
-            ? JSON.parse(st.addition || "{}")
-            : st.addition || {}
-        // 合并需要持久化的字段（access_token/refresh_token/verification_id/
-        // captcha_token/send_code 等），空串用于显式清除一次性字段
-        Object.assign(stAddition, changes)
-        st.addition = JSON.stringify(stAddition)
-        await saveDb(db)
-      } catch (e) {
-        console.warn("[GuangYaPan] failed to persist changes:", e)
-      }
-    })
-    await driver.init?.()
-  } else {
+  const registration = driverNameIndex.get(normDriver)
+  if (!registration) {
     throw new Error(
       "failed get driver: unsupported driver '" + driverName + "'",
     )
   }
 
+  const driver = await registration.create(
+    parseAddition(storageConfig),
+    storageConfig,
+  )
+  if (registration.autoInit !== false) {
+    try {
+      await driver.init?.()
+    } catch (e) {
+      if (registration.initErrorLog) {
+        console.error(registration.initErrorLog, e)
+      }
+      throw e
+    }
+  }
   return driver
 }
 
@@ -1355,9 +1214,7 @@ export async function getDriver(
   if (deferTokenPersistence) deferredTokenPersistence.add(storageConfig)
 
   try {
-    const normDriver = (driverName || "")
-      .toLowerCase()
-      .replace(/[^a-z0-9]/g, "")
+    const normDriver = normalizeDriverName(driverName)
     if (normDriver === "local") {
       return createDriver(driverName, storageConfig)
     }
@@ -1466,13 +1323,36 @@ function isWeiyunDriver(driverName: string): boolean {
   )
 }
 
+/**
+ * 夸克系驱动。QuarkClient 的 request() 会从 Set-Cookie 轮换 __puus/__pus
+ * （quark/util.ts），并通过 consumePendingCookie() 把新 cookie 交给 op 层。
+ */
+function isQuarkDriver(driverName: string): boolean {
+  const normDriver = normalizeDriverName(driverName)
+  return (
+    normDriver === "quark" ||
+    normDriver === "quarkuc" ||
+    normDriver === "uc" ||
+    normDriver === "quarkcookie"
+  )
+}
+
 export async function flushPendingDriverState(
   driverName: string,
   storageConfig: any,
   driver: StorageDriver,
   requestContext?: StorageRequestContext,
 ): Promise<void> {
-  if (!isCloud189Driver(driverName) && !isWeiyunDriver(driverName)) return
+  // F-322：夸克加入处理名单。旧实现只认 189/weiyun，夸克轮换的
+  // __puus/__pus 永远只活在内存里，无状态运行时上新 isolate 仍拿 DB 里的
+  // 旧 cookie，全面 401 直到管理员重贴（对齐上游 op.MustSaveDriverStorage）。
+  if (
+    !isCloud189Driver(driverName) &&
+    !isWeiyunDriver(driverName) &&
+    !isQuarkDriver(driverName)
+  ) {
+    return
+  }
 
   const consumePendingCookie = (
     driver as StorageDriver & {
@@ -1503,6 +1383,31 @@ function toCacheTarget(resolved: any): CacheTarget | null {
 }
 
 /**
+ * singleflight 键的长度上限。
+ *
+ * MySQL 方言下 singleflight 协调表的主键列是 VARCHAR(768)（见
+ * model/store/schema.ts 的 buildSingleFlightDdl；768 字符 × utf8mb4 4 字节
+ * = 3072 字节，即 InnoDB 索引长度上限）。超长键的 INSERT 会失败，被
+ * dbFlight 折叠成 coordination-error 后静默降级为直接执行——业务不报错，
+ * 但跨实例/跨 isolate 去重失效（F-082）。virtualPath 来自用户请求且不限长，
+ * 必须在生成处保证键长有界。
+ */
+const SINGLEFLIGHT_KEY_MAX_LENGTH = 768
+
+/** 折叠后缀长度：`#` + 双 32 位 FNV-1a 十六进制摘要（8 + 8）。 */
+const SINGLEFLIGHT_KEY_FOLD_SUFFIX_LENGTH = 17
+
+/** 32 位 FNV-1a（同步、确定性；与 cache/store.ts 的超长路径折叠同一模式）。 */
+function fnv1a32(input: string, seed: number): number {
+  let hash = seed >>> 0
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i)
+    hash = Math.imul(hash, 0x01000193) >>> 0
+  }
+  return hash >>> 0
+}
+
+/**
  * fs 读操作的 singleflight 去重键。
  *
  * 组成：操作名 + 存储 id + 存储修订号 + 虚拟路径。
@@ -1511,15 +1416,30 @@ function toCacheTarget(resolved: any): CacheTarget | null {
  *
  * 该键同时用于进程内（L1）与数据库表（L2）两级去重，因此必须稳定可复现：
  * 绝不能包含时间戳、随机数、用户对象等每次调用都不同的内容。
+ *
+ * F-082：键超长（MySQL 主键列 VARCHAR(768)，virtualPath 用户可控）时做
+ * 确定性折叠——截断前缀 + 追加整键的双 FNV-1a 64 位摘要。同一输入永远得到
+ * 同一键（L2 去重依赖可复现性）；不同路径截断前缀相同也几乎必然得到不同
+ * 摘要，不会互撞。JS 字符串长度按 UTF-16 计，恒 ≥ MySQL 字符数，故以
+ * 字符长度封顶即可保证不超列宽。
  */
-function fsSingleflightKey(
+export function fsSingleflightKey(
   op: string,
   resolved: any,
   virtualPath: string,
 ): string {
   const storageId = resolved?.storage?.id ?? "virtual"
   const revision = resolved?.storage?.modified ?? ""
-  return `${op}:${storageId}:${revision}:${virtualPath}`
+  const raw = `${op}:${storageId}:${revision}:${virtualPath}`
+  if (raw.length <= SINGLEFLIGHT_KEY_MAX_LENGTH) return raw
+  const folded = raw.slice(
+    0,
+    SINGLEFLIGHT_KEY_MAX_LENGTH - SINGLEFLIGHT_KEY_FOLD_SUFFIX_LENGTH,
+  )
+  const digest =
+    fnv1a32(raw, 0x811c9dc5).toString(16).padStart(8, "0") +
+    fnv1a32(raw, 0x9e3779b9).toString(16).padStart(8, "0")
+  return `${folded}#${digest}`
 }
 
 export async function listItems(
@@ -1747,7 +1667,13 @@ async function getItemResolved(
   if (!item) {
     const driver = await getDriver(driverName, resolved.storage)
     try {
-      item = await driver.get(virtualPath, resolved.physical!)
+      // F-405：CDN 防盗链签名驱动（bunny_storage）需要客户端 IP 参与
+      // token 计算；未提供时驱动按无 IP 行为签名，其它驱动忽略第三参。
+      const clientIp = requestContext?.clientIp
+      item =
+        clientIp && clientIp !== "unknown"
+          ? await driver.get(virtualPath, resolved.physical!, clientIp)
+          : await driver.get(virtualPath, resolved.physical!)
     } finally {
       await flushPendingDriverState(
         driverName,
@@ -1805,6 +1731,14 @@ export async function renameItem(
   await assertMetaWritable(virtualPath, requestContext)
   assertItemName(newName)
   assertWithinUserRoot(virtualPath, requestContext)
+  // F-186：同名 rename 必须是 no-op。R2/S3 的 rename 是 copy-then-delete
+  // （copyObject(src,dst) 后 delete(src)），src===dst 时先覆盖自身再把对象
+  // 删掉；目录同名 rename 还会删光源前缀下的所有顶层对象。按 resolvePath
+  // 的同一套解码视图比较，避免 `%20` 之类的编码差异绕过。
+  const currentName = virtualPath.slice(virtualPath.lastIndexOf("/") + 1)
+  if (decodePathFully(currentName) === decodePathFully(newName)) {
+    return
+  }
   const resolved = await resolvePath(virtualPath, requestContext?.env)
   if (resolved.isVirtual) {
     throw new Error("failed get storage: storage not found")
@@ -1862,8 +1796,17 @@ export async function moveItems(
   names: string[],
   requestContext?: StorageRequestContext,
 ): Promise<void> {
+  // F-186：目标目录等于源目录时 move 必须是 no-op（WebDAV 同路径 MOVE、
+  // 客户端重放都会命中）。R2/S3 的 move 同样是 copy-then-delete，
+  // src===dst 会先覆盖自身再把对象删掉。尾部斜杠视为同一目录。
+  const normalizeDir = (dir: string): string => {
+    const decoded = decodePathFully(dir)
+    return decoded.length > 1 ? decoded.replace(/\/+$/, "") : decoded
+  }
+  const sameDir = normalizeDir(srcDir) === normalizeDir(dstDir)
   for (const name of names) {
     assertItemName(name)
+    if (sameDir) continue
     const srcVirtual = `${srcDir}/${name}`
     const dstVirtual = `${dstDir}/${name}`
     await assertMetaWritable(srcVirtual, requestContext)
@@ -1884,6 +1827,28 @@ export async function moveItems(
       srcResolved.storage!.driver,
       srcResolved.storage,
     )
+    // F-186 加固（复核建议）：目录 move 进自身子树是 copy-then-delete 的另一个
+    // 破坏性场景 —— R2/S3 的目录 move 是 copyDirRecursive 后 removeDirRecursive，
+    // 目标落在源子树内时刚复制出的内容会被源前缀删除连带清掉。仅当目标解析路径
+    // 落在源项路径之下才需要甄别：文件移动即使目标键在源键前缀下也无害（delete
+    // 只删精确键），用 driver.get 探测源项是否为目录；探测失败不阻断（随后
+    // driver.move 自身会报源不存在）。解析后同一路径（如「/a」与「/a/../a」，
+    // 逃过上面的字面 sameDir 比较）按 no-op 跳过。
+    if (dstResolved.cleanPath === srcResolved.cleanPath) continue
+    if (dstResolved.cleanPath.startsWith(`${srcResolved.cleanPath}/`)) {
+      let sourceIsDir = false
+      try {
+        const probe = await driver.get(srcVirtual, srcResolved.physical!)
+        sourceIsDir = !!probe?.is_dir
+      } catch {
+        // 探测失败按非目录放行：真正的源缺失由 driver.move 报错
+      }
+      if (sourceIsDir) {
+        throw new Error(
+          "failed to move: cannot move a directory into its own subtree",
+        )
+      }
+    }
     try {
       await driver.move(
         srcDir,

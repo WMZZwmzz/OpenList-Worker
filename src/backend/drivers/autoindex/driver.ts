@@ -155,6 +155,48 @@ export class AutoIndexDriver implements StorageDriver {
     return sortFileItems(items, "name", "asc")
   }
 
+  /**
+   * 探测远端 URL 的元信息（F-381）。
+   *
+   * 先用 HEAD（不取正文）；服务端不支持 HEAD（405/501）或返回其它非 404
+   * 失败时，退化为 `Range: bytes=0-0` 的 GET 探测，随即取消正文流。
+   */
+  private async probe(
+    url: string,
+  ): Promise<{ ok: boolean; status: number; isHtml: boolean; size: number }> {
+    const isHtmlType = (v: string | null) => (v || "").includes("text/html")
+    const head = await fetch(url, {
+      method: "HEAD",
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    })
+    if (head.ok || head.status === 404) {
+      return {
+        ok: head.ok,
+        status: head.status,
+        isHtml: isHtmlType(head.headers.get("content-type")),
+        size: Number(head.headers.get("content-length") || "0") || 0,
+      }
+    }
+    const res = await fetch(url, {
+      headers: { Range: "bytes=0-0" },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    })
+    try {
+      await res.body?.cancel()
+    } catch {}
+    const total = Number(
+      (res.headers.get("content-range") || "").split("/").pop() ||
+        res.headers.get("content-length") ||
+        "0",
+    )
+    return {
+      ok: res.ok,
+      status: res.status,
+      isHtml: isHtmlType(res.headers.get("content-type")),
+      size: Number.isFinite(total) ? total : 0,
+    }
+  }
+
   async get(virtualPath: string, physicalPath: string): Promise<FileItem> {
     const rel = this.cleanRel(physicalPath)
     const name = rel.split("/").filter(Boolean).pop() || "root"
@@ -165,22 +207,68 @@ export class AutoIndexDriver implements StorageDriver {
         size: 0,
         is_dir: true,
         modified: new Date().toISOString(),
-        sign: this.addition.url,
+        sign: "",
         type: 1,
+        raw_url: "",
       }
     }
 
-    // 静态服务：文件 URL 即 根 URL + 相对路径
-    const fullURL = this.addition.url + rel
-    return {
-      name,
-      size: 0,
-      is_dir: false,
-      modified: new Date().toISOString(),
-      sign: fullURL,
-      type: calcFileType(name, false),
-      raw_url: fullURL,
+    // 静态服务：条目 URL 即 根 URL + 相对路径，目录另有带尾斜杠的形式。
+    const fileURL = this.addition.url + rel
+    const dirURL = fileURL + "/"
+    const fileProbe = await this.probe(fileURL)
+
+    // 目录：目录 URL（带尾斜杠）能取到 HTML 索引页。仅凭 text/html 不够
+    // ——真正的 .html 文件也是 text/html，必须再确认带尾斜杠的形式存在。
+    const isDirectoryProbe = async (ok: boolean, isHtml: boolean) => {
+      if (!isHtml) return false
+      const dirProbe = await this.probe(dirURL)
+      return dirProbe.ok && dirProbe.isHtml
     }
+
+    if (fileProbe.ok && (await isDirectoryProbe(true, fileProbe.isHtml))) {
+      return {
+        name,
+        size: 0,
+        is_dir: true,
+        modified: new Date().toISOString(),
+        sign: "",
+        type: 1,
+        raw_url: "",
+      }
+    }
+    if (fileProbe.ok) {
+      return {
+        name,
+        size: fileProbe.size,
+        is_dir: false,
+        modified: new Date().toISOString(),
+        sign: "",
+        type: calcFileType(name, false),
+        raw_url: fileURL,
+      }
+    }
+
+    // 裸路径 404 时再探一次带尾斜杠的目录形式（部分静态服务不做重定向）
+    const dirProbe = await this.probe(dirURL)
+    if (dirProbe.ok && dirProbe.isHtml) {
+      return {
+        name,
+        size: 0,
+        is_dir: true,
+        modified: new Date().toISOString(),
+        sign: "",
+        type: 1,
+        raw_url: "",
+      }
+    }
+
+    if (fileProbe.status === 404 || dirProbe.status === 404) {
+      throw new Error(`[AutoIndex] object not found: ${rel}`)
+    }
+    throw new Error(
+      `[AutoIndex] failed to stat ${fileURL}: HTTP ${fileProbe.status}`,
+    )
   }
 
   async mkdir(virtualPath: string, physicalPath: string): Promise<void> {

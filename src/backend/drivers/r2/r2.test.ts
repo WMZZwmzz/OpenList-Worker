@@ -88,11 +88,14 @@ class MockR2Bucket implements R2BucketLike {
 
   async put(
     key: string,
-    value: Uint8Array | ArrayBuffer | string | null,
+    value: any,
     options?: { httpMetadata?: { contentType?: string } },
   ): Promise<R2ObjectLike> {
     let bytes: Uint8Array
-    if (value instanceof Uint8Array) {
+    if (value instanceof ReadableStream) {
+      // F-189：驱动改为流式 put，mock 必须真实消费流
+      bytes = new Uint8Array(await new Response(value).arrayBuffer())
+    } else if (value instanceof Uint8Array) {
       bytes = new Uint8Array(value)
     } else if (value instanceof ArrayBuffer) {
       bytes = new Uint8Array(value)
@@ -473,6 +476,54 @@ test("getDriver 路由：Cloudflare R2 与各别名均命中 R2Driver（S3 不�
   resetEnv()
 })
 
+test("F-185：目录 copy/rename/move/remove 递归处理嵌套子目录", async () => {
+  resetEnv()
+  const bucket = new MockR2Bucket()
+  // 强制逐条翻页，同时覆盖无 delimiter 全量列举的 cursor 跟随
+  bucket.pageSize = 1
+  bucket.delimiterPageSize = 1
+  setEnvCtx({ R2: bucket })
+  const driver = new R2Driver({ bucket_binding: "R2" })
+
+  const text = (key: string) =>
+    new TextDecoder().decode(bucket.objects.get(key)?.body)
+  const keysUnder = (prefix: string) =>
+    [...bucket.objects.keys()].filter((k) => k.startsWith(prefix))
+
+  await bucket.put("src/top.txt", "top")
+  await bucket.put("src/sub/deep.txt", "deep")
+  await bucket.put("src/sub/deeper/leaf.txt", "leaf")
+
+  // 1) copy：子目录内容必须一起复制
+  await driver.copy("/src", "/cp", ["src"], "/src", "/cp")
+  assert.equal(text("cp/top.txt"), "top")
+  assert.equal(text("cp/sub/deep.txt"), "deep", "一级子目录必须被复制")
+  assert.equal(
+    text("cp/sub/deeper/leaf.txt"),
+    "leaf",
+    "二级子目录必须被复制",
+  )
+  assert.equal(keysUnder("src/").length, 3, "copy 不得删除源")
+
+  // 2) move（rename 走同一条 moveKey 路径）：目标补全 + 源不留孤儿
+  await driver.move("/src", "/moved", ["src"], "/src", "/moved")
+  assert.deepEqual(keysUnder("src/"), [], "move 后源前缀下不得残留任何对象")
+  assert.equal(text("moved/sub/deep.txt"), "deep")
+  assert.equal(text("moved/sub/deeper/leaf.txt"), "leaf")
+
+  // 3) rename：目录改名同样递归
+  await driver.rename("/moved", "/moved", "renamed")
+  assert.deepEqual(keysUnder("moved/"), [], "rename 后旧前缀必须清空")
+  assert.equal(text("renamed/sub/deeper/leaf.txt"), "leaf")
+
+  // 4) remove：嵌套对象必须全部删除（否则目录仍会被 probePrefix 判为存在）
+  await driver.remove("/renamed", "/renamed", ["renamed"])
+  assert.deepEqual(keysUnder("renamed/"), [], "remove 必须删除嵌套子目录内容")
+  await assert.rejects(() => driver.get("/renamed", "/renamed"), /not found/)
+
+  resetEnv()
+})
+
 test("驱动名归一：Cloudflare R2 的写法都指向它，S3 家族不受影响", () => {
   // 与 server/admin.ts 的 normalizeDriver 保持一致（后台表单与存储保存都走它）
   assert.equal(normalizeDriver("Cloudflare R2"), "Cloudflare R2")
@@ -518,5 +569,84 @@ test("r2CanSignDirectUpload：只有 api 模式可签发预签名直传", () => 
     r2CanSignDirectUpload({ mode: "binding", bucket_binding: "R2" }),
     false,
   )
+  resetEnv()
+})
+
+test("F-191：custom_host 归一化时 trim（前导空格不得生成非法直链）", () => {
+  const norm = normalizeR2Addition({
+    custom_host: "  https://cdn.example.com  ",
+  })
+  assert.equal(norm.custom_host, "https://cdn.example.com")
+})
+
+test("F-188/F-190：binding + custom_host 直链逐段编码，且不剥真实目录名", async () => {
+  resetEnv()
+  const bucket = new MockR2Bucket()
+  await bucket.put("media/2024/a#b c.txt", "x")
+  setEnvCtx({ R2: bucket })
+
+  // bucket 与对象首段同名 + remove_bucket：binding 模式下路径不含桶名前缀，
+  // 不得剥掉 "media"（F-190）；# 与空格必须编码（F-188）。
+  const driver = new R2Driver({
+    bucket_binding: "R2",
+    bucket: "media",
+    custom_host: "https://cdn.example.com/",
+    remove_bucket: true,
+  })
+  const item = await driver.get("/media/2024/a#b c.txt", "/media/2024/a#b c.txt")
+  assert.ok(item.raw_url, "custom_host 存在时必须返回直链")
+  const parsed = new URL(item.raw_url!)
+  assert.equal(parsed.host, "cdn.example.com")
+  assert.equal(parsed.hash, "", "# 之后的内容不得变成 fragment")
+  assert.equal(parsed.pathname, "/media/2024/a%23b%20c.txt")
+  resetEnv()
+})
+
+test("F-189：copy/rename 用流式 body（不再 arrayBuffer 全量缓冲）", async () => {
+  resetEnv()
+  const bucket = new MockR2Bucket()
+  setEnvCtx({ R2: bucket })
+  const driver = new R2Driver({ bucket_binding: "R2" })
+
+  let arrayBufferCalls = 0
+  const originalGet = bucket.get.bind(bucket)
+  bucket.get = (async (key: string, opts?: any) => {
+    const obj = await originalGet(key, opts)
+    if (obj) {
+      obj.arrayBuffer = async () => {
+        arrayBufferCalls++
+        return new ArrayBuffer(0)
+      }
+    }
+    return obj
+  }) as any
+
+  await bucket.put("big.bin", new Uint8Array(1024 * 64))
+  await driver.rename("/big.bin", "/big.bin", "copied.bin")
+  assert.equal(
+    arrayBufferCalls,
+    0,
+    "copyObject 必须直传 ReadableStream，不得调用 arrayBuffer()",
+  )
+  assert.equal(bucket.objects.get("copied.bin")!.body.byteLength, 1024 * 64)
+  resetEnv()
+})
+
+test("F-187：api 模式可签发直传 URL（不再抛 Direct upload is not enabled）", async () => {
+  resetEnv()
+  const driver = new R2Driver({
+    mode: "auto",
+    account_id: "acc",
+    bucket: "mybucket",
+    access_key_id: "k",
+    secret_access_key: "s",
+  })
+  const info = await driver.getDirectUploadInfo("/dir", "up.txt")
+  assert.equal(info.method, "PUT")
+  assert.ok(
+    info.upload_url.startsWith("https://mybucket.acc.r2.cloudflarestorage.com/"),
+    `upload_url 主机错误: ${info.upload_url}`,
+  )
+  assert.ok(info.upload_url.includes("X-Amz-Signature="))
   resetEnv()
 })

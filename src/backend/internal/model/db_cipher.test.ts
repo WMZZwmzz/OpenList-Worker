@@ -98,9 +98,9 @@ const rawStored = (env: any) => mapFormat.load(memoryDriver, env)
 
 // ─── 配置解析 ────────────────────────────────────────────────────────────────
 
-test("readCipher：默认 none，别名可用，非法值回退 none", () => {
-  assert.equal(readCipher({}), "none", "缺省必须为 none（默认不加密）")
-  assert.equal(readCipher({ DB_CIPHER: "" }), "none")
+test("readCipher：默认 aes-256-gcm，别名可用，非法值拒绝启动（S-01）", () => {
+  assert.equal(readCipher({}), "aes-256-gcm", "缺省必须为 aes-256-gcm（S-01）")
+  assert.equal(readCipher({ DB_CIPHER: "" }), "aes-256-gcm")
   assert.equal(readCipher({ DB_CIPHER: "  none  " }), "none")
   assert.equal(readCipher({ DB_CIPHER: "off" }), "none")
 
@@ -125,8 +125,8 @@ test("readCipher：默认 none，别名可用，非法值回退 none", () => {
   assert.equal(readCipher({ ...insecure, DB_CIPHER: "3des" }), "3des-cbc-hmac")
   assert.equal(readCipher({ ...insecure, DB_CIPHER: "v6" }), "3des-cbc-hmac")
 
-  // 拼错不得静默启用某个算法
-  assert.equal(readCipher({ DB_CIPHER: "rot13" }), "none")
+  // 拼错必须 fail-closed：拒绝启动而不是降级（S-01）
+  assert.throws(() => readCipher({ DB_CIPHER: "rot13" }))
   assert.equal(resolveDbCipher("rot13").known, false)
   assert.equal(resolveDbCipher("aes-256-gcm").known, true)
 
@@ -250,10 +250,37 @@ test("v3 为 Encrypt-then-MAC：篡改密文必须被完整性校验拦下", asy
 
 // ─── 持久化边界 ──────────────────────────────────────────────────────────────
 
-test("DB_CIPHER 缺省：敏感字段明文落盘（默认不加密）", async () => {
+test("DB_CIPHER 缺省：敏感字段默认加密落盘，读回自动解密（S-01）", async () => {
   const db = await import("./db")
   db.__resetDbCacheForTest()
-  const env = envFor() // 不设置 DB_CIPHER
+  const env = envFor() // 不设置 DB_CIPHER → 默认 aes-256-gcm
+
+  assert.equal(await db.saveDb(sampleDb(), env, { force: true }), true)
+
+  const raw: any = await rawStored(env)
+  for (const sealed of [
+    rawUser(raw).password,
+    rawUser(raw).otp_secret,
+    rawSetting(raw, "token").value,
+    raw.storages[0].addition,
+  ]) {
+    assert.equal(
+      detectCipherPrefix(sealed)?.cipher,
+      "aes-256-gcm",
+      "缺省必须落盘为 v2 密文（S-01）",
+    )
+  }
+
+  // 读回为明文
+  db.__resetDbCacheForTest()
+  const loaded: any = await db.getDb(env)
+  assert.equal(rawUser(loaded).password, "hash-abc")
+})
+
+test("DB_CIPHER=none（显式关闭）：敏感字段明文落盘", async () => {
+  const db = await import("./db")
+  db.__resetDbCacheForTest()
+  const env = envFor("none")
 
   assert.equal(await db.saveDb(sampleDb(), env, { force: true }), true)
 
@@ -268,6 +295,27 @@ test("DB_CIPHER 缺省：敏感字段明文落盘（默认不加密）", async (
   db.__resetDbCacheForTest()
   const loaded: any = await db.getDb(env)
   assert.equal(rawUser(loaded).password, "hash-abc")
+})
+
+test("历史明文库在缺省（aes-256-gcm）下读取正常，下次保存自动加密迁移", async () => {
+  const db = await import("./db")
+  db.__resetDbCacheForTest()
+  // 先以显式 none 落一份明文库（模拟 S-01 之前的既有部署）
+  const plainEnv = envFor("none")
+  assert.equal(await db.saveDb(sampleDb(), plainEnv, { force: true }), true)
+  const plaintextRaw: any = await rawStored(plainEnv)
+  assert.equal(isSealedCiphertext(plaintextRaw.users[0].password), false)
+
+  // 升级后不设置 DB_CIPHER（缺省 aes-256-gcm）：明文读取不受影响
+  const defaultEnv = envFor()
+  db.__resetDbCacheForTest()
+  const loaded: any = await db.getDb(defaultEnv)
+  assert.equal(rawUser(loaded).password, "hash-abc")
+
+  // 下一次保存 → 自动迁移为密文
+  assert.equal(await db.saveDb(loaded, defaultEnv), true)
+  const raw: any = await rawStored(defaultEnv)
+  assert.equal(detectCipherPrefix(rawUser(raw).password)?.cipher, "aes-256-gcm")
 })
 
 test("DB_CIPHER 非 none：敏感字段按所选算法落盘，读回自动解密", async () => {
@@ -307,7 +355,7 @@ test("DB_CIPHER 非 none：敏感字段按所选算法落盘，读回自动解�
 test("旧部署迁移：DB_CIPHER=none 仍能读加密数据，并在下次保存转为明文", async () => {
   const db = await import("./db")
 
-  // 1) 模拟 #69 的既有部署：DB_CIPHER 未配置时期望写入 v2 密文
+  // 1) 模拟既有部署：以 v2 写入密文
   const legacyEnv = envFor("aes-256-gcm")
   db.__resetDbCacheForTest()
   assert.equal(await db.saveDb(sampleDb(), legacyEnv, { force: true }), true)
@@ -318,8 +366,8 @@ test("旧部署迁移：DB_CIPHER=none 仍能读加密数据，并在下次保�
     "aes-256-gcm",
   )
 
-  // 2) 升级后默认 DB_CIPHER=none：同一份存储必须仍可解密（否则登录直接坏掉）
-  const plainEnv = envFor()
+  // 2) 显式关闭加密（DB_CIPHER=none）：同一份存储必须仍可解密（否则登录直接坏掉）
+  const plainEnv = envFor("none")
   db.__resetDbCacheForTest()
   const loaded: any = await db.getDb(plainEnv)
   assert.equal(rawUser(loaded).password, "hash-abc", "关掉加密后旧密文必须仍能解开")

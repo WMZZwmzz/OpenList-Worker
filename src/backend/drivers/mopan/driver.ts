@@ -19,9 +19,15 @@ import {
   TaskTypeMove,
   TaskStatusCompleted,
   TaskStatusConflict,
+  TaskStatusFailed,
   createDefaultDeviceInfo,
 } from "./consts"
-import { createHash } from "crypto"
+import { md5 } from "../../pkg/crypto"
+
+/** 列表/按名查找统一使用的页大小（F-246：请求与终止判据同源） */
+const PAGE_SIZE = 100
+/** 分页硬上限，避免服务端忽略 pageNum 时无限循环（F-246） */
+const MAX_PAGES = 1000
 
 function parseMoPanDate(dateStr: string): string {
   if (!dateStr) return new Date().toISOString()
@@ -79,18 +85,22 @@ export class MoPanDriver implements StorageDriver {
   private addition: MoPanAddition
   private userId: string = ""
   private uploadThread: number = 3
+  /** F-244：进行中的登录 Promise，用于合并并发 401 触发的重复登录 */
+  private loginInFlight: Promise<void> | null = null
 
   constructor(
     addition: MoPanAddition,
     onAuthUpdate?: (deviceInfo: string, token: string) => void,
   ) {
     this.addition = normalizeMoPanAddition(addition)
-    this.uploadThread = parseInt(this.addition.upload_thread || "3")
+    // F-250：parseInt("abc") 得 NaN，NaN<1 与 NaN>32 均为 false，旧校验会被绕过
+    const parsedThread = parseInt(this.addition.upload_thread || "3", 10)
+    this.uploadThread = Number.isFinite(parsedThread) ? parsedThread : 3
     if (this.uploadThread < 1 || this.uploadThread > 32) {
       this.uploadThread = 3
     }
 
-    this.client = new MoPanClient(this.addition, async (err) => {
+    this.client = new MoPanClient(this.addition, async () => {
       // Re-login on authorization expired
       await this.performLogin()
       if (onAuthUpdate) {
@@ -102,32 +112,77 @@ export class MoPanDriver implements StorageDriver {
     })
   }
 
-  private async performLogin(): Promise<void> {
-    const smsCode = this.addition.sms_code?.trim() || ""
-
-    if (smsCode === "send") {
-      await this.client.loginBySms(this.addition.phone)
-      throw new Error("[MoPan] SMS code sent, please enter the code")
+  /**
+   * F-244：并发 401 只触发一次重新登录（进程内 singleflight）。
+   * 登录期间关闭客户端的 401 自动重登录，避免登录接口自身返回 401 时
+   * 形成 performLogin → 401 → performLogin 的无界递归。
+   */
+  private performLogin(): Promise<void> {
+    if (!this.loginInFlight) {
+      this.loginInFlight = this.doPerformLogin().finally(() => {
+        this.loginInFlight = null
+      })
     }
+    return this.loginInFlight
+  }
 
-    let loginData
-    if (smsCode && smsCode !== "send") {
-      loginData = await this.client.loginBySmsStep2(
-        this.addition.phone,
-        smsCode,
-      )
-    } else {
-      loginData = await this.client.login(
-        this.addition.phone,
-        this.addition.password,
-      )
+  private async doPerformLogin(): Promise<void> {
+    this.client.setAutoRelogin(false)
+    try {
+      // F-248：优先复用 onAuthUpdate 持久化的 token，避免每次冷构建都做
+      // 完整账密/短信登录。
+      const savedToken = String(this.addition.token || "").trim()
+      if (savedToken && (await this.tryRestoreSession(savedToken))) return
+
+      const smsCode = this.addition.sms_code?.trim() || ""
+
+      if (smsCode === "send") {
+        await this.client.loginBySms(this.addition.phone)
+        throw new Error("[MoPan] SMS code sent, please enter the code")
+      }
+
+      let loginData
+      if (smsCode && smsCode !== "send") {
+        loginData = await this.client.loginBySmsStep2(
+          this.addition.phone,
+          smsCode,
+        )
+      } else {
+        loginData = await this.client.login(
+          this.addition.phone,
+          this.addition.password,
+        )
+      }
+
+      this.client.setAuthorization(loginData.token)
+      const userInfo = await this.client.getUserInfo(false)
+      this.userId = userInfo.userID
+      this.applyLoginData(loginData)
+    } finally {
+      this.client.setAutoRelogin(true)
     }
+  }
 
-    this.client.setAuthorization(loginData.token)
+  /**
+   * 用持久化 token 试探会话是否仍然有效（不触发自动重登录）。
+   * 成功返回 true。
+   */
+  private async tryRestoreSession(token: string): Promise<boolean> {
+    try {
+      this.client.setAuthorization(token)
+      const userInfo = await this.client.getUserInfo(false)
+      if (!userInfo?.userID) return false
+      this.userId = userInfo.userID
+      return true
+    } catch {
+      return false
+    }
+  }
 
-    const userInfo = await this.client.getUserInfo()
-    this.userId = userInfo.userID
-
+  private applyLoginData(loginData: {
+    token: string
+    userCloudStorageRelations?: Array<{ folderID: string; path: string }>
+  }): void {
     // Auto-detect root folder if not set
     if (!this.addition.root_folder_id && loginData.userCloudStorageRelations) {
       for (const rel of loginData.userCloudStorageRelations) {
@@ -148,13 +203,14 @@ export class MoPanDriver implements StorageDriver {
     const files: FileItem[] = []
 
     // Paginated listing
-    for (let page = 1; ; page++) {
+    for (let page = 1; page <= MAX_PAGES; page++) {
       const data = await this.client.queryFiles(
         folderId,
         page,
         this.addition.order_by || "filename",
         this.addition.order_direction === "desc",
         this.addition.cloud_id,
+        PAGE_SIZE,
       )
 
       if (!data.fileListAO) break
@@ -167,7 +223,7 @@ export class MoPanDriver implements StorageDriver {
       files.push(...fileList.map(mopanFileToFileItem))
 
       // Stop if we got less than a full page
-      if (folderList.length + fileList.length < 100) break
+      if (folderList.length + fileList.length < PAGE_SIZE) break
     }
 
     return sortFileItems(
@@ -197,38 +253,57 @@ export class MoPanDriver implements StorageDriver {
     const name = parts[parts.length - 1]
     const parentId = await this.resolveFolderId(parentPath)
 
-    // Search in parent folder
-    const data = await this.client.queryFiles(
-      parentId,
-      1,
-      "filename",
-      false,
-      this.addition.cloud_id,
-    )
+    // Search in parent folder (F-247: 逐页查找，不再只看第一页)
+    const { folder, file } = await this.findInFolder(parentId, name)
+    if (folder) return mopanFolderToFileItem(folder)
 
-    if (data.fileListAO) {
-      const folder = data.fileListAO.folderList?.find((f) => f.name === name)
-      if (folder) return mopanFolderToFileItem(folder)
-
-      const file = data.fileListAO.fileList?.find((f) => f.name === name)
-      if (file) {
-        const item = mopanFileToFileItem(file)
-        // Get download URL
-        const dlResp = await this.client
-          .getFileDownloadUrl(file.id, this.addition.cloud_id)
-          .catch(() => null)
-        if (dlResp?.downloadUrl) {
-          let url = dlResp.downloadUrl.replace(/&amp;/g, "&")
-          url = url.replace(/^http:/, "https:")
-          // Follow redirect to get actual URL
-          const redirectUrl = await this.followRedirect(url)
-          item.raw_url = redirectUrl || url
-        }
-        return item
+    if (file) {
+      const item = mopanFileToFileItem(file)
+      // Get download URL
+      const dlResp = await this.client
+        .getFileDownloadUrl(file.id, this.addition.cloud_id)
+        .catch(() => null)
+      if (dlResp?.downloadUrl) {
+        let url = dlResp.downloadUrl.replace(/&amp;/g, "&")
+        url = url.replace(/^http:/, "https:")
+        // Follow redirect to get actual URL
+        const redirectUrl = await this.followRedirect(url)
+        item.raw_url = redirectUrl || url
       }
+      return item
     }
 
     throw new Error(`[MoPan] File not found: ${physicalPath}`)
+  }
+
+  /**
+   * 在指定目录中按名称查找子目录/文件（逐页翻找，F-247）。
+   */
+  private async findInFolder(
+    folderId: string,
+    name: string,
+  ): Promise<{ folder?: MoPanFolder; file?: MoPanFile }> {
+    for (let page = 1; page <= MAX_PAGES; page++) {
+      const data = await this.client.queryFiles(
+        folderId,
+        page,
+        "filename",
+        false,
+        this.addition.cloud_id,
+        PAGE_SIZE,
+      )
+      if (!data.fileListAO) break
+
+      const { folderList = [], fileList = [] } = data.fileListAO
+
+      const folder = folderList.find((f) => f.name === name)
+      if (folder) return { folder }
+      const file = fileList.find((f) => f.name === name)
+      if (file) return { file }
+
+      if (folderList.length + fileList.length < PAGE_SIZE) break
+    }
+    return {}
   }
 
   private async followRedirect(url: string): Promise<string | null> {
@@ -270,6 +345,24 @@ export class MoPanDriver implements StorageDriver {
     }
   }
 
+  /**
+   * F-252：srcPhys/dstPhys 的语义（「目标项自身的物理路径，不再拼 names」）
+   * 只由驱动侧注释维系，接口层（StorageDriver）没有约束。这里用 names[0]
+   * 做一次运行时自检：末段与目标名一致 → 按「项路径」取父目录；不一致 →
+   * 按「目标文件夹本身」处理，避免两种解读下把文件搬到祖父目录。
+   */
+  private async resolveTargetFolderId(
+    dstPhys: string,
+    names: string[],
+  ): Promise<string> {
+    const segs = String(dstPhys || "").split("/").filter(Boolean)
+    const name = names?.[0] || ""
+    if (!name || (segs.length > 0 && segs[segs.length - 1] === name)) {
+      segs.pop()
+    }
+    return this.resolveFolderId(segs.join("/"))
+  }
+
   async move(
     srcDir: string,
     dstDir: string,
@@ -281,8 +374,7 @@ export class MoPanDriver implements StorageDriver {
     // 参数即目标项路径，不得再拼 name，否则指向 `<item>/<name>` 这种不存在的路径。
     // 目标文件夹取 dstPhys 去掉末段后的父目录。
     const srcItem = await this.get(srcDir, srcPhys)
-    const dstFolderPath = dstPhys.split("/").slice(0, -1).join("/")
-    const dstFolderId = await this.resolveFolderId(dstFolderPath)
+    const dstFolderId = await this.resolveTargetFolderId(dstPhys, names)
 
     await this.performBatchTask(srcItem, dstFolderId, TaskTypeMove)
   }
@@ -296,8 +388,7 @@ export class MoPanDriver implements StorageDriver {
   ): Promise<void> {
     // 同 move：srcPhys/dstPhys 已是目标项自身路径，参数即目标项路径，不得再拼 name。
     const srcItem = await this.get(srcDir, srcPhys)
-    const dstFolderPath = dstPhys.split("/").slice(0, -1).join("/")
-    const dstFolderId = await this.resolveFolderId(dstFolderPath)
+    const dstFolderId = await this.resolveTargetFolderId(dstPhys, names)
 
     await this.performBatchTask(srcItem, dstFolderId, TaskTypeCopy)
   }
@@ -333,10 +424,17 @@ export class MoPanDriver implements StorageDriver {
 
     const task = await this.client.addBatchTask(taskParam)
 
+    // F-249：taskIDList 为空时 taskId 会是 undefined，请求体里字段被
+    // JSON.stringify 丢弃，产生语义不明的错误。这里直接报「任务未创建」。
+    const taskId = task?.taskIDList?.[0]
+    if (!taskId) {
+      throw new Error("[MoPan] Task was not created (empty taskIDList)")
+    }
+
     // Poll task status
     for (let i = 0; i < 10; i++) {
       const stat = await this.client.checkBatchTask({
-        taskId: task.taskIDList[0],
+        taskId,
         taskType: task.taskType,
         targetType: 1,
         targetFolderID: task.targetFolderID,
@@ -347,6 +445,11 @@ export class MoPanDriver implements StorageDriver {
       if (stat.taskStatus === TaskStatusConflict) {
         await this.client.cancelBatchTask(stat.taskID, task.taskType)
         throw new Error("[MoPan] File name conflict")
+      }
+
+      // F-249：失败终态立即报错，不再空转 10 秒后报误导性的 timeout
+      if (stat.taskStatus === TaskStatusFailed) {
+        throw new Error(`[MoPan] Task ${taskId} failed`)
       }
 
       if (stat.taskStatus === TaskStatusCompleted) {
@@ -385,7 +488,7 @@ export class MoPanDriver implements StorageDriver {
     const parentId = await this.resolveFolderId(parentPath)
 
     const fileBuffer = content
-    const fileMd5 = createHash("md5").update(fileBuffer).digest("hex")
+    const fileMd5 = md5(fileBuffer)
     const totalSize = content.length
 
     // Init multi-part upload
@@ -404,7 +507,7 @@ export class MoPanDriver implements StorageDriver {
         initData.partInfos,
       )
 
-      for (const part of uploadParts) {
+      const uploadPart = async (part: (typeof uploadParts)[number]) => {
         const start = (part.partNumber - 1) * initData.partSize
         const end =
           part.partNumber === uploadParts.length
@@ -412,13 +515,28 @@ export class MoPanDriver implements StorageDriver {
             : start + initData.partSize
         const chunk = fileBuffer.slice(start, end)
 
-        await fetch(part.uploadUrl, {
+        // F-245：分片 PUT 是上传链路唯一的数据校验点，非 2xx 必须立刻抛错，
+        // 不能让失败的片子被静默吞掉后照常 commit。
+        const res = await fetch(part.uploadUrl, {
           method: "PUT",
           body: chunk as unknown as BodyInit,
           headers: {
             "Content-Length": String(chunk.length),
           },
         })
+        if (!res.ok) {
+          const detail = await res.text().catch(() => "")
+          throw new Error(
+            `[MoPan] 上传分片 ${part.partNumber}/${uploadParts.length} 失败: HTTP ${res.status} ${detail.slice(0, 200)}`,
+          )
+        }
+      }
+
+      // F-250：按 upload_thread 做有限并发（此前配置被解析后从未使用）
+      for (let i = 0; i < uploadParts.length; i += this.uploadThread) {
+        await Promise.all(
+          uploadParts.slice(i, i + this.uploadThread).map(uploadPart),
+        )
       }
     }
 
@@ -441,15 +559,8 @@ export class MoPanDriver implements StorageDriver {
     let currentId = rootId
 
     for (const part of parts) {
-      const data = await this.client.queryFiles(
-        currentId,
-        1,
-        "filename",
-        false,
-        this.addition.cloud_id,
-      )
-
-      const folder = data.fileListAO?.folderList?.find((f) => f.name === part)
+      // F-247：逐页查找子目录，超一页的目录不再误报 Folder not found
+      const { folder } = await this.findInFolder(currentId, part)
       if (!folder) {
         throw new Error(`[MoPan] Folder not found: ${part}`)
       }

@@ -115,6 +115,71 @@ test("写前守卫：读取失败后，即使内存中有旧快照也不允许�
   )
 })
 
+test("F-070：后端解析失败时，saveDb 必须回滚内存并抛出约定的包装错误", async () => {
+  const db = await import("./db")
+  db.__resetDbCacheForTest()
+  // 用例结束必须把模块状态恢复原样：抛错 loader 与被改写的内存库都会串味到
+  // 后续用例（storeBackendLoader 是模块级的，__resetDbCacheForTest 会把它复位）。
+  try {
+    // 正常工作的桩后端：load/save 都成功，用于先建立「可信」内存状态。
+    const savedSnapshots: any[] = []
+    const goodBackend = {
+      name: "stub-ok",
+      isConfigured: async () => true,
+      load: async () =>
+        savedSnapshots.length > 0
+          ? JSON.parse(JSON.stringify(savedSnapshots[savedSnapshots.length - 1]))
+          : null,
+      save: async (data: any) => {
+        savedSnapshots.push(JSON.parse(JSON.stringify(data)))
+        return true
+      },
+    }
+    db.__setStoreBackendLoaderForTest(async () => goodBackend)
+
+    const realDb = {
+      settings: [{ key: "site_title", value: "OpenList" }],
+      users: [{ id: 1, username: "admin", role: 2, password: "hash" }],
+      storages: [{ id: 1, mount_path: "/onedrive", driver: "onedrive" }],
+      shares: [],
+      metas: [],
+      plugins: [],
+    }
+    assert.equal(await db.saveDb(realDb, freshEnv(), { force: true }), true)
+
+    // 换成「解析即抛错」的 loader（模拟 UNKNOWN_DRIVER / DRIVER_UNAVAILABLE 等
+    // 配置类错误：它们发生在 getStoreBackend / isConfigured 阶段）。
+    db.__setStoreBackendLoaderForTest(async () => {
+      throw new Error("DRIVER_UNAVAILABLE: backend resolution failed")
+    })
+
+    const env = freshEnv()
+    // 非空壳写入：必须抛出约定的包装错误（而不是裸的后端错误）。
+    const modified = {
+      ...realDb,
+      settings: [{ key: "site_title", value: "Changed" }],
+    }
+    await assert.rejects(
+      () => db.saveDb(modified, env),
+      (err: any) =>
+        String(err?.message || "").includes("[DB] Failed to persist config"),
+      "loader 抛错也必须被包装为「持久化失败」错误",
+    )
+
+    // 关键不变量：持久化失败后，失败的修改不得在内存/请求缓存中生效。
+    const after = await db.getDb(env)
+    assert.equal(
+      (after.settings || []).find((s: any) => s.key === "site_title")?.value,
+      "OpenList",
+      "持久化失败后 getDb() 必须读到回滚后的旧值",
+    )
+    // 后端从未收到这次失败的 save。
+    assert.equal(savedSnapshots.length, 1, "失败的写入不得触达后端")
+  } finally {
+    db.__resetDbCacheForTest()
+  }
+})
+
 test("不变量：读取（getDb）不得产生隐式写入", async () => {
   const db = await import("./db")
   const { memoryDriver } = await import("./store/driver/memory")

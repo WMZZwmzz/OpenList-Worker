@@ -325,6 +325,56 @@ test("readBodyWithinLimit 按实际字节数生效（省略 Content-Length 也�
   assert.equal(partTooLarge.ok, false)
 })
 
+test("F-057: readBodyWithinLimit 在读取过程中按实际字节数截断（chunked）", async () => {
+  // chunked（无 Content-Length）或谎报偏小 Content-Length 时，旧实现会先把
+  // 整个 body 读进内存再判上限；这里要求边读边累计、超限立即 cancel，
+  // 且绝不调用 arrayBuffer() 整体缓冲。
+  let cancelled = false
+  let arrayBufferCalled = false
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new Uint8Array(6))
+      controller.enqueue(new Uint8Array(6))
+      controller.enqueue(new Uint8Array(6))
+    },
+    cancel() {
+      cancelled = true
+    },
+  })
+  const ctx: any = {
+    env: { MAX_UPLOAD: "8" },
+    req: {
+      header: () => undefined,
+      raw: { body },
+      arrayBuffer: async () => {
+        arrayBufferCalled = true
+        return new ArrayBuffer(0)
+      },
+    },
+  }
+  const tooLarge = await readBodyWithinLimit(ctx, false)
+  assert.equal(tooLarge.ok, false)
+  if (!tooLarge.ok) assert.equal(tooLarge.limit, 8)
+  assert.equal(arrayBufferCalled, false, "不得先把整个 body 缓冲进内存")
+  assert.equal(cancelled, true, "超限必须取消读取流")
+
+  // 未超限的流式读取仍返回完整 buffer（保持返回契约）
+  const small = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode("1234"))
+      controller.enqueue(new TextEncoder().encode("5678"))
+      controller.close()
+    },
+  })
+  const okCtx: any = {
+    env: { MAX_UPLOAD: "8" },
+    req: { header: () => undefined, raw: { body: small } },
+  }
+  const ok = await readBodyWithinLimit(okCtx, false)
+  assert.equal(ok.ok, true)
+  if (ok.ok) assert.equal(ok.buffer.toString(), "12345678")
+})
+
 test("WebDAV: 受 meta 保护的路径返回带指引的 403（而不是裸 403）", async () => {
   const env: any = { JWT_SECRET: "test-only-jwt-secret-for-hardening" }
   const davUser: any = {

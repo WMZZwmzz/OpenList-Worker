@@ -41,6 +41,12 @@ export class MoPanClient {
   private authorization: string = ""
   private deviceInfo: DeviceInfo
   private onAuthorizationExpired?: (err: Error) => Promise<void>
+  /**
+   * F-244：登录流程自身禁止触发「重新登录」回调，否则登录接口返回 401
+   * 会形成 performLogin → 401 → performLogin 的无界递归。驱动在登录期间
+   * 关闭此开关，登录结束后恢复。
+   */
+  private autoReloginEnabled: boolean = true
 
   constructor(
     addition: MoPanAddition,
@@ -68,6 +74,11 @@ export class MoPanClient {
     this.authorization = token
   }
 
+  /** 是否允许 401 时自动重登录（F-244） */
+  setAutoRelogin(enabled: boolean): void {
+    this.autoReloginEnabled = enabled
+  }
+
   getAuthorization(): string {
     return this.authorization
   }
@@ -86,12 +97,13 @@ export class MoPanClient {
     retry: boolean = true,
   ): Promise<T> {
     const secretKey = generateSecretKey()
+    const secretKeyBytes = new TextEncoder().encode(secretKey)
 
     // Encrypt device info
     const remoteInfo = base64Encode(
       aesEncrypt(
-        Buffer.from(JSON.stringify(this.deviceInfo), "utf-8"),
-        Buffer.from(secretKey, "utf-8"),
+        new TextEncoder().encode(JSON.stringify(this.deviceInfo)),
+        secretKeyBytes,
       ),
     )
 
@@ -110,8 +122,8 @@ export class MoPanClient {
     if (data !== null) {
       const jsonData = JSON.stringify(data)
       const encrypted = aesEncrypt(
-        Buffer.from(jsonData, "utf-8"),
-        Buffer.from(secretKey, "utf-8"),
+        new TextEncoder().encode(jsonData),
+        secretKeyBytes,
       )
       body = base64Encode(encrypted)
     }
@@ -135,14 +147,19 @@ export class MoPanClient {
       respText = respText.slice(1, -1)
       const decrypted = aesDecrypt(
         base64Decode(respText),
-        Buffer.from(secretKey, "utf-8"),
+        secretKeyBytes,
       )
-      respText = decrypted.toString("utf-8")
+      respText = new TextDecoder().decode(decrypted)
     }
 
     const result: MoPanResponse<any> = JSON.parse(respText)
 
-    if (result.code === 401 && retry && this.onAuthorizationExpired) {
+    if (
+      result.code === 401 &&
+      retry &&
+      this.autoReloginEnabled &&
+      this.onAuthorizationExpired
+    ) {
       await this.onAuthorizationExpired(
         new Error("Authorization expired: " + result.message),
       )
@@ -163,14 +180,15 @@ export class MoPanClient {
       phone,
       password,
     }
-    return this.request<LoginResp>(MoPanProxyFamily + "/login", data)
+    // F-244：登录请求本身不再触发「重新登录」，切断 401 递归
+    return this.request<LoginResp>(MoPanProxyFamily + "/login", data, false)
   }
 
   async loginBySms(phone: string): Promise<void> {
     const data = {
       phone,
     }
-    await this.request(MoPanProxyFamily + "/sendSmsCode", data)
+    await this.request(MoPanProxyFamily + "/sendSmsCode", data, false)
   }
 
   async loginBySmsStep2(phone: string, smsCode: string): Promise<LoginResp> {
@@ -178,11 +196,15 @@ export class MoPanClient {
       phone,
       smsCode,
     }
-    return this.request<LoginResp>(MoPanProxyFamily + "/loginBySms", data)
+    return this.request<LoginResp>(
+      MoPanProxyFamily + "/loginBySms",
+      data,
+      false,
+    )
   }
 
-  async getUserInfo(): Promise<UserInfo> {
-    return this.request<UserInfo>(MoPanProxyFamily + "/getUserInfo", null)
+  async getUserInfo(retry: boolean = true): Promise<UserInfo> {
+    return this.request<UserInfo>(MoPanProxyFamily + "/getUserInfo", null, retry)
   }
 
   async queryFiles(
@@ -191,12 +213,17 @@ export class MoPanClient {
     orderBy: string = "filename",
     descending: boolean = false,
     cloudId?: string,
+    pageSize?: number,
   ): Promise<QueryFilesResp> {
     const data: Record<string, any> = {
       folderId,
       pageNum: page,
       orderBy,
       descending,
+    }
+    // F-246：显式声明页大小，避免 list() 的终止判据押注在服务端默认值上
+    if (pageSize) {
+      data.pageSize = pageSize
     }
     if (cloudId) {
       data.cloudId = cloudId

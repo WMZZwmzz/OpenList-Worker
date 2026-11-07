@@ -48,7 +48,10 @@ export class Pan115Client {
   }) => void
   /** 简单限流：每秒最多 N 个请求（Go rate.Limiter 等价） */
   private rateLimitMs = 0
-  private lastRequestAt = 0
+  /** 下一个可用时间槽：并发调用各自预占不同槽位，而不是读到同一旧值一起放行 */
+  private nextSlotAt = 0
+  /** 进行中的刷新（singleflight）：并发 401 只刷新一次 */
+  private refreshInFlight: Promise<void> | null = null
 
   constructor(
     addition: Pan115Addition,
@@ -68,20 +71,28 @@ export class Pan115Client {
   private async waitRateLimit(): Promise<void> {
     if (this.rateLimitMs <= 0) return
     const now = Date.now()
-    const wait = this.lastRequestAt + this.rateLimitMs - now
+    // 预占下一个时间槽：并发调用者各自推进 nextSlotAt，不会读到同一个旧值
+    // 而整批同时放行（等价 Go rate.Limiter 的串行化）。
+    const slot = Math.max(now, this.nextSlotAt)
+    this.nextSlotAt = slot + this.rateLimitMs
+    const wait = slot - now
     if (wait > 0) {
       await new Promise((r) => setTimeout(r, wait))
     }
-    this.lastRequestAt = Date.now()
   }
 
-  /** fetch + 20s 超时 + 网络错误重试 3 次（瞬时故障恢复） */
+  /**
+   * fetch + 20s 超时 + 网络错误重试（瞬时故障恢复）。
+   * attempts 由调用方按幂等性决定：非幂等写操作只发一次，避免服务端已执行
+   * 但响应丢失时重复执行（重复建目录、重复删除/移动）。
+   */
   private async fetchWithRetry(
     url: string,
     init: RequestInit,
+    attempts = 3,
   ): Promise<Response> {
     let lastErr: unknown
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let attempt = 0; attempt < attempts; attempt++) {
       try {
         const controller = new AbortController()
         const timer = setTimeout(() => controller.abort(), 20000)
@@ -92,7 +103,7 @@ export class Pan115Client {
         }
       } catch (e) {
         lastErr = e
-        if (attempt < 2) {
+        if (attempt < attempts - 1) {
           await new Promise((r) => setTimeout(r, 500 * (attempt + 1)))
         }
       }
@@ -113,6 +124,18 @@ export class Pan115Client {
   // ---- Token refresh ----
 
   public async refreshToken(): Promise<void> {
+    // singleflight：并发 401 共享同一个刷新 Promise，避免用同一个旧
+    // refresh_token 并发刷新（轮换型 API 下后到的请求必败），也避免并发回调
+    // 对存储配置的读-改-写互相覆盖。
+    if (!this.refreshInFlight) {
+      this.refreshInFlight = this.performRefreshToken().finally(() => {
+        this.refreshInFlight = null
+      })
+    }
+    await this.refreshInFlight
+  }
+
+  private async performRefreshToken(): Promise<void> {
     if (!this.refreshTokenValue) {
       throw new Error("115 网盘缺少 refresh_token（必填）")
     }
@@ -151,6 +174,10 @@ export class Pan115Client {
   /**
    * 鉴权请求：Bearer access_token；响应 state=false 且 code 为 401 开头/99 时
    * 自动刷新 token 并重试一次（防止无限递归）。
+   *
+   * retryable：网络层自动重试是幂等性相关的——GET 与查询类 POST（downurl /
+   * upload/init / folder/get_info）可以重发；mkdir/move/copy/delFile/update
+   * 这类写操作一旦超时，服务端可能已执行，重发会产生重复副作用，因此只发一次。
    */
   public async request(
     url: string,
@@ -159,8 +186,12 @@ export class Pan115Client {
     form?: Record<string, string>,
     ua?: string,
     skipAuthRetry = false,
+    retryable = false,
   ): Promise<any> {
     await this.waitRateLimit()
+
+    // 幂等请求允许 3 次尝试；非幂等写操作只发一次
+    const attempts = retryable || method === "GET" ? 3 : 1
 
     const doReq = async (): Promise<{ body: any; rawText: string }> => {
       const u = new URL(url)
@@ -184,7 +215,7 @@ export class Pan115Client {
         headers["Content-Type"] = "application/x-www-form-urlencoded"
         init.body = body.toString()
       }
-      const res = await this.fetchWithRetry(u.toString(), init)
+      const res = await this.fetchWithRetry(u.toString(), init, attempts)
       const rawText = await res.text()
       let body: any
       try {
@@ -277,7 +308,7 @@ export class Pan115Client {
     return (
       await this.request(ApiFsGetFolderInfo, "POST", undefined, {
         path,
-      })
+      }, undefined, false, true)
     )?.data as Pan115FolderInfoResp
   }
 
@@ -331,6 +362,8 @@ export class Pan115Client {
         undefined,
         { pick_code: pickCode },
         ua,
+        false,
+        true, // 纯查询，可安全重试
       )
     )?.data as Pan115DownUrlResp
   }
@@ -352,15 +385,23 @@ export class Pan115Client {
     signVal?: string
   }): Promise<Pan115UploadInitResp> {
     return (
-      await this.request(ApiFsUploadInit, "POST", undefined, {
-        file_name: opts.fileName,
-        file_size: String(opts.fileSize),
-        target: `U_1_${opts.target}`,
-        fileid: opts.fileId,
-        preid: opts.preId,
-        sign_key: opts.signKey || "",
-        sign_val: opts.signVal || "",
-      })
+      await this.request(
+        ApiFsUploadInit,
+        "POST",
+        undefined,
+        {
+          file_name: opts.fileName,
+          file_size: String(opts.fileSize),
+          target: `U_1_${opts.target}`,
+          fileid: opts.fileId,
+          preid: opts.preId,
+          sign_key: opts.signKey || "",
+          sign_val: opts.signVal || "",
+        },
+        undefined,
+        false,
+        true, // 幂等查询（同一 sha1 反复 init 无副作用），可安全重试
+      )
     )?.data as Pan115UploadInitResp
   }
 }

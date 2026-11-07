@@ -340,6 +340,92 @@ test("per_page / max_page 控制分页拉取（对齐 Go getAllReleases）", asy
   }
 })
 
+test("F-305：不存在的路径抛 Object not found，不做跨版本按名字兜底", async () => {
+  const restore = installFetch(defaultRoutes)
+  try {
+    const client = new ClientGithubReleases({
+      repo_structure: "OpenListTeam/OpenList",
+      show_all_version: true,
+      show_readme: true,
+      show_source_code: true,
+    })
+    await client.init()
+
+    // v0.9.0 只有 openlist-v0.9.0.tar.gz；按名字兜底会错拿 v1.0.0 的同名资产
+    await assert.rejects(
+      () => client.getDownloadUrl("/v0.9.0/openlist-linux-amd64.tar.gz"),
+      /Object not found/,
+    )
+    // 完全不存在的路径不得返回 v1.0.0 的直链
+    await assert.rejects(
+      () =>
+        client.getDownloadUrl(
+          "/this/path/never/existed/openlist-linux-amd64.tar.gz",
+        ),
+      /Object not found/,
+    )
+    await assert.rejects(
+      () => client.getDownloadUrl("/totally-bogus.bin"),
+      /Object not found/,
+    )
+
+    // get() 同样报 not-found，而不是返回 raw_url 为空的伪文件
+    const driver = new DriverGithubReleases({
+      repo_structure: "OpenListTeam/OpenList",
+      show_all_version: true,
+      show_readme: true,
+      show_source_code: true,
+    })
+    await assert.rejects(
+      () => driver.get("/totally-bogus.bin", "/totally-bogus.bin"),
+      /Object not found/,
+    )
+    await assert.rejects(
+      () =>
+        driver.get(
+          "/v0.9.0/openlist-linux-amd64.tar.gz",
+          "/v0.9.0/openlist-linux-amd64.tar.gz",
+        ),
+      /Object not found/,
+    )
+  } finally {
+    restore()
+  }
+})
+
+test("F-305：版本目录只解析本 tag 的资产，README 仍可下载", async () => {
+  const restore = installFetch(defaultRoutes)
+  try {
+    const client = new ClientGithubReleases({
+      repo_structure: "OpenListTeam/OpenList",
+      show_source_code: true,
+      show_readme: true,
+    })
+    await client.init()
+    assert.equal(
+      await client.getDownloadUrl("/openlist-linux-amd64.tar.gz"),
+      "https://github.com/OpenListTeam/OpenList/releases/download/v1.0.0/openlist-linux-amd64.tar.gz",
+    )
+    assert.equal(
+      await client.getDownloadUrl("/README.md"),
+      "https://raw.githubusercontent.com/OpenListTeam/OpenList/main/README.md",
+    )
+    // 未开启 show_source_code 时源码包不存在
+    const noSource = new ClientGithubReleases({
+      repo_structure: "OpenListTeam/OpenList",
+      show_source_code: false,
+      show_readme: false,
+    })
+    await noSource.init()
+    await assert.rejects(
+      () => noSource.getDownloadUrl("/Source code (zip)"),
+      /Object not found/,
+    )
+  } finally {
+    restore()
+  }
+})
+
 test("驱动为只读：写操作全部抛错", async () => {
   const driver = new DriverGithubReleases({
     repo_structure: "OpenListTeam/OpenList",
@@ -350,4 +436,122 @@ test("驱动为只读：写操作全部抛错", async () => {
   await assert.rejects(() => driver.move(), /read-only/)
   await assert.rejects(() => driver.copy(), /read-only/)
   await assert.rejects(() => driver.rename(), /read-only/)
+})
+
+// ---- F-306: 非默认 root_folder_path 必须剥离后再匹配挂载点 ----
+test("root_folder_path 非默认时仍能正常列表与下载（F-306）", async () => {
+  const restore = installFetch(defaultRoutes)
+  try {
+    const client = new ClientGithubReleases({
+      repo_structure: "repos:OpenListTeam/OpenList",
+      root_folder_path: "/rl",
+      show_source_code: true,
+    })
+    await client.init()
+
+    const atRoot = await client.list("/rl")
+    assert.deepEqual(atRoot.map((f) => f.name), ["repos"])
+    assert.equal(atRoot[0].isDir, true)
+
+    const atMount = await client.list("/rl/repos")
+    assert.ok(
+      atMount.some((f) => f.name === "openlist-linux-amd64.tar.gz"),
+      "root 前缀应被剥离后命中挂载点",
+    )
+    assert.equal(await client.isDirectory("/rl/repos"), true)
+    assert.equal(
+      await client.getDownloadUrl("/rl/repos/openlist-linux-amd64.tar.gz"),
+      "https://github.com/OpenListTeam/OpenList/releases/download/v1.0.0/openlist-linux-amd64.tar.gz",
+    )
+  } finally {
+    restore()
+  }
+})
+
+// ---- F-307: README/LICENSE 过滤规则对齐 Go ----
+test("readmeFiles 跳过目录条目，只列 README.md 与 LICENSE*（F-307）", async () => {
+  const contents = [
+    { name: "LICENSES", type: "dir", size: 0, download_url: null },
+    { name: "docs.md", type: "dir", size: 0, download_url: null },
+    { name: "CHANGELOG.md", type: "file", size: 1, download_url: "u1" },
+    { name: "readme.md", type: "file", size: 2, download_url: "u2" },
+    { name: "LICENSE", type: "file", size: 3, download_url: "u3" },
+  ]
+  const restore = installFetch([
+    ["/releases/latest", LATEST],
+    ["/releases?", ALL],
+    ["/contents", contents],
+  ])
+  try {
+    const client = new ClientGithubReleases({
+      repo_structure: "OpenListTeam/OpenList",
+      show_readme: true,
+    })
+    await client.init()
+    const files = await client.list("/")
+    const names = files.map((f) => f.name).sort()
+    assert.deepEqual(names, ["LICENSE", "openlist-linux-amd64.tar.gz", "readme.md"])
+    // 目录条目不可下载
+    await assert.rejects(
+      () => client.getDownloadUrl("/LICENSES"),
+      /Object not found/,
+    )
+  } finally {
+    restore()
+  }
+})
+
+// ---- F-308: 祖先合成目录聚合 release 体量与真实时间 ----
+test("祖先目录聚合 release 大小与发布时间（F-308）", async () => {
+  const restore = installFetch(defaultRoutes)
+  try {
+    const client = new ClientGithubReleases({
+      repo_structure: "repos:OpenListTeam/OpenList",
+    })
+    await client.init()
+    const root = await client.list("/")
+    assert.equal(root.length, 1)
+    assert.equal(root[0].name, "repos")
+    assert.equal(root[0].size, 1024)
+    assert.equal(root[0].modified, "2026-01-02T00:00:00Z")
+  } finally {
+    restore()
+  }
+})
+
+// ---- F-309: max_page 非法值与硬上限 ----
+test("max_page 非法值回落到 1 页而非「不限页」（F-309）", async () => {
+  const calls: string[] = []
+  const original = globalThis.fetch
+  globalThis.fetch = (async (input: any) => {
+    const url = String(input)
+    calls.push(url)
+    if (url.includes("/releases?")) {
+      const parsed = new URL(url)
+      const page = Number(parsed.searchParams.get("page") || "1")
+      return new Response(
+        JSON.stringify([release(`v${page}`, `a${page}`)]),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )
+    }
+    return new Response(JSON.stringify([]), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    })
+  }) as typeof fetch
+  try {
+    const client = new ClientGithubReleases({
+      repo_structure: "OpenListTeam/OpenList",
+      show_all_version: true,
+      show_readme: false,
+      per_page: 1,
+      max_page: "abc",
+    })
+    await client.init()
+    const files = await client.list("/")
+    assert.deepEqual(files.map((f) => f.name), ["v1"])
+    assert.ok(!calls.some((u) => u.includes("page=2")))
+  } finally {
+    globalThis.fetch = original
+  }
 })

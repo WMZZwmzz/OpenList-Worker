@@ -282,6 +282,8 @@ export class QuarkClient {
   // ---- Delete ----
 
   async remove(fileIds: string[]): Promise<void> {
+    // action_type=2 是夸克 Web 端的「彻底删除」语义（与 quark-auto-save 一致）；
+    // 上游 Go 用 1（移入回收站）。两者都是服务端接受值，保持现有行为。
     await this.request("/file/delete", "POST", undefined, {
       action_type: 2,
       filelist: fileIds,
@@ -292,7 +294,11 @@ export class QuarkClient {
   // ---- Move ----
 
   async move(fileIds: string[], toDirId: string): Promise<void> {
+    // F-320：与上游 Go（quark_uc driver.go）及所有已知实现一致，
+    // /file/move 必须带 action_type 与 exclude_fids。
     await this.request("/file/move", "POST", undefined, {
+      action_type: 1,
+      exclude_fids: [],
       filelist: fileIds,
       to_pdir_fid: toDirId,
     })
@@ -301,7 +307,10 @@ export class QuarkClient {
   // ---- Copy ----
 
   async copy(fileIds: string[], toDirId: string): Promise<void> {
+    // F-320：/file/copy 与 /file/move 同族，同样补上 action_type/exclude_fids。
     await this.request("/file/copy", "POST", undefined, {
+      action_type: 1,
+      exclude_fids: [],
       filelist: fileIds,
       to_pdir_fid: toDirId,
     })
@@ -351,16 +360,14 @@ export class QuarkClient {
   // ---- Init (validates cookie by calling /config) ----
 
   async init(): Promise<void> {
+    // F-324：init() 是挂载期唯一的校验点，调用方（admin 创建存储 / load_all）
+    // 依赖它抛错来标记存储不可用。此前把 /config 的所有失败吞成 warn，导致
+    // cookie 为空/失效的存储照样显示「正常」，直到首次 list/get 才 401。
     if (!this.cookie?.trim()) {
-      console.warn("[Quark/UC] Cookie is empty, skipping init.")
-      return
+      throw new Error("[Quark/UC] Cookie is empty")
     }
-    try {
-      await this.request("/config", "GET")
-      console.log(`[Quark/UC] (${this.addition.variant || "Quark"}) init OK`)
-    } catch (e: any) {
-      console.warn(`[Quark/UC] init warning:`, e.message)
-    }
+    await this.request("/config", "GET")
+    console.log(`[Quark/UC] (${this.addition.variant || "Quark"}) init OK`)
   }
 }
 
@@ -388,15 +395,27 @@ function extractCookieFromSetCookie(
   return null
 }
 
-/** Simple HTML entity unescaping (matching Go's html.UnescapeString for common cases) */
+/**
+ * Simple HTML entity unescaping (matching Go's html.UnescapeString).
+ *
+ * F-323：必须**单遍**扫描。链式 replace 把 &amp; 放第一位会对已解码结果再解码
+ * 一次（"&amp;lt;" → "&lt;" → "<"），与 Go 的单遍语义不符。
+ */
 function unescapeHtml(str: string): string {
-  return str
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&apos;/g, "'")
+  return str.replace(/&(amp|lt|gt|quot|#39|apos);/g, (_m, name: string) => {
+    switch (name) {
+      case "amp":
+        return "&"
+      case "lt":
+        return "<"
+      case "gt":
+        return ">"
+      case "quot":
+        return '"'
+      default:
+        return "'" // #39 / apos
+    }
+  })
 }
 
 /** Guess the format_type from file extension for upload */

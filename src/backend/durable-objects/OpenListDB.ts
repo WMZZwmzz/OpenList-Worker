@@ -21,6 +21,16 @@ import {
 
 export class OpenListDB {
   private state: any
+  /**
+   * schema 是否已在本实例上建好（F-119）。
+   *
+   * 历史实现让 8 个 RPC 方法每次调用都先全量重放 11 条 DDL（KV 表 + 8 条列式表
+   * + 2 条 singleflight），把每次 KV 语义操作放大成 11+ 次 SQLite exec。DDL 是
+   * `IF NOT EXISTS`，功能幂等，但属于稳定的每请求重计算。
+   *
+   * 现在只在首次调用时执行；失败则不置位（下次重试）。
+   */
+  private schemaReady = false
 
   constructor(state: any) {
     this.state = state
@@ -35,6 +45,7 @@ export class OpenListDB {
    * 建表（幂等）：KV 表（map/key 格式）+ 列式表（sql 格式）+ singleflight 协调表。
    */
   private ensureSchema(): void {
+    if (this.schemaReady) return
     for (const ddl of [
       ...KV_SCHEMA_SQLITE,
       ...D1_SCHEMA,
@@ -42,6 +53,9 @@ export class OpenListDB {
     ]) {
       this.sql.exec(ddl)
     }
+    // 只有全部 DDL 成功后才置位：中途抛错（如 DO 尚未就绪）下次会重试，
+    // 不会让实例带着「只建了一半表」的状态继续跑。
+    this.schemaReady = true
   }
 
   async init(): Promise<void> {

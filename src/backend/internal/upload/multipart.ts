@@ -8,6 +8,13 @@
  * 说明：
  * - 会话状态存于进程内 Map（Worker 单实例存活期间可断点续传）。
  *   跨实例/冷启动恢复依赖驱动 session token 的自包含性，本层不做 KV 持久化。
+ * - **部署限制（F-010）**：`/fs/multipart/*` 的会话不跨 isolate/进程，因此可靠的
+ *   断点续传只在「单实例 / 有会话粘性」的部署上成立。CF Workers、EdgeOne、Vercel
+ *   这类无会话亲和的多 isolate 运行时上，init 与后续 chunk/complete 可能落到不同
+ *   实例，表现为 404 "upload session not found"。要做真正的跨实例续传，必须把
+ *   会话落到 KV/D1/DO（并让 fs.ts 在 chunk/complete 时按 upload_id 回读），或把
+ *   driver_session 令牌下发客户端保存、chunk 时回传重建——两者都需要 fs.ts 侧
+ *   的接线，不在本模块范围内。
  * - chunk 按 index（0-based）桥接到驱动 uploadPart(partNumber = index + 1)，
  *   与官方前端 multipart.ts 的 chunk index 语义对齐。
  * - received 以区间数组 [number, number][] 表示，供前端断点续传跳过已收分片。
@@ -107,9 +114,30 @@ function intervalsOf(set: Set<number>): [number, number][] {
   return out
 }
 
+/**
+ * 第 idx 个分片的实际字节数。除最后一片外恒为 chunk_size，最后一片为剩余量
+ * （size - idx*chunk_size）。越界 index（脏数据）计 0，绝不让统计值超过 size。
+ */
+export function chunkLengthOf(
+  s: Pick<MultipartSession, "size" | "chunk_size" | "total_chunks">,
+  idx: number,
+): number {
+  if (!Number.isInteger(idx) || idx < 0 || idx >= s.total_chunks) return 0
+  const start = idx * s.chunk_size
+  const remaining = s.size - start
+  if (!Number.isFinite(remaining) || remaining <= 0) return 0
+  return Math.min(s.chunk_size, remaining)
+}
+
 export function snapshot(s: MultipartSession): MultipartSnapshot {
   const intervals = intervalsOf(s.received)
-  const receivedBytes = s.received.size * s.chunk_size
+  // F-117：received_bytes 必须按**每个分片的实际字节数**累加，不能简单乘
+  // chunk_size —— 最后一片通常不足 chunk_size（15MB 文件按 10MB 分片，两片收完
+  // 原生实现会报 20MB），进度会超过文件真实大小。
+  let receivedBytes = 0
+  for (const idx of s.received) {
+    receivedBytes += chunkLengthOf(s, idx)
+  }
   // frontier：连续已收的最大 index + 1（驱动顺序写入进度）
   let frontier = 0
   for (let i = 0; i < s.total_chunks; i++) {
@@ -166,7 +194,59 @@ export function findReceivingSession(
 }
 
 export function putSession(s: MultipartSession): void {
+  const limit = sessionLimitError(s)
+  if (limit) {
+    // 越界会话不得进入内存 Map：MAX_UPLOAD_BYTES / MAX_TOTAL_CHUNKS 此前只被
+    // 测试引用，生产路径完全没有护栏（F-114）。这里在会话入库的唯一入口拒绝。
+    throw new Error(limit)
+  }
   sessions.set(s.upload_id, s)
+  // F-114：pruneSessions 原先只在测试里被调用，被放弃/失败的会话永久滞留。
+  // putSession 是所有 init/chunk 的公共入口（fs.ts 每次写入都会经过这里），
+  // 在这里按分钟节流执行一次清扫，无需给 fs.ts 增加调用点，也没有定时器。
+  maybePruneSessions()
+}
+
+/**
+ * 校验会话规模是否符合硬上限。返回错误文案，合规时返回 null。
+ *
+ * 单独导出便于 fs.ts / 测试在分配 `new Array(total_chunks)` **之前**校验，
+ * 避免先分配再拒绝。
+ */
+export function sessionLimitError(
+  s: Pick<MultipartSession, "size" | "chunk_size" | "total_chunks">,
+): string | null {
+  if (!Number.isFinite(s.size) || s.size <= 0) return "invalid upload size"
+  if (s.size > MAX_UPLOAD_BYTES) {
+    return `upload size exceeds MAX_UPLOAD_BYTES (${MAX_UPLOAD_BYTES})`
+  }
+  if (!Number.isInteger(s.chunk_size) || s.chunk_size <= 0) {
+    return "invalid chunk size"
+  }
+  if (
+    !Number.isInteger(s.total_chunks) ||
+    s.total_chunks < 1 ||
+    s.total_chunks > MAX_TOTAL_CHUNKS
+  ) {
+    return `total_chunks exceeds MAX_TOTAL_CHUNKS (${MAX_TOTAL_CHUNKS})`
+  }
+  return null
+}
+
+const PRUNE_INTERVAL_MS = 60_000
+let lastPruneAt = 0
+
+/** 节流清扫：距上次超过 PRUNE_INTERVAL_MS 才真正遍历 Map。 */
+function maybePruneSessions(): void {
+  const now = Date.now()
+  if (now - lastPruneAt < PRUNE_INTERVAL_MS) return
+  lastPruneAt = now
+  pruneSessions()
+}
+
+/** 仅供测试：重置节流计时，让下一次 putSession 触发清扫。 */
+export function __resetPruneThrottleForTest(): void {
+  lastPruneAt = 0
 }
 
 export function deleteSession(uploadId: string): void {

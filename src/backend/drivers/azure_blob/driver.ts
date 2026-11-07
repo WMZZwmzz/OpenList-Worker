@@ -27,6 +27,22 @@ function joinPath(a: string, b: string): string {
   return left + "/" + right
 }
 
+/** 逐段编码 blob 路径（保留 "/"），签名与发送使用同一编码形式 */
+function encodeBlobPath(path: string): string {
+  return String(path || "")
+    .split("/")
+    .map((seg) => encodeURIComponent(seg))
+    .join("/")
+}
+
+function decodeQueryComponent(value: string): string {
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return value
+  }
+}
+
 function base64ToBytes(b64: string): Uint8Array {
   const binary = atob(b64)
   const bytes = new Uint8Array(binary.length)
@@ -59,6 +75,30 @@ async function hmacSha256Base64(
   return bytesToBase64(new Uint8Array(sig))
 }
 
+/** XML 实体反转义（F-454）：blob 名可含 & < > 等字符，Azure 会在 XML 里转义 */
+function unescapeXml(str: string): string {
+  return str.replace(/&(amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);/g, (m, e) => {
+    switch (e) {
+      case "amp":
+        return "&"
+      case "lt":
+        return "<"
+      case "gt":
+        return ">"
+      case "quot":
+        return '"'
+      case "apos":
+        return "'"
+      default: {
+        const code = e.startsWith("#x")
+          ? parseInt(e.slice(2), 16)
+          : parseInt(e.slice(1), 10)
+        return Number.isFinite(code) ? String.fromCodePoint(code) : m
+      }
+    }
+  })
+}
+
 // 简单 XML 提取：从 Azure List Blobs 响应中提取 blob/prefix 信息
 function parseListBlobsXml(xml: string): AzureListResult {
   const result: AzureListResult = { blobs: [], prefixes: [] }
@@ -68,7 +108,9 @@ function parseListBlobsXml(xml: string): AzureListResult {
   let m: RegExpExecArray | null
   while ((m = blobRe.exec(xml))) {
     const block = m[1]
-    const name = (block.match(/<Name>([^<]+)<\/Name>/) || [])[1] || ""
+    const name = unescapeXml(
+      (block.match(/<Name>([^<]+)<\/Name>/) || [])[1] || "",
+    )
     if (name.endsWith("/")) continue
     const size = parseInt(
       (block.match(/<Content-Length>(\d+)<\/Content-Length>/) || [])[1] || "0",
@@ -85,9 +127,29 @@ function parseListBlobsXml(xml: string): AzureListResult {
     })
   }
   while ((m = prefixRe.exec(xml))) {
-    result.prefixes.push(m[1])
+    result.prefixes.push(unescapeXml(m[1]))
   }
   return result
+}
+
+/** 解析 List Blobs（无 delimiter）响应：全部 blob 名 + 翻页标记（F-451） */
+function parseBlobNamesXml(xml: string): {
+  names: string[]
+  nextMarker: string
+} {
+  const names: string[] = []
+  const blobRe = /<Blob>([\s\S]*?)<\/Blob>/g
+  let m: RegExpExecArray | null
+  while ((m = blobRe.exec(xml))) {
+    const name = unescapeXml(
+      (m[1].match(/<Name>([^<]+)<\/Name>/) || [])[1] || "",
+    )
+    if (name) names.push(name)
+  }
+  const nextMarker = unescapeXml(
+    (xml.match(/<NextMarker>([^<]*)<\/NextMarker>/) || [])[1] || "",
+  )
+  return { names, nextMarker }
 }
 
 export class AzureBlobDriver implements StorageDriver {
@@ -129,22 +191,34 @@ export class AzureBlobDriver implements StorageDriver {
     contentLength: string,
     contentType: string,
   ): Promise<string> {
-    const xmsDate = extraHeaders["x-ms-date"] || ""
     const canonicalHeaders = Object.keys(extraHeaders)
       .filter((k) => k.startsWith("x-ms-"))
       .sort()
       .map((k) => `${k.toLowerCase()}:${extraHeaders[k].trim()}\n`)
       .join("")
-    const canonicalResource = `/${this.accountName}${path ? "/" + path : ""}\n${query
+    // canonicalizedResource = /account/container[/blob] [+ 解码并按名称排序的 query]
+    // 规范要求包含 container 段，且 query 的名称与值必须先 URL 解码。
+    const resourceParts = [
+      `/${this.accountName}/${this.container}${path ? "/" + path : ""}`,
+    ]
+    const queryParts = query
       .split("&")
       .filter(Boolean)
-      .sort()
       .map((p) => {
-        const [k, v] = p.split("=")
-        return `${k.toLowerCase()}:${v || ""}`
+        const eq = p.indexOf("=")
+        const rawKey = eq < 0 ? p : p.slice(0, eq)
+        const rawValue = eq < 0 ? "" : p.slice(eq + 1)
+        return {
+          key: decodeQueryComponent(rawKey).toLowerCase(),
+          value: decodeQueryComponent(rawValue),
+        }
       })
-      .join("\n")}`
-    const stringToSign = `${method}\n\n\n${contentLength}\n\n${contentType}\n\n\n\n\n\n\n${canonicalHeaders}${canonicalResource}`
+      .sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
+    for (const { key, value } of queryParts) {
+      resourceParts.push(`${key}:${value}`)
+    }
+    const canonicalizedResource = resourceParts.join("\n")
+    const stringToSign = `${method}\n\n\n${contentLength}\n\n${contentType}\n\n\n\n\n\n\n${canonicalHeaders}${canonicalizedResource}`
     return hmacSha256Base64(stringToSign, this.keyBytes)
   }
 
@@ -161,7 +235,10 @@ export class AzureBlobDriver implements StorageDriver {
   ): Promise<Response> {
     const xmsDate = new Date().toUTCString()
     const contentType = options.contentType || ""
-    const contentLength = options.body ? String(options.body.length) : ""
+    // 规范：content length 为 0 时 Content-Length 字段必须是空串（不能签成 "0"）
+    const bodyLength = options.body ? options.body.length : 0
+    const contentLength = bodyLength > 0 ? String(bodyLength) : ""
+    const encodedPath = encodeBlobPath(path)
     const extraHeaders = {
       "x-ms-date": xmsDate,
       "x-ms-version": "2021-08-06",
@@ -169,13 +246,13 @@ export class AzureBlobDriver implements StorageDriver {
     }
     const signature = await this.sharedKeySignature(
       method,
-      path,
+      encodedPath,
       query,
       extraHeaders,
       contentLength,
       contentType,
     )
-    const url = `${this.endpoint}/${this.container}${path ? "/" + path : ""}${query ? "?" + query : ""}`
+    const url = `${this.endpoint}/${this.container}${encodedPath ? "/" + encodedPath : ""}${query ? "?" + query : ""}`
     const headers: Record<string, string> = {
       Authorization: `SharedKey ${this.accountName}:${signature}`,
       ...extraHeaders,
@@ -196,11 +273,14 @@ export class AzureBlobDriver implements StorageDriver {
     )
     const se = expiry.toISOString().replace(/\.\d+Z$/, "Z")
     const canonicalResource = `/blob/${this.accountName}/${this.container}/${blobPath}`
-    const stringToSign = `r\n\n\n${se}\n${canonicalResource}\n\n\n\n\n\n\n\n\n`
+    // sv=2021-08-06（>= 2020-12-06）的 string-to-sign 共 16 个字段：
+    // sp,st,se,canonicalizedResource,si,sip,spr,sv,sr,snapshotTime,
+    // encryptionScope,rscc,rscd,rsce,rscl,rsct
+    const stringToSign = `r\n\n${se}\n${canonicalResource}\n\n\n\n2021-08-06\nb\n\n\n\n\n\n\n`
     const sig = encodeURIComponent(
       await hmacSha256Base64(stringToSign, this.keyBytes),
     )
-    return `${this.endpoint}/${this.container}/${blobPath}?sp=r&st=&se=${encodeURIComponent(se)}&sv=2021-08-06&sr=b&sig=${sig}`
+    return `${this.endpoint}/${this.container}/${encodeBlobPath(blobPath)}?sp=r&st=&se=${encodeURIComponent(se)}&sv=2021-08-06&sr=b&sig=${sig}`
   }
 
   private getKey(physicalPath: string): string {
@@ -282,8 +362,9 @@ export class AzureBlobDriver implements StorageDriver {
       physicalPath.split("/").slice(0, -1).join("/"),
       newName,
     ).replace(/^\/+/, "")
-    await this.copyBlob(srcKey, dstKey)
-    await this.deleteBlob(srcKey)
+    // F-451：目录必须按前缀递归复制/删除，单 blob 操作只会搬走 0 字节标记
+    await this.copyEntry(srcKey, dstKey)
+    await this.deleteEntry(srcKey)
   }
 
   async remove(
@@ -292,7 +373,7 @@ export class AzureBlobDriver implements StorageDriver {
     _names: string[],
   ): Promise<void> {
     const key = this.getKey(physicalPath)
-    await this.deleteBlob(key)
+    await this.deleteEntry(key)
   }
 
   async move(
@@ -306,8 +387,8 @@ export class AzureBlobDriver implements StorageDriver {
     // 不得再拼 name，否则会指向 `<item>/<name>` 这种不存在的 blob。
     const srcKey = this.getKey(srcPhys)
     const dstKey = this.getKey(dstPhys)
-    await this.copyBlob(srcKey, dstKey)
-    await this.deleteBlob(srcKey)
+    await this.copyEntry(srcKey, dstKey)
+    await this.deleteEntry(srcKey)
   }
 
   async copy(
@@ -320,7 +401,7 @@ export class AzureBlobDriver implements StorageDriver {
     // 同 move：srcPhys/dstPhys 已是目标项自身路径，不得再拼 name。
     const srcKey = this.getKey(srcPhys)
     const dstKey = this.getKey(dstPhys)
-    await this.copyBlob(srcKey, dstKey)
+    await this.copyEntry(srcKey, dstKey)
   }
 
   async put(_v: string, physicalPath: string, content: Buffer): Promise<void> {
@@ -333,8 +414,82 @@ export class AzureBlobDriver implements StorageDriver {
     if (!res.ok) throw new Error(`[AzureBlob] put failed: HTTP ${res.status}`)
   }
 
+  /**
+   * 列出 prefix 下全部 blob 名（不带 delimiter，按 NextMarker 翻页）。
+   * 用于目录的递归复制/删除（F-451）。
+   */
+  private async listBlobNames(prefix: string): Promise<string[]> {
+    const out: string[] = []
+    let marker = ""
+    for (let page = 0; page < 100; page++) {
+      const query =
+        "restype=container&comp=list&prefix=" +
+        encodeURIComponent(prefix) +
+        (marker ? "&marker=" + encodeURIComponent(marker) : "")
+      const res = await this.request("GET", "", query)
+      if (!res.ok) {
+        throw new Error(`[AzureBlob] list failed: HTTP ${res.status}`)
+      }
+      const { names, nextMarker } = parseBlobNamesXml(await res.text())
+      out.push(...names)
+      if (!nextMarker) break
+      marker = nextMarker
+    }
+    return out
+  }
+
+  /** key 是否是虚拟目录：存在 `<key>/` 标记 blob，或该前缀下已有对象 */
+  private async isDirectory(key: string): Promise<boolean> {
+    const clean = key.replace(/^\/+|\/+$/g, "")
+    if (!clean) return true
+    const marker = clean + "/"
+    const head = await this.request("HEAD", marker, "")
+    if (head.ok) return true
+    if (head.status !== 404) return false
+    return (await this.listBlobNames(marker)).length > 0
+  }
+
+  /** 复制单个 blob；目录则递归复制其下全部 blob（F-451） */
+  private async copyEntry(srcKey: string, dstKey: string): Promise<void> {
+    if (!(await this.isDirectory(srcKey))) {
+      await this.copyBlob(srcKey, dstKey)
+      return
+    }
+    const srcPrefix = srcKey.replace(/^\/+|\/+$/g, "") + "/"
+    const dstPrefix = dstKey.replace(/^\/+|\/+$/g, "") + "/"
+    const names = await this.listBlobNames(srcPrefix)
+    if (names.length === 0) {
+      // 只有标记 blob 的空目录
+      await this.copyBlob(srcPrefix, dstPrefix)
+      return
+    }
+    for (const name of names) {
+      const rel = name.startsWith(srcPrefix)
+        ? name.slice(srcPrefix.length)
+        : name
+      await this.copyBlob(name, dstPrefix + rel)
+    }
+  }
+
+  /** 删除单个 blob；目录则递归删除其下全部 blob（F-451） */
+  private async deleteEntry(key: string): Promise<void> {
+    if (!(await this.isDirectory(key))) {
+      await this.deleteBlob(key)
+      return
+    }
+    const prefix = key.replace(/^\/+|\/+$/g, "") + "/"
+    const names = await this.listBlobNames(prefix)
+    if (names.length === 0) {
+      await this.deleteBlob(prefix)
+      return
+    }
+    for (const name of names) {
+      await this.deleteBlob(name)
+    }
+  }
+
   private async copyBlob(srcKey: string, dstKey: string): Promise<void> {
-    const srcUrl = `${this.endpoint}/${this.container}/${srcKey}`
+    const srcUrl = `${this.endpoint}/${this.container}/${encodeBlobPath(srcKey)}`
     const res = await this.request("PUT", dstKey, "", {
       body: new Uint8Array(0),
       contentType: "application/octet-stream",
