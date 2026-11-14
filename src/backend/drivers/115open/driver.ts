@@ -238,8 +238,14 @@ export class Pan115Driver implements StorageDriver {
         return info.file_id
       }
     } catch (e: any) {
-      // folder/get_info 只支持目录路径：参数错误(990002)/不存在(430004) → 回退逐层
-      if (e?.code !== ERR_OBJECT_NOT_FOUND && e?.code !== 990002) throw e
+      // folder/get_info 只支持目录路径：参数错误(990002)/空目录名(20001)/
+      // 不存在(430004) → 回退逐层解析（逐层用 ufile/files 列目录，不依赖 path 拼接）
+      if (
+        e?.code !== ERR_OBJECT_NOT_FOUND &&
+        e?.code !== 990002 &&
+        e?.code !== 20001
+      )
+        throw e
     }
     // 逐层解析
     const segs = clean.split("/").filter(Boolean)
@@ -534,7 +540,7 @@ export class Pan115Driver implements StorageDriver {
   async put(
     _virtualPath: string,
     physicalPath: string,
-    content: Buffer,
+    content: Uint8Array,
   ): Promise<void> {
     if (content.length < 1) {
       throw new Error("115 网盘不允许上传空文件")
@@ -606,7 +612,7 @@ export class Pan115Driver implements StorageDriver {
       SecurityToken: string
     },
     initResp: { bucket: string; object: string; callback: any },
-    content: Buffer,
+    content: Uint8Array,
   ): Promise<void> {
     const endpoint = token.endpoint.startsWith("http")
       ? token.endpoint

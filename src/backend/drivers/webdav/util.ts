@@ -45,34 +45,41 @@ async function discardBody(resp: Response): Promise<void> {
 }
 
 /**
- * F-239：multistatus 里的文本值必须做 XML 实体解码。正则抽取的 displayname /
- * href 原样保留 `&amp;`，会得到 `a&amp;b.txt` 这种名字，后续所有路径操作都
- * 打到不存在的远端路径（stat/MOVE/DELETE 全 404）。
+ * Decode XML predefined entities and numeric character references.
+ * F-239 / 上游 #140：multistatus 里的文本值必须做 XML 实体解码。正则抽取的
+ * displayname / href 原样保留 `&amp;`，会得到 `a&amp;b.txt` 这种名字，后续
+ * 所有路径操作都打到不存在的远端路径（stat/MOVE/DELETE 全 404）。
  *
  * 单遍回调查表，避免 `&amp;lt;` 这类输入被二次解码。
  */
-export function decodeXmlEntities(str: string): string {
-  const named: Record<string, string> = {
-    amp: "&",
-    lt: "<",
-    gt: ">",
-    quot: '"',
-    apos: "'",
-  }
-  return str.replace(
-    /&(amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);/g,
-    (match, entity: string) => {
-      if (entity[0] !== "#") return named[entity] ?? match
-      const code =
-        entity[1] === "x" || entity[1] === "X"
-          ? parseInt(entity.slice(2), 16)
-          : parseInt(entity.slice(1), 10)
-      if (!Number.isFinite(code) || code < 0 || code > 0x10ffff) return match
-      try {
-        return String.fromCodePoint(code)
-      } catch {
-        return match
+export function decodeXmlEntities(s: string): string {
+  return s.replace(
+    /&(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);/g,
+    (m) => {
+      if (m === "&amp;") return "&"
+      if (m === "&lt;") return "<"
+      if (m === "&gt;") return ">"
+      if (m === "&quot;") return '"'
+      if (m === "&apos;") return "'"
+      const hex = /^&#x/i.test(m)
+      const num = hex ? m.slice(3, -1) : m.slice(2, -1)
+      const code = hex ? parseInt(num, 16) : parseInt(num, 10)
+      // Keep the reference verbatim unless the code point is a valid XML 1.0
+      // Char (#x9/#xA/#xD, #x20-#xD7FF, #xE000-#xFFFD, #x10000-#x10FFFF).
+      // XML-invalid points (NUL, #xFFFF non-characters, surrogates, out of
+      // range) would otherwise poison the parsed name/path, and out-of-range
+      // values would crash the parse with a RangeError.
+      if (
+        Number.isNaN(code) ||
+        code > 0x10ffff ||
+        (code >= 0xd800 && code <= 0xdfff) ||
+        code === 0xfffe ||
+        code === 0xffff ||
+        (code < 0x20 && code !== 0x9 && code !== 0xa && code !== 0xd)
+      ) {
+        return m
       }
+      return String.fromCodePoint(code)
     },
   )
 }
@@ -102,12 +109,17 @@ export function parseMultistatusXml(
         respBlock,
       )
     if (!hrefMatch) continue
-    const rawHref = decodeXmlEntities(hrefMatch[1].trim())
-    let decodedHref = rawHref
+    const rawHref = hrefMatch[1].trim()
+    // XML-unescape first: the upstream XML-escapes the href text. Decoding XML
+    // entities before percent-decoding avoids double-decoding a percent-encoded
+    // literal entity (e.g. `%26amp%3B` must stay `&amp;`, not become `&`);
+    // XML decoding never produces `%`, so the order is safe.
+    const xmlDecodedHref = decodeXmlEntities(rawHref)
+    let decodedHref = xmlDecodedHref
     try {
-      decodedHref = decodeURIComponent(rawHref)
+      decodedHref = decodeURIComponent(xmlDecodedHref)
     } catch {
-      // ignore URI decode error
+      // ignore URI decode error; keep the XML-decoded text
     }
 
     // Extract propstat with 200 OK
@@ -151,7 +163,7 @@ export function parseMultistatusXml(
       /<(?:[a-zA-Z0-9_-]+:)?displayname\b[^>]*>([\s\S]*?)<\/(?:[a-zA-Z0-9_-]+:)?displayname>/i.exec(
         propContent,
       )
-    let displayName = dnMatch ? decodeXmlEntities(dnMatch[1]).trim() : ""
+    let displayName = dnMatch ? decodeXmlEntities(dnMatch[1].trim()) : ""
 
     // Derive name from href if displayname is missing or is pure path
     const cleanHref = decodedHref.replace(/\/+$/, "")

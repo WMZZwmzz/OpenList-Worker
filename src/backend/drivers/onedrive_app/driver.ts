@@ -245,7 +245,7 @@ export class OnedriveAPP implements StorageDriver {
    */
   private async uploadChunk(
     uploadUrl: string,
-    chunk: Buffer,
+    chunk: Uint8Array,
     start: number,
     total: number,
   ): Promise<void> {
@@ -282,7 +282,7 @@ export class OnedriveAPP implements StorageDriver {
   async put(
     virtualPath: string,
     physicalPath: string,
-    content: Buffer,
+    content: Uint8Array,
   ): Promise<void> {
     if (content.length <= 4 * 1024 * 1024) {
       const url = getMetaUrl(this, false, physicalPath, "content")

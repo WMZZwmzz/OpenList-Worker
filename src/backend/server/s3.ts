@@ -7,6 +7,7 @@ import {
   removeItems,
 } from "../internal/op/storage"
 import { safeErrorMessage } from "../pkg/errs"
+import { appendDownloadSignToRawUrl } from "../pkg/sign"
 import { readBodyWithinLimit } from "../pkg/upload-limit"
 import {
   canRemove,
@@ -256,19 +257,14 @@ s3Router.get("/*", async (c) => {
     if (!item) return s3Error("NoSuchKey", "NoSuchKey", 404)
     if (item.is_dir) return s3Error("NoSuchKey", "NoSuchKey", 404)
     if (rawUrl) {
-      // A-17：/d /p 公开端点需要签名时，302 必须携带签名，否则受限目录下载 401。
-      let target = rawUrl
-      if (await needDownloadSign(c, virtualPath)) {
-        const sign = await signDownloadPath(
-          c,
-          virtualPath,
-          await getSignExpiresIn(c),
-        )
-        if (sign) {
-          target += `${target.includes("?") ? "&" : "?"}sign=${encodeURIComponent(sign)}`
-        }
-      }
-      return c.redirect(target, 302)
+      // A-17 / 上游 #175 同一修复：/d、/p 端点没有 Auth 中间件，
+      // 开启 sign_all / link_expiration / 存储级 enable_sign / 密码 meta 时
+      // 裸链接会被判 401 "sign verify failed"。统一走 appendDownloadSignToRawUrl
+      // 助手（内部使用本地专用下载签名密钥）。
+      return c.redirect(
+        await appendDownloadSignToRawUrl(c, rawUrl, virtualPath),
+        302,
+      )
     }
     return s3Error("NoSuchKey", "NoSuchKey", 404)
   } catch (e: any) {

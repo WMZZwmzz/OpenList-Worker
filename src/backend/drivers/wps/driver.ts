@@ -312,9 +312,9 @@ export class WpsDriver implements StorageDriver {
   }
 
   async put(
-    _virtualPath: string,
-    _physicalPath: string,
-    _content: Buffer | Uint8Array,
+    virtualPath: string,
+    physicalPath: string,
+    content: Uint8Array,
   ): Promise<void> {
     // WPS 上传依赖分块协议（create/upload/commit），当前 util 层未实现任何上传接口。
     // 绝不能静默返回成功：op 层 putItem 会据此刻返回 200 并向客户端报告成功，

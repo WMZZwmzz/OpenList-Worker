@@ -1035,5 +1035,7 @@ export function buildOtpauthUrl(
  * @returns Data URL 格式的 QR 码（SVG；超长时为空字符串）
  */
 export async function buildQrImageUrl(otpauthUrl: string): Promise<string> {
+  // 本地自建 QR 实现（纯 JS SVG Data URL，不依赖 canvas / QRCode 库）；
+  // 上游 #153 的 SVG 方案与本实现目标一致，此处保持本地版本。
   return buildQrDataUrl(otpauthUrl)
 }

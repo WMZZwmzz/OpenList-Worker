@@ -399,7 +399,7 @@ export class GithubDriver implements StorageDriver {
   async put(
     _virtualPath: string,
     physicalPath: string,
-    content: Buffer,
+    content: Uint8Array,
   ): Promise<void> {
     if (!this.isOnBranch) {
       throw new Error("cannot write to non-branch reference")

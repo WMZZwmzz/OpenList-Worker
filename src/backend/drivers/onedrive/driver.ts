@@ -289,7 +289,7 @@ export class Onedrive implements StorageDriver {
    */
   private async uploadChunk(
     uploadUrl: string,
-    chunk: Buffer,
+    chunk: Uint8Array,
     start: number,
     total: number,
   ): Promise<void> {
@@ -326,7 +326,7 @@ export class Onedrive implements StorageDriver {
   async put(
     virtualPath: string,
     physicalPath: string,
-    content: Buffer,
+    content: Uint8Array,
   ): Promise<void> {
     if (content.length <= 4 * 1024 * 1024) {
       // upSmall

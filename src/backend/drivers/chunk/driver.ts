@@ -308,7 +308,7 @@ export class ChunkDriver implements StorageDriver {
   async put(
     _virtualPath: string,
     physicalPath: string,
-    content: Buffer,
+    content: Uint8Array,
   ): Promise<void> {
     this.ensureReady()
     const size = content.length
@@ -348,7 +348,7 @@ export class ChunkDriver implements StorageDriver {
         const end = Math.min(offset + this.partSize, size)
         const partContent = content.subarray(offset, end)
         const partPath = joinPath(chunkDir, this.getPartName(partIndex))
-        await this.remoteDriver!.put("", partPath, Buffer.from(partContent))
+        await this.remoteDriver!.put("", partPath, partContent)
         offset = end
         partIndex++
       }

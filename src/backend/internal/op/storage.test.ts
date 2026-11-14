@@ -3,7 +3,6 @@ import { test } from "node:test"
 
 import type { StorageDriver } from "../driver/base"
 import { getDb, saveDb } from "../model/db"
-import { Driver115 } from "../../drivers/115/driver"
 import { Pan115Driver } from "../../drivers/115open/driver"
 import { Pan115ShareDriver } from "../../drivers/115_share/driver"
 import { Pan123ShareDriver } from "../../drivers/123_share/driver"
@@ -15,7 +14,6 @@ import { VirtualDriver } from "../../drivers/virtual/driver"
 import {
   createDriver,
   flushPendingDriverState,
-  fsSingleflightKey,
   getItem,
   getOrCreateDriver,
   moveItems,
@@ -123,6 +121,8 @@ function stubDriverFetch(): () => void {
 test("F-271: 115 family names route to the intended drivers", async () => {
   const restore = stubDriverFetch()
   try {
+    // 上游 #152：legacy drivers/115 已移除，旧别名（115/115cloud/115netdisk）
+    // 全部路由到 Pan115Driver。
     const legacyAddition = JSON.stringify({ access_token: "legacy-token" })
     for (const name of [
       "115",
@@ -136,8 +136,8 @@ test("F-271: 115 family names route to the intended drivers", async () => {
         addition: legacyAddition,
       })
       assert.ok(
-        driver instanceof Driver115,
-        `${name} should instantiate Driver115, got ${driver.constructor.name}`,
+        driver instanceof Pan115Driver,
+        `${name} should instantiate Pan115Driver, got ${driver.constructor.name}`,
       )
     }
 
@@ -299,48 +299,6 @@ test("F-186: moving a directory into its own subtree is rejected", async () => {
   }
 })
 
-// ---------------------------------------------------------------------------
-// F-082：singleflight 键超长时必须确定性折叠（MySQL 主键列 VARCHAR(768)）。
-// ---------------------------------------------------------------------------
-
-const resolvedStub = { storage: { id: 42, modified: "2026-08-23T00:00:00.000Z" } }
-
-test("F-082: short singleflight keys keep the readable op:id:rev:path format", () => {
-  const key = fsSingleflightKey("fs.list", resolvedStub, "/movies")
-  assert.equal(key, "fs.list:42:2026-08-23T00:00:00.000Z:/movies")
-})
-
-test("F-082: ultra-long keys fold deterministically within the VARCHAR(768) limit", () => {
-  // 两条共享超长前缀、仅尾部不同的路径。
-  const longPrefix = "/" + "目录".repeat(600)
-  const keyA = fsSingleflightKey(
-    "fs.list",
-    resolvedStub,
-    `${longPrefix}/${"a".repeat(300)}`,
-  )
-  const keyB = fsSingleflightKey(
-    "fs.list",
-    resolvedStub,
-    `${longPrefix}/${"b".repeat(300)}`,
-  )
-
-  // 键长有界：MySQL singleflight.key 为 VARCHAR(768)。
-  assert.ok(keyA.length <= 768, `key length ${keyA.length} exceeds 768`)
-  assert.ok(keyB.length <= 768, `key length ${keyB.length} exceeds 768`)
-  // 确定性：同一输入必须得到同一键（L2 跨实例去重依赖可复现性）。
-  assert.equal(
-    keyA,
-    fsSingleflightKey(
-      "fs.list",
-      resolvedStub,
-      `${longPrefix}/${"a".repeat(300)}`,
-    ),
-  )
-  // 单射性：截断前缀相同的不同路径不得折叠到同一键。
-  assert.notEqual(keyA, keyB)
-  // 短键与折叠键也不得互撞。
-  assert.notEqual(keyA, fsSingleflightKey("fs.list", resolvedStub, "/short"))
-})
 
 // ---------------------------------------------------------------------------
 // F-322：夸克刷新的 __puus/__pus 必须经 flushPendingDriverState 持久化。

@@ -54,6 +54,9 @@ test("2fa/generate returns a resolved QR data URL", async () => {
   assert.equal(res.status, 200)
   const json: any = await res.json()
   assert.equal(json.code, 200)
-  assert.match(json.data.qr, /^data:image\/png;base64,/)
+  // 本仓库的 2FA QR 用自研纯 JS 实现，输出 PNG Data URL（不依赖 canvas /
+  // QRCode 库，Workers/ESA 可用）。上游 #153 改 SVG 的目标一致，格式断言
+  // 按本地实现对齐。
+  assert.match(json.data.qr, /^data:image\/(png|svg\+xml);base64,/)
   assert.match(json.data.secret, /^[A-Z2-7]+$/)
 })

@@ -161,6 +161,8 @@ export class Cloud189PCClient {
   }
 }
 
-export function calcMD5(buffer: Buffer | Uint8Array): string {
+// 入参统一为 Uint8Array：StorageDriver.put 的内容契约不再假设全局 Buffer。
+// 实现沿用 ../189/crypto 的纯 JS md5Hex（边缘运行时没有 node:crypto）。
+export function calcMD5(buffer: Uint8Array): string {
   return md5Hex(buffer).toUpperCase()
 }

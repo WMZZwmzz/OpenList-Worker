@@ -693,7 +693,7 @@ export class Pan123Client {
   public async uploadFile(
     parentId: string,
     fileName: string,
-    content: Buffer,
+    content: Uint8Array,
   ): Promise<void> {
     let etag = ""
     try {

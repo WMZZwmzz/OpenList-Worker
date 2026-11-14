@@ -179,7 +179,7 @@ export class DropboxDriver implements StorageDriver {
   async put(
     virtualPath: string,
     physicalPath: string,
-    content: Buffer | Uint8Array,
+    content: Uint8Array,
   ): Promise<void> {
     const clean = this.cleanPath(physicalPath)
     // F-335/F-338：参数头改为纯 ASCII 的 JSON（非 Latin-1 文件名不再炸），

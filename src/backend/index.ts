@@ -10,6 +10,7 @@ import {
 import { webdavRouter } from "./server/webdav"
 import { s3Router } from "./server/s3"
 import { setEnvCtx } from "./internal/model/db"
+import { embyRouter, subsonicRouter } from "./server/emby"
 import { getStoreConfigErrorDetail } from "./internal/model/store/backend"
 import { storageErrorSummary, uiStorageError } from "./server/storage-error"
 
@@ -319,6 +320,10 @@ app.route("/api", api)
 app.route("/d", rawRouter)
 app.route("/sd", rawRouter)
 app.route("/p", rawRouter)
+
+// 媒体库协议端点：/@emby 与 /@rest，避免与用户目录冲突
+app.route("/@emby", embyRouter)
+app.route("/@rest", subsonicRouter)
 
 // 内嵌品牌资源（logo/favicon），必须在 SPA 兜底 app.all("*") 之前挂载
 app.route("/", assetsRouter)

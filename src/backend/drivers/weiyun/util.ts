@@ -566,7 +566,8 @@ export class WeiyunClient {
     dirKey: string,
     fileName: string,
     fileSize: number,
-    content: Uint8Array | Buffer | undefined,
+    // F-166：分片会话在 init 阶段拿不到文件真实字节，omitHash 路径传 undefined
+    content?: Uint8Array,
     channelCount = 4,
     fileExistOption = 1,
     options: { omitHash?: boolean } = {},

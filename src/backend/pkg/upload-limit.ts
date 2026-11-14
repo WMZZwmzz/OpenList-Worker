@@ -64,14 +64,16 @@ export const tooLargeResponse = (c: any, limit: number, label = "File") =>
  *
  * 现在改为：`Content-Length` 预检之后，用 `c.req.raw.body` 的 ReadableStream
  * 边读边累计，超过上限立即 `reader.cancel()` 并返回失败，不保留任何 chunk。
- * 返回契约保持不变（`{ ok: true, buffer } | { ok: false, limit }`），三个生产
- * 入口（/fs/put、/fs/multipart/chunk、S3 PutObject）无需改动。
+ *
+ * 返回 `Uint8Array` 而不是 Node 的 `Buffer`（上游 #169/#173）：ESA 等边缘
+ * 运行时没有全局 `Buffer`，直接用 `Buffer.from` 会在读请求体这一步抛
+ * `Buffer is not defined`，导致上传全链路 500。
  */
 export async function readBodyWithinLimit(
   c: any,
   part = false,
   limitOverride?: number,
-): Promise<{ ok: true; buffer: Buffer } | { ok: false; limit: number }> {
+): Promise<{ ok: true; buffer: Uint8Array } | { ok: false; limit: number }> {
   const pre = exceedsUploadLimit(c, part)
   if (pre !== null) return { ok: false, limit: pre }
   // A-18：/fs/form 的 multipart 包体比单个文件多出边界/头部开销，调用方
@@ -85,7 +87,8 @@ export async function readBodyWithinLimit(
   if (!body || typeof body.getReader !== "function") {
     // 退化路径：上下文里没有可用的 ReadableStream（例如只提供 arrayBuffer()
     // 的轻量替身）。只能整体读取，但仍在返回前按实际字节数复核。
-    const buffer = Buffer.from(await c.req.arrayBuffer())
+    // 注意：这只是对同一个 ArrayBuffer 建视图，**不额外拷贝**全量请求体。
+    const buffer = new Uint8Array(await c.req.arrayBuffer())
     if (buffer.length > max) return { ok: false, limit: max }
     return { ok: true, buffer }
   }
@@ -119,7 +122,7 @@ export async function readBodyWithinLimit(
     } catch {}
   }
 
-  const buffer = Buffer.allocUnsafe(total)
+  const buffer = new Uint8Array(total)
   let offset = 0
   for (const chunk of chunks) {
     buffer.set(chunk, offset)

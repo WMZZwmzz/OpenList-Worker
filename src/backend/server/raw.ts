@@ -6,11 +6,6 @@ import { resolveShare, shareClientKey } from "../internal/op/share"
 import { getUserFromContext } from "./middlewares"
 import { canAccess, getNearestMeta } from "../pkg/meta"
 import {
-  getCachedLink,
-  setCachedLink,
-  type CacheTarget,
-} from "../internal/cache"
-import {
   needDownloadSign,
   verifyDownloadSign,
   signDownloadPath,
@@ -321,13 +316,18 @@ async function proxyUpstream(
     "Content-Range, Accept-Ranges, Content-Length, Content-Disposition",
   )
 
-  // Content-Type: prefer upstream, fallback by extension
-  //
-  // 上游类型是用户可上传的文件内容决定的：把 text/html 原样回传等于让攻击者在
-  // 站点自身源上放一个可执行脚本的文档（存储型 XSS），SVG 同理。
-  // HTML/XHTML 一律降级为纯文本下载，SVG 保留可视但锁死脚本。
+  // Content-Type（合并本地 XSS 加固与上游回退修复）：
+  // - 上游给通用 octet-stream（139/OSS 等常见）或缺失时按扩展名回退，
+  //   否则 PDF 在浏览器里不会被当成文档、视频也拿不到 video/*（上游修复）。
+  // - HTML/XHTML 一律降级为纯文本下载、SVG 保留可视但锁死脚本：上游类型由
+  //   用户可上传的文件内容决定，原样回传等于让攻击者在站点自身源上放一个
+  //   可执行脚本的文档（存储型 XSS，本地审计加固）。
+  const upstreamRaw = upstreamRes.headers.get("content-type") || ""
+  const fallbackType = contentTypeForPath(reqPath)
   const upstreamType = (
-    upstreamRes.headers.get("content-type") || contentTypeForPath(reqPath)
+    !upstreamRaw || /^application\/octet-stream/i.test(upstreamRaw)
+      ? fallbackType
+      : upstreamRaw
   ).trim()
   const htmlType = /^(text\/html|application\/xhtml\+xml)/i.test(upstreamType)
   const svgType = /^image\/svg\+xml/i.test(upstreamType)
@@ -361,9 +361,16 @@ async function proxyUpstream(
   // 清洗 CR/LF 与控制字符，防止恶意上游注入额外响应头（Set-Cookie/Location）。
   const contentDisposition = upstreamRes.headers.get("content-disposition")
   if (contentDisposition) {
+    // 媒体库（scope=media）用于在线播放/阅读：上游通常给 attachment，
+    // 会把 PDF 变成下载、把视频变成附件，这里改为 inline。
+    const inlineForMedia = (c.req.query("scope") || "") === "media"
     c.header(
       "Content-Disposition",
-      sanitizeContentDisposition(contentDisposition),
+      sanitizeContentDisposition(
+        inlineForMedia
+          ? contentDisposition.replace(/^\s*attachment/i, "inline")
+          : contentDisposition,
+      ),
     )
   } else if (htmlType) {
     // 降级成纯文本后强制另存为，避免在页面里就地渲染
@@ -554,8 +561,20 @@ rawRouter.get("/*", async (c) => {
       // /p 是公开代理端点，对齐 Go handles.Proxy() 的 canProxy() 检查：
       // 未开启代理、且扩展名也不在 proxy_types / text_types 里 → 403 proxy not allowed。
       // （Go 只对 /p 与归档 /ap 做此限制，/d、/sd 不做，故这里仅判 /p 端点。）
+      // 媒体库签发的 /p（scope=media）：签名本身覆盖了 scope，等价于
+      // 「该用户已获授权读取这个文件」，因此不再受存储 web_proxy 限制。
+      // 不满足时仍按原策略判定（公开 /p 端点防滥用）。
+      const mediaScoped =
+        (c.req.query("scope") || "") === "media" &&
+        (await verifyDownloadSign(
+          c,
+          reqPath,
+          c.req.query("sign") || "",
+          "media",
+        ))
       if (
         isProxyEndpoint &&
+        !mediaScoped &&
         !canUseProxyEndpoint({
           storage: resolved.storage,
           driver: normDriver,
@@ -577,38 +596,28 @@ rawRouter.get("/*", async (c) => {
           // 管理员配置的受信存储 endpoint host（可能是内网自建 S3/WebDAV/MinIO），
           // 加上全局环境变量 SSRF_ALLOWED_HOSTS，合并为 SSRF 白名单，避免被误拦截。
           const trustedHosts = getTrustedHosts(resolved.storage.addition, c.env)
-          // 下载链接缓存：与 /fs/get 共用同一份缓存（键 = storage + 虚拟路径）。
-          // 命中时直接复用直链，跳过驱动换链（网盘侧通常最贵、最易被限流）。
-          const cacheTarget: CacheTarget = {
-            storage: resolved.storage,
-            cleanPath: resolved.cleanPath,
-            physical: resolved.physical,
-            isVirtual: resolved.isVirtual,
-          }
-          let fileItem = await getCachedLink(cacheTarget, c.env)
-          // 仅在缓存未命中时才会实例化驱动（命中时 driver 保持 null，
-          // 见下方 createReadStream 分支的空值保护）。
-          let driver: any = null
-          if (!fileItem) {
-            driver = await getDriver(resolved.storage.driver, resolved.storage)
-            const s3ctx = getStorageRequestContext(c)
-            try {
-              // F-405：bunny 等 CDN 防盗链驱动按请求 IP 计算 token（unknown
-              // 时退回无 IP 签名，与 op 层 getItemResolved 同一策略）。
-              const clientIp = s3ctx?.clientIp
-              fileItem =
-                clientIp && clientIp !== "unknown"
-                  ? await driver.get(reqPath, resolved.physical, clientIp)
-                  : await driver.get(reqPath, resolved.physical)
-            } finally {
-              await flushPendingDriverState(
-                resolved.storage.driver,
-                resolved.storage,
-                driver,
-                s3ctx,
-              )
-            }
-            await setCachedLink(cacheTarget, fileItem, c.env)
+          // 每次请求都向驱动换取直链（上游 #185 移除缓存后的架构）：不做任何
+          // 跨请求缓存，保证链接与文件状态实时。
+          const driver: any = await getDriver(
+            resolved.storage.driver,
+            resolved.storage,
+          )
+          let fileItem: any
+          try {
+            // F-405：bunny 等 CDN 防盗链驱动按请求 IP 计算 token（unknown
+            // 时退回无 IP 签名，与 op 层 getItemResolved 同一策略）。
+            const clientIp = getStorageRequestContext(c)?.clientIp
+            fileItem =
+              clientIp && clientIp !== "unknown"
+                ? await driver.get(reqPath, resolved.physical, clientIp)
+                : await driver.get(reqPath, resolved.physical)
+          } finally {
+            await flushPendingDriverState(
+              resolved.storage.driver,
+              resolved.storage,
+              driver,
+              getStorageRequestContext(c),
+            )
           }
 
           if (fileItem && fileItem.raw_url) {

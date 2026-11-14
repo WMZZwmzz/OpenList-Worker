@@ -429,7 +429,7 @@ export class GuangYaPanDriver implements StorageDriver {
   async put(
     virtualPath: string,
     physicalPath: string,
-    content: Buffer,
+    content: Uint8Array,
   ): Promise<void> {
     const clean = this.cleanPath(physicalPath)
     const parentPath = clean.split("/").slice(0, -1).join("/") || "/"

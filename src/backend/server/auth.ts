@@ -486,6 +486,7 @@ export async function getOrInitUsers(envCtx: any) {
       permission: 0,
       base_path: "/",
       // A-01：默认禁用 guest，匿名访问需管理员显式启用该账号。
+      // 与 defaultDb.users 保持一致（上游 issue #133 同步确认此行为）。
       disabled: true,
       sso_id: "",
       allow_ldap: false,
@@ -516,6 +517,8 @@ export async function getOrInitUsers(envCtx: any) {
       // 未初始化：仅创建 guest，admin 由 Web 安装向导（POST /api/public/init/setup）创建
       db.users = [guest]
     }
+    // 新装默认要求登录（issue #133）：由上面的「guest 默认禁用」实现，
+    // 与 Go 版一致 —— Go 没有 allow_guest 设置项，只有 guest 账号的启用状态。
     // 只有配置了 ADMIN_PASS（或已存在真实管理员）时，这份库才不是空壳，
     // 才应该落盘。未配置时应等待 init/setup 完成初始化，而不是抢先写入一个
     // 未初始化的占位库（会被 saveDb 的写前守卫拦截）。

@@ -323,7 +323,7 @@ export class WoPanDriver implements StorageDriver {
   async put(
     _virtualPath: string,
     physicalPath: string,
-    content: Buffer,
+    content: Uint8Array,
   ): Promise<void> {
     this.resetBudget()
     const parts = physicalPath.split("/").filter(Boolean)

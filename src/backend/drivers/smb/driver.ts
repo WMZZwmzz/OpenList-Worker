@@ -76,7 +76,7 @@ export class SMBDriver implements StorageDriver {
   async put(
     virtualPath: string,
     physicalPath: string,
-    content: Buffer | Uint8Array,
+    content: Uint8Array,
   ): Promise<void> {
     this.unsupported("put")
   }

@@ -28,6 +28,7 @@ const INIT_MARK = "openlist_config"
  * 旧实现为每张表只生成一条 `DELETE ... WHERE key NOT IN (?,?,...)`，占位符
  * 数量等于该表实体数：metas / settings / shares 超过 100 行后，每次 save 都
  * 会因超限整单失败（saveDb 回滚内存，配置无法落盘，且每次都在同一点失败）。
+ * 上游 #184 修复的是同一缺陷（issue #180）。
  *
  * 这里取 90 留出余量，并保证 save() 生成的**任何**单条语句参数数 ≤ 该值。
  */
@@ -225,6 +226,7 @@ export const sqlFormat: FormatAdapter = {
       } else {
         // 大表（> MAX_BOUND_PARAMS 行）：单条 NOT IN 的占位符数会超过
         // D1 / DO 的单语句 100 参数硬上限，整次保存必然失败（F-083）。
+        // 上游 #184 修复的是同一缺陷（issue #180）。
         //
         // 改成：先 SELECT 既有主键，在 JS 侧与 keepKeys 求差集，再把**需要
         // 删除**的键按 ≤ MAX_BOUND_PARAMS 一组用 `DELETE ... WHERE key IN (?)`

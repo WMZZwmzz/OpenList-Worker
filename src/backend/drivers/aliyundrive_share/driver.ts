@@ -206,7 +206,7 @@ export class AliyundriveShareDriver implements StorageDriver {
   async put(
     virtualPath: string,
     physicalPath: string,
-    content: Buffer | Uint8Array,
+    content: Uint8Array,
   ): Promise<void> {
     throw new Error("Aliyundrive Share is read-only")
   }

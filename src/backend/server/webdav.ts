@@ -39,11 +39,7 @@ import { buildWebDavPropfindResponse } from "../internal/webdav/webdav"
 import { safeErrorMessage } from "../pkg/errs"
 import { encodeDownloadPath } from "../pkg/path"
 import { readBodyWithinLimit } from "../pkg/upload-limit"
-import {
-  getSignExpiresIn,
-  needDownloadSign,
-  signDownloadPath,
-} from "../pkg/sign"
+import { appendDownloadSignToRawUrl } from "../pkg/sign"
 
 /**
  * WebDAV 协议服务（挂载于 /dav/*）。
@@ -439,21 +435,15 @@ webdavRouter.all("/*", async (c) => {
         // 端点前缀（/p 还是 /d）与路径编码都由 getItem 决定（见
         // op/storage.ts resolveRawUrlPrefix）：/p 受 Go canProxy() 限制，未开启
         // 代理的存储会 403 proxy not allowed，因此不能在这里硬编码 /p。
-        // A-17：/d 与 /p 是公开下载端点，签名策略开启（sign_all /
-        // link_expiration）或路径受 read_users/encrypt 保护时，raw 端点会
-        // 拒绝无签名请求。此前 302 丢弃签名，WebDAV 下载在受限目录必然 401。
-        let target = rawUrl || `/api/d${encodeDownloadPath(actualPath)}`
-        if (await needDownloadSign(c, actualPath)) {
-          const sign = await signDownloadPath(
-            c,
-            actualPath,
-            await getSignExpiresIn(c),
-          )
-          if (sign) {
-            target += `${target.includes("?") ? "&" : "?"}sign=${encodeURIComponent(sign)}`
-          }
-        }
-        return c.redirect(target, 302)
+        // A-17 / 上游 #175：raw 端点没有 Auth 中间件、要靠签名放行：
+        // sign_all / link_expiration / 存储级 enable_sign / 密码 meta 任一命中
+        // 时，裸链接会被判 401 "sign verify failed"。WebDAV 客户端（Infuse、
+        // rclone 等）不会自己补签名，必须在这里签好（统一走共享助手）。
+        const target = rawUrl || `/api/d${encodeDownloadPath(actualPath)}`
+        return c.redirect(
+          await appendDownloadSignToRawUrl(c, target, actualPath),
+          302,
+        )
       }
 
       case "PUT": {
@@ -464,10 +454,10 @@ webdavRouter.all("/*", async (c) => {
           return metaForbidden(c)
         }
         // F-044：与 /fs/put、S3 PutObject 共用同一套上限（Content-Length 预检 +
-        // 边读边计的实际字节复核）。历史实现直接 arrayBuffer() 整包读入内存，
-        // 超大 PUT（或省略 Content-Length 的 chunked 请求）可打爆 isolate。
-        // 默认上限 25MB（MAX_UPLOAD 可调）；WebDAV 客户端上传大文件需要管理员
-        // 按部署实际调整该变量。
+        // 边读边计的实际字节复核，上游 #169 的 Uint8Array 契约由
+        // readBodyWithinLimit 返回类型保证）。历史实现直接 arrayBuffer()
+        // 整包读入内存，超大 PUT（或省略 Content-Length 的 chunked 请求）
+        // 可打爆 isolate。默认上限 25MB（MAX_UPLOAD 可调）。
         const body = await readBodyWithinLimit(c, false)
         if (!body.ok) {
           return c.text(

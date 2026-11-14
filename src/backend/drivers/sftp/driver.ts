@@ -223,7 +223,7 @@ export class SFTPDriver implements StorageDriver {
   async put(
     _virtualPath: string,
     physicalPath: string,
-    content: Buffer,
+    content: Uint8Array,
   ): Promise<void> {
     const target = cleanPosixPath(physicalPath)
     await this.client.mkdirAll(posixDirname(target))
