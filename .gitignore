@@ -2,6 +2,7 @@
 node_modules
 dist
 dist-server
+esa-dist
 public_data
 
 # temp file

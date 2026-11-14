@@ -607,17 +607,18 @@ export class GithubDriver implements StorageDriver {
 
   async move(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhys: string,
-    _dstPhys: string,
+    dstPhys: string,
   ): Promise<void> {
     if (!this.isOnBranch) {
       throw new Error("cannot write to non-branch reference")
     }
 
     const srcPath = cleanPath(srcPhys)
-    const dstPath = cleanPath(dstDir)
+    // A-08：目标目录取目标项物理路径的父目录（dstDir 含挂载前缀）。
+    const dstPath = dirname(cleanPath(dstPhys))
 
     if (isChildPath(srcPath, dstPath)) {
       throw new Error("cannot move parent dir to child")
@@ -862,17 +863,17 @@ export class GithubDriver implements StorageDriver {
 
   async copy(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhys: string,
-    _dstPhys: string,
+    dstPhys: string,
   ): Promise<void> {
     if (!this.isOnBranch) {
       throw new Error("cannot write to non-branch reference")
     }
 
     const srcPath = cleanPath(srcPhys)
-    const dstPath = cleanPath(dstDir)
+    const dstPath = dirname(cleanPath(dstPhys))
 
     if (isChildPath(srcPath, dstPath)) {
       throw new Error("cannot copy parent dir to child")

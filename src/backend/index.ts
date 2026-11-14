@@ -181,7 +181,17 @@ app.use("*", async (c, next) => {
   const env = (c.env || {}) as any
   try {
     const reqUrl = new URL(c.req.url)
-    if (!env.__requestOrigin) {
+    // A-49：EdgeOne Node 云函数调用 KV 代理时会把内部密钥发往
+    // `__requestOrigin`。若平台不校验 Host，Host 可被伪造。优先使用管理员
+    // 显式固定的来源；未配置时才退回请求 origin（并依赖平台 Host 校验）。
+    const pinnedOrigin = String(
+      env.OPENLIST_ORIGIN || env.PUBLIC_ORIGIN || "",
+    )
+      .trim()
+      .replace(/\/+$/, "")
+    if (pinnedOrigin) {
+      env.__requestOrigin = pinnedOrigin
+    } else if (!env.__requestOrigin) {
       env.__requestOrigin = reqUrl.origin
     }
   } catch {
@@ -209,17 +219,21 @@ app.use("*", async (c, next) => {
     const detail = await getStoreConfigErrorDetailCached(env)
     if (detail.message) {
       const ui = uiStorageError(detail)
+      // A-31：这条 503 在安全头中间件之前返回，必须显式补上安全头；同时
+      // 免鉴权响应不得回显驱动异常原文（可能含内部主机名 / DSN 片段）。
+      c.header("X-Content-Type-Options", "nosniff")
+      c.header("X-Frame-Options", "SAMEORIGIN")
+      c.header("Referrer-Policy", "no-referrer")
+      c.header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+      const safeMessage = ui.reason || storageErrorSummary(detail.message)
       return c.json(
         {
           code: 503,
-          // message 保持完整原因（兼容既有客户端与日志排查）
-          message: detail.message,
+          message: safeMessage,
           data: {
             error: "STORAGE_CONFIG_ERROR",
             code: detail.code,
-            configError: detail.message,
-            // 界面展示 summary（完整一句短原因）+ suggestion（怎么改）；
-            // reason 是截断后的完整说明，留给工具与日志阅读。
+            configError: safeMessage,
             summary: storageErrorSummary(detail.message),
             reason: ui.reason,
             suggestion: ui.suggestion,

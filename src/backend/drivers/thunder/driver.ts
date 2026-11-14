@@ -4,6 +4,7 @@ import {
   StorageDriver,
 } from "../../internal/driver/base"
 import { sortFileItems } from "../../internal/driver/sort"
+import { signS3Headers } from "../s3/sigv4"
 import { randomHex } from "../rand"
 import {
   ThunderAddition,
@@ -22,6 +23,22 @@ import {
   ThunderClient,
   UPLOAD_TYPE_RESUMABLE,
 } from "./util"
+
+/**
+ * A-07：从上传端点推导 SigV4 的 region。
+ * 迅雷返回的 endpoint 可能是 AWS S3（s3.cn-north-1.amazonaws.com.cn）或
+ * S3 兼容服务；无法识别时回退 us-east-1（S3 兼容实现的通用默认值）。
+ */
+function s3RegionOfEndpoint(endpoint: string): string {
+  try {
+    const host = new URL(endpoint).hostname
+    const aws = host.match(/(?:^|\.)s3[.-]([a-z0-9-]+)\.amazonaws\./)
+    if (aws) return aws[1]
+    const oss = host.match(/\.oss-([a-z0-9-]+)\.aliyuncs\.com$/)
+    if (oss) return oss[1]
+  } catch {}
+  return "us-east-1"
+}
 
 function thunderFileToFileItem(
   f: ThunderFile,
@@ -457,13 +474,26 @@ export class ThunderDriver implements StorageDriver {
       }
 
       const uploadUrl = `${endpoint.replace(/\/$/, "")}/${params.bucket}/${params.key}`
-      const headers: Record<string, string> = {
-        "x-amz-security-token": params.security_token,
-      }
-
-      const uploadRes = await fetch(uploadUrl, {
+      // A-07：上传必须使用 params 里的 access_key_id/access_key_secret 做
+      // AWS SigV4 签名。历史实现只带 x-amz-security-token，S3/OSS 对 PUT
+      // 一律 403，迅雷上传 100% 失败。
+      const signed = await signS3Headers({
         method: "PUT",
-        headers,
+        url: uploadUrl,
+        region: s3RegionOfEndpoint(uploadUrl),
+        accessKeyId: params.access_key_id,
+        secretAccessKey: params.access_key_secret,
+        sessionToken: params.security_token,
+        headers: {
+          "content-type": "application/octet-stream",
+          "content-length": String(content.length),
+        },
+        body: content,
+      })
+
+      const uploadRes = await fetch(signed.url, {
+        method: "PUT",
+        headers: signed.headers,
         body: content as any,
       })
 

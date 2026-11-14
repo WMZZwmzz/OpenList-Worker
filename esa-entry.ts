@@ -195,6 +195,9 @@ export default {
     esaVerboseLog = readEsaLogFlag(env, "ESA_LOG_REQUESTS")
     // 【关键】每次请求创建独立的 KV 缓存 Map，隔离不同请求，避免数据污染
     const kvCache = new Map<string, string | null>()
+    // A-66：KV 包装器必须随请求传递，绝不能挂到 globalThis（并发请求会互相
+    // 覆盖，A 请求可能读到 B 请求的缓存/故障态）。
+    let effectiveEnv: any = env
 
     if (isApiRequest) {
       // L-19：原来每个 /api 请求都打印一次 env 变量名清单（含绑定名、内部
@@ -238,14 +241,20 @@ export default {
               e,
             )
           }
-          ;(globalThis as any).KV = wrappedKv
+          if (!env?.KV) {
+            // env 为 frozen/Proxy：用原型链派生一个只覆盖 KV 的视图，
+            // 其余绑定仍从原 env 读取。
+            const derived = Object.create(env || null)
+            derived.KV = wrappedKv
+            effectiveEnv = derived
+          } else {
+            effectiveEnv = env
+          }
           if (isApiRequest) {
-            const envHasKv = !!(env && env.KV)
-            const globalHasKv = !!(globalThis as any).KV
             console.log(
               `[ESA/req:${reqId}] EdgeKV initialized namespace=${namespace}, ` +
                 `probe=${kvTestOk ? "ok" : "FAIL:" + kvTestErr}, ` +
-                `env.KV=${envHasKv}, globalThis.KV=${globalHasKv}, ` +
+                `env.KV=${!!effectiveEnv?.KV}, ` +
                 `JWT_SECRET set=${!!env.JWT_SECRET}`,
             )
           }
@@ -273,7 +282,7 @@ export default {
       )
     }
 
-    const response = await app.fetch(request, env, context)
+    const response = await app.fetch(request, effectiveEnv, context)
 
     // 【关键】对所有 /api/ GET 请求强制 no-cache，防止 ESA CDN 缓存动态 API 响应。
     // 特别是 /api/public/settings：保存设置后立即刷新，CDN 可能返回缓存的旧值，

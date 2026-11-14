@@ -485,7 +485,8 @@ export async function getOrInitUsers(envCtx: any) {
       role: 1,
       permission: 0,
       base_path: "/",
-      disabled: false,
+      // A-01：默认禁用 guest，匿名访问需管理员显式启用该账号。
+      disabled: true,
       sso_id: "",
       allow_ldap: false,
       pwd_update_at: new Date().toISOString(),
@@ -536,12 +537,20 @@ export async function getOrInitUsers(envCtx: any) {
     //                        existing deployment is never locked out nor
     //                        silently reset by upgrading.
     const adminPass = adminUser ? String(adminUser.password || "").trim() : ""
-    const isValidFormat = /^[0-9a-f]{64}$/i.test(adminPass)
+    // A-02：PBKDF2（本移植的默认写入格式）必须被视为「已初始化」。
+    // 历史实现只认 Go 双层 SHA256 的 64 位 hex，导致 PBKDF2 密码永远被判为
+    // 无效：每次登录都用 ADMIN_PASS 重置密码、更换盐并整库落盘，管理员在后台
+    // 改的密码永远不生效，任意未认证请求还能反复踢掉管理员会话。
+    const isValidFormat =
+      isHex64(adminPass) || isPbkdf2PasswordFormat(adminPass)
     if (adminUser && !isValidFormat) {
       const envPass =
         (envCtx && envCtx.ADMIN_PASS) ||
         (typeof process !== "undefined" ? process.env?.ADMIN_PASS : "") ||
         ""
+      // 无法识别格式（空密码 / 历史遗留格式）时，ADMIN_PASS 可显式重置一次；
+      // 重置后写入的是 PBKDF2（上面已纳入有效格式），下一次调用不会再进入
+      // 本分支，因此不会像历史实现那样每次登录都重置并踢掉会话。
       if (envPass) {
         await setUserPassword(adminUser, envPass)
         await saveDb(db, envCtx)
@@ -655,7 +664,7 @@ async function tryConsumeBackupCode(
   return true
 }
 
-async function checkUserOtp(matchedUser: any, body: any, c: any, db: any) {
+export async function checkUserOtp(matchedUser: any, body: any, c: any, db: any) {
   if (!matchedUser.otp_secret) {
     return { ok: true, code: 200, httpStatus: 200 as const, message: "ok" }
   }
@@ -806,6 +815,20 @@ authRouter.post("/otp/login", async (c) => {
     )
   }
 
+  // A-11：OTP 兑换必须与口令登录共享锁定状态。历史实现只记录失败、从不检查
+  // 锁定，6 位 TOTP 可被无限枚举（注释声称与口令登录同一套锁定，实际未落地）。
+  if (await isLoginLocked(c, user.username, c.env)) {
+    return c.json(
+      {
+        code: 429,
+        message:
+          "Too many failed login attempts for this account/IP. Please try again later.",
+        data: null,
+      },
+      429,
+    )
+  }
+
   const otpCheck = await checkUserOtp(user, body, c, db)
   if (!otpCheck.ok) {
     // 与口令登录同一套锁定计数：否则 6 位码可以被无限试碰。
@@ -942,6 +965,14 @@ authRouter.post("/login", async (c) => {
     }
   }
 
+  // A-42：用户不存在时也执行一次等价的 PBKDF2（100k 次），消除
+  // 「存在用户 ~24ms / 不存在 ~0ms」的时序差，防止用户名枚举。
+  if (!matchedUser) {
+    try {
+      await pbkdf2PasswordHashFromStatic(await staticHash(rawPassword || "x"))
+    } catch {}
+  }
+
   // 登录失败 - 记录审计日志
   const auditLogger = getAuditLogger()
   await auditLogger.logLoginFailure(c, username, "Invalid credentials")
@@ -1042,6 +1073,13 @@ authRouter.post("/login/hash", async (c) => {
       })
     }
   }
+
+  // A-42：失败路径统一补一次等价 PBKDF2，避免通过响应耗时枚举用户名。
+  try {
+    await pbkdf2PasswordHashFromStatic(
+      inputHash.length === 64 ? inputHash : "0".repeat(64),
+    )
+  } catch {}
 
   // 登录失败 - 记录审计日志
   const auditLogger = getAuditLogger()

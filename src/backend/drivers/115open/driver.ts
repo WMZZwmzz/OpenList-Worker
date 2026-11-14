@@ -201,6 +201,15 @@ export class Pan115Driver implements StorageDriver {
     )
   }
 
+  /**
+   * A-23：结构变更后必须清空路径→fid 缓存。
+   * 驱动实例被跨请求长期缓存，rename/move/remove 后同名重建会命中旧 fid，
+   * 读写落到已改名/已删除的目录。
+   */
+  private invalidateFidCache(): void {
+    this.fidCache.clear()
+  }
+
   /** 解析物理路径 → 文件夹 fid（逐层 getFolderInfoByPath，带缓存） */
   private async resolveFolderId(physicalPath: string): Promise<string> {
     const rootId = this.getRootId()
@@ -391,6 +400,7 @@ export class Pan115Driver implements StorageDriver {
     const parentId = await this.resolveFolderId(parentPath)
     if (!this.reserve()) throw new Error("subrequest budget exceeded")
     await this.client.mkdir(parentId, dirName)
+    this.invalidateFidCache()
   }
 
   async rename(
@@ -402,6 +412,7 @@ export class Pan115Driver implements StorageDriver {
     const file = await this.resolveFile(physicalPath)
     if (!this.reserve()) throw new Error("subrequest budget exceeded")
     await this.client.updateFile(file.fid, newName)
+    this.invalidateFidCache()
   }
 
   async remove(
@@ -413,6 +424,7 @@ export class Pan115Driver implements StorageDriver {
     const file = await this.resolveFile(physicalPath)
     if (!this.reserve()) throw new Error("subrequest budget exceeded")
     await this.client.delFile(file.fid, file.pid || this.getRootId())
+    this.invalidateFidCache()
   }
 
   /**
@@ -440,6 +452,7 @@ export class Pan115Driver implements StorageDriver {
     const dstId = await this.resolveFolderId(this.parentPhysicalPath(dstPhys))
     if (!this.reserve()) throw new Error("subrequest budget exceeded")
     await this.client.move(file.fid, dstId)
+    this.invalidateFidCache()
   }
 
   async copy(
@@ -454,6 +467,7 @@ export class Pan115Driver implements StorageDriver {
     const dstId = await this.resolveFolderId(this.parentPhysicalPath(dstPhys))
     if (!this.reserve()) throw new Error("subrequest budget exceeded")
     await this.client.copy(dstId, file.fid)
+    this.invalidateFidCache()
   }
 
   // ---- Upload（OSS 直传：秒传 → 二次校验 → PUT Object） ----

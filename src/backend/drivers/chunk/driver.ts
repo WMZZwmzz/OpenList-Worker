@@ -234,16 +234,24 @@ export class ChunkDriver implements StorageDriver {
   ): Promise<void> {
     this.ensureReady()
     const remotePath = this.joinRemote(physicalPath)
+    // A-25：历史实现把「探测 + 删除」放在同一个 try 里，普通文件删除失败
+    // （权限/网络）会落入 catch 去删不存在的分片目录，最终返回成功。
+    let isRegularFile = false
     try {
       await this.remoteDriver!.get("", remotePath)
-      await this.remoteDriver!.remove("", remotePath, names)
+      isRegularFile = true
     } catch {
-      await this.remoteDriver!.remove(
-        "",
-        this.chunkDirRemote(physicalPath),
-        names,
-      )
+      isRegularFile = false
     }
+    if (isRegularFile) {
+      await this.remoteDriver!.remove("", remotePath, names)
+      return
+    }
+    await this.remoteDriver!.remove(
+      "",
+      this.chunkDirRemote(physicalPath),
+      names,
+    )
   }
 
   async move(
@@ -307,19 +315,26 @@ export class ChunkDriver implements StorageDriver {
     const remotePath = this.joinRemote(physicalPath)
 
     // 小文件直接透传（不分片）
-    if (this.addition.chunk_large_file_only && size <= this.partSize) {
-      await this.remoteDriver!.put("", remotePath, content)
-      return
-    }
-    // 空文件或小于分片大小，直接透传
     if (size <= this.partSize) {
+      // A-26：同名文件此前以分片形式存在时，旧分片目录必须清理，否则列表
+      // 会同时出现普通文件与分片文件（同名冲突）。
+      await this.removeChunkDirQuiet(physicalPath)
       await this.remoteDriver!.put("", remotePath, content)
       return
     }
 
     // 分片存储
     const chunkDir = this.chunkDirRemote(physicalPath)
-    // 创建分片目录（忽略已存在错误）
+    // A-26：覆盖上传时先删除旧分片目录。历史实现只做 mkdir，旧文件分片数
+    // 更多时会残留旧尾部，而 listParts 只校验 0..n-1 连续，结果被当成完整
+    // 文件返回截断/损坏内容。
+    await this.removeChunkDirQuiet(physicalPath)
+    try {
+      // 同名普通文件同样要清掉，避免 get 优先命中旧文件。
+      await this.remoteDriver!.remove("", remotePath, [basename(physicalPath)])
+    } catch {
+      // 不存在属正常情况
+    }
     try {
       await this.remoteDriver!.mkdir("", chunkDir)
     } catch {
@@ -328,13 +343,37 @@ export class ChunkDriver implements StorageDriver {
 
     let offset = 0
     let partIndex = 0
-    while (offset < size) {
-      const end = Math.min(offset + this.partSize, size)
-      const partContent = content.subarray(offset, end)
-      const partPath = joinPath(chunkDir, this.getPartName(partIndex))
-      await this.remoteDriver!.put("", partPath, Buffer.from(partContent))
-      offset = end
-      partIndex++
+    try {
+      while (offset < size) {
+        const end = Math.min(offset + this.partSize, size)
+        const partContent = content.subarray(offset, end)
+        const partPath = joinPath(chunkDir, this.getPartName(partIndex))
+        await this.remoteDriver!.put("", partPath, Buffer.from(partContent))
+        offset = end
+        partIndex++
+      }
+    } catch (err) {
+      // 上传中断时清理已写入的分片，避免残缺前缀被当作完整文件。
+      for (let i = 0; i < partIndex; i++) {
+        try {
+          await this.remoteDriver!.remove(
+            "",
+            joinPath(chunkDir, this.getPartName(i)),
+            [this.getPartName(i)],
+          )
+        } catch {}
+      }
+      throw err
+    }
+  }
+
+  /** 静默删除分片目录（A-26：写入前清理旧分片）。 */
+  private async removeChunkDirQuiet(physicalPath: string): Promise<void> {
+    const chunkDir = this.chunkDirRemote(physicalPath)
+    try {
+      await this.remoteDriver!.remove("", chunkDir, [basename(chunkDir)])
+    } catch {
+      // 不存在属正常情况
     }
   }
 

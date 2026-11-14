@@ -43,12 +43,16 @@ function getEsaBlobBinding(env?: any): any | null {
 }
 
 /**
- * 获取 EdgeOne Blob Store（使用 SDK）
+ * 获取 EdgeOne Blob Store（使用 SDK）。
+ *
+ * A-16：store 名必须与 legacy 实现（internal/model/store/json.ts）一致——
+ * `openlist_db` + strong consistency。历史新驱动固定 `getStore("default")`，
+ * 从 legacy 升级后读到空库，进而可能触发重新初始化并覆盖真实配置。
  */
-async function getEdgeOneStore(namespace: string = "default"): Promise<any | null> {
+async function getEdgeOneStore(namespace: string = "openlist_db"): Promise<any | null> {
   try {
     const { getStore } = await import("@edgeone/pages-blob")
-    return getStore(namespace)
+    return getStore({ name: namespace, consistency: "strong" } as any)
   } catch {
     return null
   }

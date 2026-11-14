@@ -910,7 +910,7 @@ export async function getStoreStatus(env?: any): Promise<any> {
  */
 export async function isPersistentStorageAvailable(env?: any): Promise<boolean> {
   const status = await getStorageStatusSafe(env)
-  return isPersistentStatus(status)
+  return isPersistentStatus(status, env)
 }
 
 /** 存储状态查询，任何异常都折叠成「不可用」状态而非抛出。 */
@@ -934,10 +934,14 @@ async function getStorageStatusSafe(env?: any): Promise<any> {
  * 供 isPersistentStorageAvailable() 与 getStoreConfigErrorDetail() 共用，
  * 避免两处规则漂移导致「自检说不可用、实际请求却放行」。
  */
-function isPersistentStatus(status: any): boolean {
+function isPersistentStatus(status: any, env?: any): boolean {
   const driver = String(status?.driver ?? "none")
   const hasDriver = driver !== "none" && driver !== ""
   const isMemory = driver === "memory"
+  // A-32：内存驱动只在 serverless 环境判为不可用（重启即丢）。本地 Node /
+  // 单机演示本来就是「auto 无绑定 → 内存回退」的合法场景，全局 503 门禁
+  // 不应把它一并拦死（与 backend.ts 的 autoDetectDriver 注释一致）。
+  const memoryAcceptable = isMemory && !isServerlessRuntime(env)
   const hasConfigError = Boolean(status?.configError)
   // F-078：health 失败时 status 的形状并不统一 —— kv/blob 会带 `available:false`，
   // 而 d1/do/mysql/cfkv（以及 getStoreStatus 的 health 异常兜底）只返回
@@ -947,7 +951,12 @@ function isPersistentStatus(status: any): boolean {
   // 两个字段都为 false 才算不健康；任何一个是 false 即视为不健康。
   const driverHealthy =
     status?.available !== false && status?.connected !== false
-  return hasDriver && !isMemory && !hasConfigError && driverHealthy
+  return (
+    hasDriver &&
+    (!isMemory || memoryAcceptable) &&
+    !hasConfigError &&
+    driverHealthy
+  )
 }
 
 /**
@@ -1020,7 +1029,7 @@ export async function getStoreConfigErrorDetail(
   const status = await getStorageStatusSafe(env)
 
   // 配置齐全且健康：无错误（重置去重状态，便于下次复现时仍能看到日志）
-  if (isPersistentStatus(status)) {
+  if (isPersistentStatus(status, env)) {
     lastConfigErrorLog = null
     return { code: null, message: null, suggestion: null }
   }

@@ -444,14 +444,17 @@ export class Pan123Driver implements StorageDriver {
 
   async move(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
     const budget = newBudget()
     const { file } = await this.resolveFile(srcPhysical, budget)
-    const dstParts = String(dstDir).split("/").filter(Boolean)
+    // A-08：dstPhysical 是目标项自身的物理路径；虚拟 dstDir 含挂载前缀，
+    // 直接拿去解析会在非根挂载下落到不存在的目录。取物理路径的父目录。
+    const dstParts = String(dstPhysical).split("/").filter(Boolean)
+    dstParts.pop()
     const targetParentId = await this.resolveFolderId("/" + dstParts.join("/"), budget)
     await this.client.move([String(file.FileId)], targetParentId)
   }

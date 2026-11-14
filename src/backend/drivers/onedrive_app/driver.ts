@@ -329,10 +329,18 @@ export class OnedriveAPP implements StorageDriver {
     }
   }
 
-  async getDirectUploadInfo(physicalPath: string) {
+  async getDirectUploadInfo(dstDir: string, fileName?: string) {
     if (!this.enable_direct_upload) {
       throw new Error("Direct upload is not enabled")
     }
-    return getDirectUploadInfo(this, physicalPath)
+    // A-10：上传会话必须建在「目录 + 文件名」上。历史实现只接收目录路径，
+    // 调用方的 fileName 被丢弃，会话落在目录节点（或 400），多文件同名互覆盖。
+    const parts = String(dstDir || "")
+      .split("/")
+      .filter(Boolean)
+    const name = fileName || parts.pop() || ""
+    const parent = parts.join("/")
+    const target = parent ? `/${parent}/${name}` : `/${name}`
+    return getDirectUploadInfo(this, target)
   }
 }

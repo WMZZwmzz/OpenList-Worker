@@ -854,7 +854,10 @@ export class FTPClient {
   private async removeFileInternal(remotePath: string): Promise<void> {
     await this.ensureConnected()
     const res = await this.sendCommand(`DELE ${remotePath}`)
-    if (res.code >= 400 && res.code !== 550) {
+    // A-25：550 既可能是「文件不存在」，也可能是「无权限 / 目录非空」。
+    // 历史实现对 550 直接放行，删除失败被伪装成成功。这里统一抛错，由调用方
+    // 决定是否按「不存在」处理（removeRecursive 会先 list 再删除）。
+    if (res.code >= 400) {
       throw new Error(`[FTP] DELE failed: ${res.raw}`)
     }
   }
@@ -866,7 +869,8 @@ export class FTPClient {
   private async removeDirInternal(remotePath: string): Promise<void> {
     await this.ensureConnected()
     const res = await this.sendCommand(`RMD ${remotePath}`)
-    if (res.code >= 400 && res.code !== 550) {
+    // A-25：同 DELE，550 不能当作成功。
+    if (res.code >= 400) {
       throw new Error(`[FTP] RMD failed: ${res.raw}`)
     }
   }

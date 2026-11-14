@@ -1,5 +1,6 @@
 import { Hono } from "hono"
 import type { Context } from "hono"
+import pkg from "../../../package.json"
 import { cors } from "hono/cors"
 import { getDb, getKvStatus } from "../internal/model/db"
 import {
@@ -303,7 +304,8 @@ export function setupRouter(app: Hono) {
     c.json({
       ok: true,
       name: "OpenList",
-      version: "v4.2.3",
+      // A-68：版本号以 package.json 为唯一来源，避免多处硬编码漂移。
+      version: `v${pkg.version}`,
       environment: (c.env as any)?.ENVIRONMENT || "development",
     }),
   )
@@ -373,7 +375,7 @@ export function setupRouter(app: Hono) {
       {
         ok: healthy,
         name: "OpenList",
-        version: "v4.2.3",
+        version: `v${pkg.version}`,
         checks,
       },
       healthy ? 200 : 503,

@@ -288,8 +288,12 @@ export class SeafileDriver implements StorageDriver {
     newName: string,
   ): Promise<void> {
     const { repoId, innerPath } = await this.resolveRepoAndPath(physicalPath)
+    // A-38：目录改名必须走 /dir/ 端点，/file/ 只适用于文件（否则目录
+    // rename 返回 File not found）。先解析目标条目类型。
+    const item = await this.get(virtualPath, physicalPath)
+    const endpoint = item.is_dir ? "dir" : "file"
     await this.client.request(
-      `/api2/repos/${encodeURIComponent(repoId)}/file/`,
+      `/api2/repos/${encodeURIComponent(repoId)}/${endpoint}/`,
       {
         method: "POST",
         isFormData: true,

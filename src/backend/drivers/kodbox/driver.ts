@@ -55,50 +55,39 @@ export class DriverKodbox implements StorageDriver {
     const parts = full.split("/").filter(Boolean)
     const name = parts[parts.length - 1] || "root"
     const parentPath = "/" + parts.slice(0, -1).join("/")
-    try {
-      const entries = await this.client.list(parentPath === "//" ? "/" : parentPath)
-      const entry = entries.find((e) => e.name === name)
-      if (entry) {
-        const item: FileItem = {
-          name: entry.name,
-          size: entry.size || 0,
-          is_dir: entry.type === "folder",
-          modified: entry.modifyTime
-            ? new Date(entry.modifyTime * 1000).toISOString()
-            : new Date().toISOString(),
-          sign: "",
-          type: calcFileType(entry.name, entry.type === "folder"),
-          raw_url: "",
-        }
-        if (!item.is_dir) {
-          item.raw_url = this.client.downloadUrl(entry.path || full)
-        }
-        return item
+    // A-24：列取失败（401/限流/网络）必须抛出，不能吞成 0 字节文件。
+    const entries = await this.client.list(
+      parentPath === "//" ? "/" : parentPath,
+    )
+    const entry = entries.find((e) => e.name === name)
+    if (entry) {
+      const item: FileItem = {
+        name: entry.name,
+        size: entry.size || 0,
+        is_dir: entry.type === "folder",
+        modified: entry.modifyTime
+          ? new Date(entry.modifyTime * 1000).toISOString()
+          : new Date().toISOString(),
+        sign: "",
+        type: calcFileType(entry.name, entry.type === "folder"),
+        raw_url: "",
       }
-    } catch {}
+      if (!item.is_dir) {
+        item.raw_url = this.client.downloadUrl(entry.path || full)
+      }
+      return item
+    }
 
-    // Fallback: 目录
-    try {
-      await this.client.list(full)
-      return {
-        name,
-        size: 0,
-        is_dir: true,
-        modified: new Date().toISOString(),
-        sign: "",
-        type: 1,
-        raw_url: "",
-      }
-    } catch {
-      return {
-        name,
-        size: 0,
-        is_dir: false,
-        modified: new Date().toISOString(),
-        sign: "",
-        type: 0,
-        raw_url: "",
-      }
+    // Fallback: 目录；解析失败直接抛出（上层转 404）。
+    await this.client.list(full)
+    return {
+      name,
+      size: 0,
+      is_dir: true,
+      modified: new Date().toISOString(),
+      sign: "",
+      type: 1,
+      raw_url: "",
     }
   }
 

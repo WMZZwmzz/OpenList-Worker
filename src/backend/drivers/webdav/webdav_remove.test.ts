@@ -124,8 +124,10 @@ test("Webdav move() 请求源与 Destination 头分别为源/目标项自身路�
 test("Webdav root_folder_path 前缀只拼一次（remove 与 move）", async () => {
   const removeCalls: Call[] = []
 
+  // 通用层 resolvePath 已把 root_folder_path 拼进 physicalPath，
+  // 驱动只负责原样使用（A-06：不得再拼第二次）。
   await withMock(removeCalls, () =>
-    makeDriver("/root").remove("/d/a.txt", "/d/a.txt", ["a.txt"]),
+    makeDriver("/root").remove("/d/a.txt", "/root/d/a.txt", ["a.txt"]),
   )
   const removeDeletes = removeCalls.filter((c) => c.method === "DELETE")
   assert.equal(
@@ -152,8 +154,8 @@ test("Webdav root_folder_path 前缀只拼一次（remove 与 move）", async ()
       "/d",
       "/d/dst",
       ["a.txt"],
-      "/d/a.txt",
-      "/d/dst/a.txt",
+      "/root/d/a.txt",
+      "/root/d/dst/a.txt",
     ),
   )
   const rootMoves = moveCalls.filter((c) => c.method === "MOVE")

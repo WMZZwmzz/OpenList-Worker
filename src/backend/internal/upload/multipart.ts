@@ -88,6 +88,11 @@ const CHUNK_DEFAULT = 10 * 1024 * 1024 // 10MB
  */
 export const MAX_UPLOAD_BYTES = 100 * 1024 * 1024 * 1024 // 100GB
 export const MAX_TOTAL_CHUNKS = 20000
+/**
+ * A-64：单个 isolate 内的会话数量上限。每个会话都持有 received Set 与
+ * partMd5s 数组，无上限时持写权限的用户可反复 init 打满内存。
+ */
+export const MAX_SESSIONS = 1000
 
 /** 将前端建议的 chunk_size clamp 到 [1MB, 64MB] */
 export function clampChunkSize(raw: number): number {
@@ -194,6 +199,15 @@ export function findReceivingSession(
 }
 
 export function putSession(s: MultipartSession): void {
+  // A-64：会话数量上限（先尝试清理过期会话，仍满则拒绝）。
+  if (!sessions.has(s.upload_id) && sessions.size >= MAX_SESSIONS) {
+    pruneSessions()
+    if (sessions.size >= MAX_SESSIONS) {
+      throw new Error(
+        `too many upload sessions (limit ${MAX_SESSIONS}); finish or abort existing uploads first`,
+      )
+    }
+  }
   const limit = sessionLimitError(s)
   if (limit) {
     // 越界会话不得进入内存 Map：MAX_UPLOAD_BYTES / MAX_TOTAL_CHUNKS 此前只被

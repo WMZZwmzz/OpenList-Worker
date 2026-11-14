@@ -210,7 +210,9 @@ export async function cacheGetEnvelope<T = any>(
       // F-104：修订号不匹配（或旧条目没有修订号）→ 不能当作命中。
       // 顺手删掉**这一个**后端上的陈旧条目（不要调 cacheDelete：那会连其他
       // 后端上仍有效的条目一起删，见 F-105）。
-      if (revision !== undefined && revision !== "") {
+      // A-29：修订号为空串时也必须校验。历史实现 `revision !== ""` 直接放行，
+      // 存储对象缺少 modified（Go/导入数据）时编辑后到 TTL 前仍会返回旧列表/旧直链。
+      if (revision !== undefined) {
         if (parsed.rev !== revision) {
           try {
             await driver.delete(key, env)
@@ -273,7 +275,8 @@ export async function cacheSetEnvelope<T = any>(
 
   const now = Date.now()
   const envelope: CacheEnvelope<T> = { v: value, ts: now, exp: now + ttlMs }
-  if (opts.revision !== undefined && opts.revision !== "") {
+  // A-29：空串修订号同样要写入，读路径才能对「空修订号」做一致性校验。
+  if (opts.revision !== undefined) {
     envelope.rev = opts.revision
   }
   let raw: string

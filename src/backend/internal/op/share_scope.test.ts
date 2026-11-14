@@ -91,7 +91,8 @@ const seedTenant = async (files: string[]) =>
           username: "u1",
           password: "x",
           role: 0,
-          permission: 0,
+          // A-62：分享创建者必须拥有 SHARE 权限位（1 << 14）
+          permission: 16384,
           base_path: "/u1",
           disabled: false,
         },

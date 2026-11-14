@@ -10,4 +10,6 @@ export interface AzureBlobAddition {
 export interface AzureListResult {
   blobs: Array<{ name: string; size: number; modified: string }>
   prefixes: string[]
+  /** A-35：分页标记；非空时必须带 marker 继续列取。 */
+  nextMarker?: string
 }

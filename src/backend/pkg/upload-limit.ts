@@ -70,10 +70,16 @@ export const tooLargeResponse = (c: any, limit: number, label = "File") =>
 export async function readBodyWithinLimit(
   c: any,
   part = false,
+  limitOverride?: number,
 ): Promise<{ ok: true; buffer: Buffer } | { ok: false; limit: number }> {
   const pre = exceedsUploadLimit(c, part)
   if (pre !== null) return { ok: false, limit: pre }
-  const max = getUploadSizeLimit(c, part)
+  // A-18：/fs/form 的 multipart 包体比单个文件多出边界/头部开销，调用方
+  // 可以传入「文件上限 + 余量」，读取后再按文件实际字节复核。
+  const max =
+    Number.isFinite(limitOverride) && Number(limitOverride) > 0
+      ? Number(limitOverride)
+      : getUploadSizeLimit(c, part)
 
   const body = c?.req?.raw?.body
   if (!body || typeof body.getReader !== "function") {

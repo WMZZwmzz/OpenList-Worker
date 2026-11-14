@@ -23,6 +23,11 @@ import {
 } from "../pkg/meta"
 import type { Meta } from "../pkg/meta"
 import { safeDecodeComponent } from "../pkg/path"
+import {
+  getSignExpiresIn,
+  needDownloadSign,
+  signDownloadPath,
+} from "../pkg/sign"
 
 /**
  * S3 网关（简化版，挂载于 /s3/*）。
@@ -251,7 +256,19 @@ s3Router.get("/*", async (c) => {
     if (!item) return s3Error("NoSuchKey", "NoSuchKey", 404)
     if (item.is_dir) return s3Error("NoSuchKey", "NoSuchKey", 404)
     if (rawUrl) {
-      return c.redirect(rawUrl, 302)
+      // A-17：/d /p 公开端点需要签名时，302 必须携带签名，否则受限目录下载 401。
+      let target = rawUrl
+      if (await needDownloadSign(c, virtualPath)) {
+        const sign = await signDownloadPath(
+          c,
+          virtualPath,
+          await getSignExpiresIn(c),
+        )
+        if (sign) {
+          target += `${target.includes("?") ? "&" : "?"}sign=${encodeURIComponent(sign)}`
+        }
+      }
+      return c.redirect(target, 302)
     }
     return s3Error("NoSuchKey", "NoSuchKey", 404)
   } catch (e: any) {

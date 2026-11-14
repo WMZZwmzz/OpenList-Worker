@@ -619,18 +619,49 @@ export class WebdavClient {
     } = {},
   ): Promise<Response> {
     const fullUrl = this.buildUrl(remotePath)
-    const urlObj = new URL(fullUrl)
-    const uri = urlObj.pathname + urlObj.search
+    const origin = new URL(fullUrl).origin
 
-    const authHeaders = this.getAuthHeaders(method, uri)
-    const headers = { ...authHeaders, ...(options.headers || {}) }
-
-    let resp = await fetch(fullUrl, {
-      method,
-      headers,
-      body: options.body,
-      redirect: options.redirect || "follow",
-    })
+    // A-74：不再用 redirect:"follow" 让运行时自动跟随——Basic/Digest/Cookie
+    // 会随重定向被发往新 host。这里手动跟随，但只允许同源跳转（最多 5 跳）。
+    let currentUrl = fullUrl
+    let currentMethod = method
+    let currentBody = options.body
+    let headers: Record<string, string> = {}
+    let resp!: Response
+    for (let hop = 0; hop <= 5; hop++) {
+      const urlObj = new URL(currentUrl)
+      const uri = urlObj.pathname + urlObj.search
+      headers = {
+        ...this.getAuthHeaders(currentMethod, uri),
+        ...(options.headers || {}),
+      }
+      resp = await fetch(currentUrl, {
+        method: currentMethod,
+        headers,
+        body: currentBody,
+        redirect: "manual",
+      })
+      if (![301, 302, 303, 307, 308].includes(resp.status)) break
+      const location = resp.headers.get("location")
+      if (!location) break
+      const next = new URL(location, currentUrl)
+      if (next.origin !== origin) {
+        throw new Error(
+          `WebDAV redirect blocked: cross-origin redirect to ${next.origin}`,
+        )
+      }
+      if (hop === 5) throw new Error("WebDAV redirect loop (too many redirects)")
+      currentUrl = next.toString()
+      if (
+        resp.status === 303 ||
+        ((resp.status === 301 || resp.status === 302) &&
+          currentMethod !== "GET" &&
+          currentMethod !== "HEAD")
+      ) {
+        currentMethod = "GET"
+        currentBody = null
+      }
+    }
 
     // Handle 401 Digest Auth negotiation
     if (resp.status === 401 && !this.isSharepoint) {
@@ -638,11 +669,13 @@ export class WebdavClient {
       if (/digest/i.test(wwwAuth)) {
         this.digestParts = parseDigestChallenge(wwwAuth)
         this.ncCount = 1
+        const urlObj = new URL(currentUrl)
+        const uri = urlObj.pathname + urlObj.search
         const retryAuth = computeDigestAuth(
           this.digestParts,
           this.username,
           this.password,
-          method,
+          currentMethod,
           uri,
           this.ncCount,
         )
@@ -650,11 +683,11 @@ export class WebdavClient {
           ...headers,
           Authorization: retryAuth,
         }
-        resp = await fetch(fullUrl, {
-          method,
+        resp = await fetch(currentUrl, {
+          method: currentMethod,
           headers: retryHeaders,
-          body: options.body,
-          redirect: options.redirect || "follow",
+          body: currentBody,
+          redirect: "manual",
         })
       }
     }

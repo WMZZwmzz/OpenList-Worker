@@ -16,6 +16,48 @@ import { UrlTreeAddition, UrlTreeNode } from "./types"
 
 // ---- 树构建 ----
 
+/**
+ * A-69：名称中的 `:` / 换行 / 反斜杠会破坏 `name:size:mtime:url` 文本格式
+ * （重载后节点错位，甚至可注入额外节点）。写入时转义，读取时还原。
+ */
+function escapeName(name: string): string {
+  return String(name || "")
+    .replace(/\\/g, "\\\\")
+    .replace(/:/g, "\\:")
+    .replace(/\r/g, "\\r")
+    .replace(/\n/g, "\\n")
+}
+
+function unescapeName(name: string): string {
+  return String(name || "")
+    .replace(/\\r/g, "\r")
+    .replace(/\\n/g, "\n")
+    .replace(/\\:/g, ":")
+    .replace(/\\\\/g, "\\")
+}
+
+/** 按未转义的 `:` 分割（供文件行解析使用）。 */
+function splitUnescapedColon(value: string): string[] {
+  const out: string[] = []
+  let cur = ""
+  for (let i = 0; i < value.length; i++) {
+    const ch = value[i]
+    if (ch === "\\" && i + 1 < value.length) {
+      cur += ch + value[i + 1]
+      i++
+      continue
+    }
+    if (ch === ":") {
+      out.push(cur)
+      cur = ""
+      continue
+    }
+    cur += ch
+  }
+  out.push(cur)
+  return out
+}
+
 function parseFileLine(line: string): UrlTreeNode {
   const httpIdx = line.indexOf("http://")
   const httpsIdx = line.indexOf("https://")
@@ -44,8 +86,8 @@ function parseFileLine(line: string): UrlTreeNode {
     if (!trimmed) {
       throw new Error(`invalid line: ${line}, file name can't be empty`)
     }
-    const parts = trimmed.split(":")
-    node.name = parts[0]
+    const parts = splitUnescapedColon(trimmed)
+    node.name = unescapeName(parts[0])
     if (parts.length > 1) {
       const size = parseInt(parts[1], 10)
       if (Number.isNaN(size)) {
@@ -98,7 +140,7 @@ function buildTree(text: string): UrlTreeNode {
     if (line.endsWith(":")) {
       const node: UrlTreeNode = {
         url: "",
-        name: line.slice(0, -1),
+        name: unescapeName(line.slice(0, -1)),
         level,
         modified: 0,
         size: 0,
@@ -137,14 +179,19 @@ function stringifyTree(root: UrlTreeNode): string {
     const indent = "  ".repeat(node.level)
     if (!node.url) {
       const children = node.children.map(walk).join("\n")
-      return `${indent}${node.name}:${children ? "\n" + children : ""}`
+      return `${indent}${escapeName(node.name)}:${children ? "\n" + children : ""}`
     }
     const base = new URL(node.url)
     const baseName = base.pathname.split("/").filter(Boolean).pop() || ""
     if (node.size === 0 && node.modified === 0) {
-      return `${indent}${baseName === node.name ? node.url : `${node.name}:${node.url}`}`
+      // 名称等于 URL 末段时可省略名称；比较用原始名称，输出用转义后的名称。
+      return `${indent}${
+        baseName === node.name
+          ? node.url
+          : `${escapeName(node.name)}:${node.url}`
+      }`
     }
-    let info = node.name
+    let info = escapeName(node.name)
     if (node.size !== 0 || node.modified !== 0) info += `:${node.size}`
     if (node.modified !== 0) info += `:${node.modified}`
     return `${indent}${info}:${node.url}`

@@ -52,30 +52,18 @@ export class DriverOpenlist implements StorageDriver {
         raw_url: data.raw_url || "",
       }
     } catch {
-      // Fallback: 可能是目录
-      try {
-        await this.client.list(physicalPath)
-        const parts = physicalPath.split("/").filter(Boolean)
-        return {
-          name: parts[parts.length - 1] || "root",
-          size: 0,
-          is_dir: true,
-          modified: new Date().toISOString(),
-          sign: "",
-          type: 1,
-          raw_url: "",
-        }
-      } catch {
-        const parts = physicalPath.split("/").filter(Boolean)
-        return {
-          name: parts[parts.length - 1] || "root",
-          size: 0,
-          is_dir: false,
-          modified: new Date().toISOString(),
-          sign: "",
-          type: 0,
-          raw_url: "",
-        }
+      // Fallback: 可能是目录。目录也拉取失败时必须抛出（A-24），
+      // 不能伪造一个 0 字节文件掩盖鉴权/网络错误。
+      await this.client.list(physicalPath)
+      const parts = physicalPath.split("/").filter(Boolean)
+      return {
+        name: parts[parts.length - 1] || "root",
+        size: 0,
+        is_dir: true,
+        modified: new Date().toISOString(),
+        sign: "",
+        type: 1,
+        raw_url: "",
       }
     }
   }

@@ -49,6 +49,14 @@ export class AliDocDriver implements StorageDriver {
     await this.client.checkCookie()
   }
 
+  /**
+   * A-23：结构变更后清空路径→dentryUuid 缓存，避免同名重建命中已删除/改名的
+   * 目录（驱动实例跨请求长期缓存）。
+   */
+  private invalidateIdCache(): void {
+    this.idCache.clear()
+  }
+
   private cleanPath(p: string): string {
     const s = "/" + (p || "").split("/").filter(Boolean).join("/")
     return s === "/" ? "/" : s
@@ -162,6 +170,7 @@ export class AliDocDriver implements StorageDriver {
       parentDentryUuid: parentId,
       conflictHandleStrategy: "auto_rename",
     })
+    this.invalidateIdCache()
   }
 
   async rename(
@@ -174,6 +183,7 @@ export class AliDocDriver implements StorageDriver {
       dentryUuid: id,
       name: newName,
     })
+    this.invalidateIdCache()
   }
 
   async move(
@@ -192,6 +202,7 @@ export class AliDocDriver implements StorageDriver {
       sourceDentryUuid: srcId,
       operateFrom: 1,
     })
+    this.invalidateIdCache()
   }
 
   async copy(
@@ -211,6 +222,7 @@ export class AliDocDriver implements StorageDriver {
       operateFrom: 1,
       onlyCopyMeta: false,
     })
+    this.invalidateIdCache()
   }
 
   async remove(
@@ -220,6 +232,7 @@ export class AliDocDriver implements StorageDriver {
   ): Promise<void> {
     const id = await this.resolveItemId(physicalPath)
     await this.client.post("/box/api/v1/dentry/recycle", { dentryUuid: id })
+    this.invalidateIdCache()
   }
 
   async put(

@@ -27,12 +27,15 @@ importers:
       '@embedpdf/snippet':
         specifier: ^2.14.4
         version: 2.14.4(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(svelte@5.56.8)(vue@3.5.40(typescript@5.9.3))
+      '@hono/node-server':
+        specifier: ^1.19.17
+        version: 1.19.17(hono@4.13.17)
       '@hono/vite-dev-server':
         specifier: ^0.26.1
         version: 0.26.1(hono@4.13.17)(miniflare@3.20250718.3)(wrangler@4.152.0(@types/node@24.13.3))
       '@hope-ui/solid':
         specifier: github:OpenListTeam/hope-ui#31b436e36ae5d266016814ba71a442ffa9d91181
-        version: https://codeload.github.com/OpenListTeam/hope-ui/tar.gz/31b436e36ae5d266016814ba71a442ffa9d91181(@stitches/core@1.2.8)(solid-js@1.9.14)(solid-transition-group@0.3.0(solid-js@1.9.14))
+        version: git+https://git@github.com:OpenListTeam/hope-ui.git#31b436e36ae5d266016814ba71a442ffa9d91181(@stitches/core@1.2.8)(solid-js@1.9.14)(solid-transition-group@0.3.0(solid-js@1.9.14))
       '@jellyfin/libass-wasm':
         specifier: ^4.2.4
         version: 4.2.4
@@ -134,7 +137,7 @@ importers:
         version: 0.55.1
       mpegts.js:
         specifier: github:OpenListTeam/mpegts.js#1e51e0f6f918cf08e05dfae9c7bfcf658d6b4ac2
-        version: https://codeload.github.com/OpenListTeam/mpegts.js/tar.gz/1e51e0f6f918cf08e05dfae9c7bfcf658d6b4ac2
+        version: git+https://git@github.com:OpenListTeam/mpegts.js.git#1e51e0f6f918cf08e05dfae9c7bfcf658d6b4ac2
       mysql2:
         specifier: ^3.11.0
         version: 3.24.3(@types/node@24.13.3)
@@ -1636,8 +1639,8 @@ packages:
       wrangler:
         optional: true
 
-  '@hope-ui/solid@https://codeload.github.com/OpenListTeam/hope-ui/tar.gz/31b436e36ae5d266016814ba71a442ffa9d91181':
-    resolution: {tarball: https://codeload.github.com/OpenListTeam/hope-ui/tar.gz/31b436e36ae5d266016814ba71a442ffa9d91181}
+  '@hope-ui/solid@git+https://git@github.com:OpenListTeam/hope-ui.git#31b436e36ae5d266016814ba71a442ffa9d91181':
+    resolution: {commit: 31b436e36ae5d266016814ba71a442ffa9d91181, repo: git@github.com:OpenListTeam/hope-ui.git, type: git}
     version: 0.6.7
     peerDependencies:
       '@stitches/core': ^1.2.8
@@ -3611,8 +3614,8 @@ packages:
   monaco-editor@0.55.1:
     resolution: {integrity: sha512-jz4x+TJNFHwHtwuV9vA9rMujcZRb0CEilTEwG2rRSpe/A7Jdkuj8xPKttCgOh+v/lkHy7HsZ64oj+q3xoAFl9A==}
 
-  mpegts.js@https://codeload.github.com/OpenListTeam/mpegts.js/tar.gz/1e51e0f6f918cf08e05dfae9c7bfcf658d6b4ac2:
-    resolution: {tarball: https://codeload.github.com/OpenListTeam/mpegts.js/tar.gz/1e51e0f6f918cf08e05dfae9c7bfcf658d6b4ac2}
+  mpegts.js@git+https://git@github.com:OpenListTeam/mpegts.js.git#1e51e0f6f918cf08e05dfae9c7bfcf658d6b4ac2:
+    resolution: {commit: 1e51e0f6f918cf08e05dfae9c7bfcf658d6b4ac2, repo: git@github.com:OpenListTeam/mpegts.js.git, type: git}
     version: 1.8.1
 
   ms@2.1.3:
@@ -5803,7 +5806,7 @@ snapshots:
       miniflare: 3.20250718.3
       wrangler: 4.152.0(@types/node@24.13.3)
 
-  '@hope-ui/solid@https://codeload.github.com/OpenListTeam/hope-ui/tar.gz/31b436e36ae5d266016814ba71a442ffa9d91181(@stitches/core@1.2.8)(solid-js@1.9.14)(solid-transition-group@0.3.0(solid-js@1.9.14))':
+  '@hope-ui/solid@git+https://git@github.com:OpenListTeam/hope-ui.git#31b436e36ae5d266016814ba71a442ffa9d91181(@stitches/core@1.2.8)(solid-js@1.9.14)(solid-transition-group@0.3.0(solid-js@1.9.14))':
     dependencies:
       '@floating-ui/dom': 0.4.4
       '@stitches/core': 1.2.8
@@ -8027,7 +8030,7 @@ snapshots:
       dompurify: 3.4.17
       marked: 14.0.0
 
-  mpegts.js@https://codeload.github.com/OpenListTeam/mpegts.js/tar.gz/1e51e0f6f918cf08e05dfae9c7bfcf658d6b4ac2:
+  mpegts.js@git+https://git@github.com:OpenListTeam/mpegts.js.git#1e51e0f6f918cf08e05dfae9c7bfcf658d6b4ac2:
     dependencies:
       es6-promise: 4.2.8
 

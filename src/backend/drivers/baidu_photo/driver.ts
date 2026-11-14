@@ -19,6 +19,13 @@ function getFileName(path: string): string {
   return path.split("/").pop() || ""
 }
 
+/** 物理路径的父目录（A-08：目标目录必须由 dstPhysical 推导）。 */
+function parentDirOf(path: string): string {
+  const parts = String(path || "/").split("/").filter(Boolean)
+  parts.pop()
+  return "/" + parts.join("/")
+}
+
 function albumToItem(a: BaiduPhotoAlbum): FileItem {
   return {
     name: a.title,
@@ -259,13 +266,14 @@ export class DriverBaiduPhoto implements StorageDriver {
 
   async move(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
     const entry = await this.resolveEntry(srcPhysical)
-    const dstClean = dstDir.split("/").filter(Boolean).join("/")
+    // A-08：目标相册取目标项物理路径的父目录（dstDir 含挂载前缀）。
+    const dstClean = parentDirOf(dstPhysical).split("/").filter(Boolean).join("/")
 
     // 移动 = copy 到目标 + 删除源（仅相册文件支持）
     if (entry.kind === "albumfile") {
@@ -303,13 +311,14 @@ export class DriverBaiduPhoto implements StorageDriver {
 
   async copy(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
     const entry = await this.resolveEntry(srcPhysical)
-    const dstClean = dstDir.split("/").filter(Boolean).join("/")
+    // A-08：同上，目标相册取物理路径的父目录。
+    const dstClean = parentDirOf(dstPhysical).split("/").filter(Boolean).join("/")
 
     if (entry.kind === "file" && dstClean) {
       // root file -> album

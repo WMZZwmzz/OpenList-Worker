@@ -65,10 +65,14 @@ test("F-040: setup 拒绝保留用户名 guest（否则匿名访客会继承管�
     env2,
   )
   assert.equal(res2.status, 400)
+  // 审计日志是失败请求的正常留痕（A-44 改为同步落盘后必然出现），
+  // 这里校验的是「不得写入任何配置数据」。
   assert.equal(
-    env2.KV.__store.size,
+    [...env2.KV.__store.keys()].filter(
+      (k) => k !== "openlist_audit_logs",
+    ).length,
     0,
-    "被拒绝的初始化不得写库",
+    "被拒绝的初始化不得写配置库",
   )
 })
 

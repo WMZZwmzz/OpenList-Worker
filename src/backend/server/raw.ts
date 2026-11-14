@@ -21,7 +21,11 @@ import { clientIpFromContext } from "../pkg/client-ip"
 import { secureLog, secureWarn, secureError } from "../pkg/secure-log"
 import { encodeDownloadPath } from "../pkg/path"
 import { assertLocalPathInsideRoot } from "../pkg/local-fs-guard"
-import { assertSafeUrl, getTrustedHosts } from "../pkg/http"
+import {
+  assertSafeUrl,
+  assertSafeUrlWithDns,
+  getTrustedHosts,
+} from "../pkg/http"
 import {
   resolveProxyDecision,
   getDownProxyUrl,
@@ -112,7 +116,8 @@ export async function safeProxyFetch(
   let currentHeaders = headers
   for (let i = 0; i < MAX_REDIRECTS; i++) {
     try {
-      assertSafeUrl(current, "Proxy download", allowHosts)
+      // A-27：静态黑名单 + DNS 解析双重校验（Node 运行时）。
+      await assertSafeUrlWithDns(current, "Proxy download", allowHosts)
     } catch (e: any) {
       throw new Error(e?.message || "SSRF blocked: restricted destination")
     }

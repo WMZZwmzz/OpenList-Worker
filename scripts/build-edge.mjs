@@ -240,12 +240,16 @@ async function build() {
   )
 
   // 阿里云 ESA（边缘安全加速）边缘函数入口（仅在源文件存在时构建）
+  //
+  // A-30：产物不能写进 dist/。dist 在 EdgeOne / ESA / Workers 配置里都是
+  // 「公开静态资源目录」，放进去等于把约 2MB 的后端 bundle（含内部端点、
+  // 鉴权与 SSRF 白名单实现）暴露给匿名下载。ES 入口单独输出到 esa-dist/。
   if (fs.existsSync("esa-entry.ts")) {
     await esbuild.build({
       entryPoints: ["esa-entry.ts"],
       bundle: true,
       platform: "browser", // ESA 边缘运行时不支持 Node 内置模块，需要浏览器构建
-      outfile: "dist/esa-entry.js",
+      outfile: "esa-dist/esa-entry.js",
       minify: true,
       format: "esm",
       mainFields: ["browser", "module", "main"], // 优先选择浏览器版本依赖

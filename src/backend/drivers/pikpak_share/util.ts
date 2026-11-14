@@ -29,6 +29,7 @@ export class PikPakShareApiClient {
   async getFiles(parentId = ""): Promise<PikPakShareFileItem[]> {
     const items: PikPakShareFileItem[] = []
     let pageToken = ""
+    const seenTokens = new Set<string>()
 
     do {
       const u = new URL("https://api-drive.mypikpak.com/drive/v1/share")
@@ -67,9 +68,14 @@ export class PikPakShareApiClient {
 
       const list = json.files || []
       items.push(...list)
-      pageToken = json.next_page_token || ""
+      const next = json.next_page_token || ""
+      // A-54：服务端重复返回同一 token 会死循环；页数也必须有硬上限。
+      if (next && seenTokens.has(next)) break
+      if (next) seenTokens.add(next)
+      pageToken = next
 
       if (list.length === 0) break
+      if (seenTokens.size > 1000) break
     } while (pageToken)
 
     return items

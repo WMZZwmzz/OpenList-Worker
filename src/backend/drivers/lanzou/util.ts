@@ -565,7 +565,8 @@ export class LanzouClient {
 
   async getFiles(folderId: string): Promise<LanzouFileOrFolder[]> {
     const allFiles: LanzouFileOrFolder[] = []
-    for (let pg = 1; ; pg++) {
+    // A-55：页数硬上限，异常服务端（永远返回非空）不得无限请求。
+    for (let pg = 1; pg <= 1000; pg++) {
       const resp = await this.doupload({
         task: "5",
         folder_id: folderId || "-1",
@@ -662,7 +663,8 @@ export class LanzouClient {
 
     // 分页获取文件
     form["pwd"] = pwd || this.addition.share_password || ""
-    for (let page = 1; ; page++) {
+    // A-55：页数硬上限（同上）。
+    for (let page = 1; page <= 1000; page++) {
       form["pg"] = String(page)
       const resStr = await this.request(
         `${this.getShareUrl()}/filemoreajax.php`,

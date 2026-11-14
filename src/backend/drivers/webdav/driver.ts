@@ -37,8 +37,11 @@ export class WebdavDriver implements StorageDriver {
   }
 
   private getRemotePath(physicalPath: string): string {
-    const root = this.addition.root_folder_path || "/"
-    return joinPath(root, physicalPath || "/")
+    // A-06：通用层 resolvePath 已把 root_folder_path 拼进 physicalPath
+    // （internal/model/db.ts），驱动再做一次 join 会让非根挂载全部落到
+    // /root/root/... 而恒 404。这里只做规范化。
+    const p = String(physicalPath || "/").replace(/\/{2,}/g, "/")
+    return p.startsWith("/") ? p : "/" + p
   }
 
   private fileItemFromWebdav(item: WebdavFile, remotePath: string): FileItem {

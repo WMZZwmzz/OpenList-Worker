@@ -50,6 +50,18 @@ const CONFS: Record<"quark" | "uc", Conf> = {
   },
 }
 
+/** A-57：CSPRNG 设备 ID（32 位 hex），回退路径也带随机成分。 */
+function randomDeviceId(): string {
+  try {
+    const bytes = crypto.getRandomValues(new Uint8Array(16))
+    return Array.from(bytes)
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("")
+  } catch {
+    return md5(`${Date.now()}-${Math.random()}-${Math.random()}`)
+  }
+}
+
 export class ClientQuarkUcTv {
   private conf: Conf
   private addition: DriverQuarkUcTvAddition
@@ -63,7 +75,9 @@ export class ClientQuarkUcTv {
     this.conf =
       (variantKey === "uc" || variantKey === "quark" ? CONFS[variantKey] : null) ||
       CONFS.quark
-    this.deviceId = addition.device_id || md5(String(Date.now()))
+    // A-57：deviceId 必须用 CSPRNG。历史实现是 md5(毫秒时间戳)，可预测且
+    // 同毫秒内碰撞。
+    this.deviceId = addition.device_id || randomDeviceId()
     this.addition.device_id = this.deviceId
   }
 
@@ -158,11 +172,8 @@ export class ClientQuarkUcTv {
       req_id: reqId,
       ...this.deviceQuery(),
     }
-    if (this.accessToken) {
-      body.refresh_token = this.addition.refresh_token
-    } else {
-      body.refresh_token = this.addition.refresh_token
-    }
+    // A-57：两个分支完全相同，直接赋值。
+    body.refresh_token = this.addition.refresh_token
     const resp = await fetch(`${this.conf.codeApi}${pathname}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -197,10 +208,17 @@ export class ClientQuarkUcTv {
         page_index: String(pageIndex),
       })
       const data = resp.data as QuarkTvFilesData | undefined
-      if (data?.files) all.push(...data.files)
-      const total = data?.total_count || 0
-      if (pageIndex * pageSize >= total) break
+      const files = data?.files || []
+      all.push(...files)
+      // A-56：total_count 缺失（0/undefined）时历史实现 `0 >= 0` 立即 break，
+      // 只拿到第一页。改为以「空页」为终止条件；有 total 时再按总数提前结束。
+      if (files.length === 0) break
+      const total = Number(data?.total_count)
+      if (Number.isFinite(total) && total > 0 && pageIndex * pageSize >= total) {
+        break
+      }
       pageIndex++
+      if (pageIndex > 1000) break
     }
     return all
   }

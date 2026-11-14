@@ -68,7 +68,12 @@ export class GoogleDrive implements StorageDriver {
         targetMimeType: file.shortcutDetails?.targetMimeType,
       })
       if (!item.is_dir) {
-        item.raw_url = this.client.getDownloadUrl(targetId || fileId)
+        item.raw_url = this.client.getDownloadUrl(
+          targetId || fileId,
+          targetId
+            ? String(file.shortcutDetails?.targetMimeType || "")
+            : String(file.mimeType || ""),
+        )
         item.raw_url_headers = this.client.getDownloadHeaders()
       }
       return item

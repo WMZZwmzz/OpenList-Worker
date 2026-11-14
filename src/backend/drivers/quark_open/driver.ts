@@ -46,46 +46,34 @@ export class DriverQuarkOpen implements StorageDriver {
     const parts = physicalPath.split("/").filter(Boolean)
     const rawName = parts[parts.length - 1] || "root"
     const parentPath = "/" + parts.slice(0, -1).join("/")
-    try {
-      const parentId = await this.resolveDirId(parentPath)
-      const files = await this.client.getFiles(parentId)
-      const file = files.find((f) => f.filename === rawName)
-      if (file) {
-        const item = this.fileToItem(file)
-        if (!item.is_dir) {
-          try {
-            item.raw_url = await this.client.getDownloadUrl(file.fid)
-            item.raw_url_headers = { Cookie: this.client.downloadCookie() }
-          } catch (e: any) {
-            item.raw_url_error = e.message
-          }
+    // A-24：父目录列取失败（401/限流/网络）必须向上抛出。历史实现用
+    // catch {} 吞掉后返回 0 字节空文件，把鉴权失败伪装成正常条目。
+    const parentId = await this.resolveDirId(parentPath)
+    const files = await this.client.getFiles(parentId)
+    const file = files.find((f) => f.filename === rawName)
+    if (file) {
+      const item = this.fileToItem(file)
+      if (!item.is_dir) {
+        try {
+          item.raw_url = await this.client.getDownloadUrl(file.fid)
+          item.raw_url_headers = { Cookie: this.client.downloadCookie() }
+        } catch (e: any) {
+          item.raw_url_error = e.message
         }
-        return item
       }
-    } catch {}
+      return item
+    }
 
-    // Fallback: 目录
-    try {
-      await this.resolveDirId(physicalPath)
-      return {
-        name: rawName,
-        size: 0,
-        is_dir: true,
-        modified: new Date().toISOString(),
-        sign: "",
-        type: 1,
-        raw_url: "",
-      }
-    } catch {
-      return {
-        name: rawName,
-        size: 0,
-        is_dir: false,
-        modified: new Date().toISOString(),
-        sign: "",
-        type: 0,
-        raw_url: "",
-      }
+    // 不是父目录下的文件：按目录解析；解析失败会抛 not found（由上层转 404）。
+    await this.resolveDirId(physicalPath)
+    return {
+      name: rawName,
+      size: 0,
+      is_dir: true,
+      modified: new Date().toISOString(),
+      sign: "",
+      type: 1,
+      raw_url: "",
     }
   }
 

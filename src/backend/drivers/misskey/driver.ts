@@ -58,61 +58,48 @@ export class DriverMisskey implements StorageDriver {
     const parts = physicalPath.split("/").filter(Boolean)
     const rawName = parts[parts.length - 1] || "root"
     const parentPath = "/" + parts.slice(0, -1).join("/")
-    try {
-      const parentId = await this.resolveFolderId(parentPath)
-      const [files, folders] = await Promise.all([
-        this.client.getFiles(parentId),
-        this.client.getFolders(parentId),
-      ])
-      const file = files.find((f) => f.name === rawName)
-      if (file) {
-        return {
-          name: file.name,
-          size: file.size || 0,
-          is_dir: false,
-          modified: file.createdAt || new Date().toISOString(),
-          sign: file.id,
-          type: calcFileType(file.name, false),
-          raw_url: file.url || "",
-          thumb: file.thumbnailUrl || "",
-        }
-      }
-      const folder = folders.find((f) => f.name === rawName)
-      if (folder) {
-        return {
-          name: folder.name,
-          size: 0,
-          is_dir: true,
-          modified: folder.createdAt || new Date().toISOString(),
-          sign: folder.id,
-          type: 1,
-          raw_url: "",
-        }
-      }
-    } catch {}
-
-    // Fallback: 目录
-    try {
-      await this.resolveFolderId(physicalPath)
+    // A-24：列取失败必须抛出，不能吞成 0 字节文件。
+    const parentId = await this.resolveFolderId(parentPath)
+    const [files, folders] = await Promise.all([
+      this.client.getFiles(parentId),
+      this.client.getFolders(parentId),
+    ])
+    const file = files.find((f) => f.name === rawName)
+    if (file) {
       return {
-        name: rawName,
+        name: file.name,
+        size: file.size || 0,
+        is_dir: false,
+        modified: file.createdAt || new Date().toISOString(),
+        sign: file.id,
+        type: calcFileType(file.name, false),
+        raw_url: file.url || "",
+        thumb: file.thumbnailUrl || "",
+      }
+    }
+    const folder = folders.find((f) => f.name === rawName)
+    if (folder) {
+      return {
+        name: folder.name,
         size: 0,
         is_dir: true,
-        modified: new Date().toISOString(),
-        sign: "",
+        modified: folder.createdAt || new Date().toISOString(),
+        sign: folder.id,
         type: 1,
         raw_url: "",
       }
-    } catch {
-      return {
-        name: rawName,
-        size: 0,
-        is_dir: false,
-        modified: new Date().toISOString(),
-        sign: "",
-        type: 0,
-        raw_url: "",
-      }
+    }
+
+    // Fallback: 目录；解析失败直接抛出（上层转 404）。
+    await this.resolveFolderId(physicalPath)
+    return {
+      name: rawName,
+      size: 0,
+      is_dir: true,
+      modified: new Date().toISOString(),
+      sign: "",
+      type: 1,
+      raw_url: "",
     }
   }
 

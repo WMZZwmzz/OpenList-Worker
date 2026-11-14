@@ -7,6 +7,13 @@ import { sortFileItems } from "../../internal/driver/sort"
 import { AliyundriveOpenAddition, AliyunFileItem } from "./types"
 import { AliyunOpenClient } from "./util"
 
+/** 物理路径的父目录（A-08：驱动契约要求用 dstPhysical 推导目标目录）。 */
+function parentOf(p: string): string {
+  const parts = String(p || "/").split("/").filter(Boolean)
+  parts.pop()
+  return "/" + parts.join("/")
+}
+
 function aliyunFileToFileItem(f: AliyunFileItem): FileItem {
   const isDir = f.type === "folder"
   return {
@@ -129,26 +136,27 @@ export class AliyundriveOpen implements StorageDriver {
 
   async move(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
     const fileId = await this.resolveFileId(srcPhysical)
-    const dstId = await this.resolveFileId(dstDir)
+    // A-08：目标父目录由物理路径推导（dstDir 含挂载前缀）。
+    const dstId = await this.resolveFileId(parentOf(dstPhysical))
     await this.client.move(fileId, dstId)
     this.invalidatePathCache()
   }
 
   async copy(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
     const fileId = await this.resolveFileId(srcPhysical)
-    const dstId = await this.resolveFileId(dstDir)
+    const dstId = await this.resolveFileId(parentOf(dstPhysical))
     await this.client.copy(fileId, dstId)
     this.invalidatePathCache()
   }

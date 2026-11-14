@@ -6,6 +6,13 @@ import {
 import { DriverTeambitionAddition } from "./types"
 import { ClientTeambition } from "./util"
 
+/** 物理路径的父目录（A-08：目标目录必须由 dstPhysical 推导）。 */
+function parentOf(path: string): string {
+  const parts = String(path || "/").split("/").filter(Boolean)
+  parts.pop()
+  return "/" + parts.join("/")
+}
+
 export class DriverTeambition implements StorageDriver {
   private client: ClientTeambition
   private pathCache = new Map<string, string>()
@@ -47,64 +54,51 @@ export class DriverTeambition implements StorageDriver {
     const parts = physicalPath.split("/").filter(Boolean)
     const rawName = parts[parts.length - 1] || "root"
     const parentPath = "/" + parts.slice(0, -1).join("/")
-    try {
-      const parentId = await this.pathToId(parentPath)
-      const { folders, works } = await this.client.getFiles(parentId)
-      const folder = folders.find((c) => c.title === rawName)
-      if (folder) {
-        return {
-          name: folder.title,
-          size: 0,
-          is_dir: true,
-          modified: folder.updated || new Date().toISOString(),
-          sign: folder._id,
-          type: 1,
-          raw_url: "",
-        }
-      }
-      const work = works.find((w) => w.fileName === rawName)
-      if (work) {
-        let url = work.downloadUrl || ""
-        if (url) {
-          try {
-            url = await this.client.resolveDownloadUrl(url)
-          } catch {}
-        }
-        return {
-          name: work.fileName,
-          size: work.fileSize || 0,
-          is_dir: false,
-          modified: work.updated || new Date().toISOString(),
-          sign: work._id,
-          type: calcFileType(work.fileName, false),
-          thumb: work.thumbnail || work.thumbnailUrl || "",
-          raw_url: url,
-        }
-      }
-    } catch {}
-
-    // Fallback: 目录
-    try {
-      await this.client.getFiles(await this.pathToId(physicalPath))
+    // A-24：列取/解析失败必须抛出，不能吞成 0 字节文件。
+    const parentId = await this.pathToId(parentPath)
+    const { folders, works } = await this.client.getFiles(parentId)
+    const folder = folders.find((c) => c.title === rawName)
+    if (folder) {
       return {
-        name: rawName,
+        name: folder.title,
         size: 0,
         is_dir: true,
-        modified: new Date().toISOString(),
-        sign: "",
+        modified: folder.updated || new Date().toISOString(),
+        sign: folder._id,
         type: 1,
         raw_url: "",
       }
-    } catch {
-      return {
-        name: rawName,
-        size: 0,
-        is_dir: false,
-        modified: new Date().toISOString(),
-        sign: "",
-        type: 0,
-        raw_url: "",
+    }
+    const work = works.find((w) => w.fileName === rawName)
+    if (work) {
+      let url = work.downloadUrl || ""
+      if (url) {
+        try {
+          url = await this.client.resolveDownloadUrl(url)
+        } catch {}
       }
+      return {
+        name: work.fileName,
+        size: work.fileSize || 0,
+        is_dir: false,
+        modified: work.updated || new Date().toISOString(),
+        sign: work._id,
+        type: calcFileType(work.fileName, false),
+        thumb: work.thumbnail || work.thumbnailUrl || "",
+        raw_url: url,
+      }
+    }
+
+    // Fallback: 目录（解析失败会抛 not found，由上层转 404）
+    await this.client.getFiles(await this.pathToId(physicalPath))
+    return {
+      name: rawName,
+      size: 0,
+      is_dir: true,
+      modified: new Date().toISOString(),
+      sign: "",
+      type: 1,
+      raw_url: "",
     }
   }
 
@@ -138,25 +132,34 @@ export class DriverTeambition implements StorageDriver {
 
   async move(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
     const entry = await this.resolveEntry(srcPhysical)
-    await this.client.move(entry.id, await this.pathToId(dstDir), entry.isDir)
+    // A-08：目标目录取目标项物理路径的父目录（dstDir 含挂载前缀）。
+    await this.client.move(
+      entry.id,
+      await this.pathToId(parentOf(dstPhysical)),
+      entry.isDir,
+    )
     this.pathCache.clear()
   }
 
   async copy(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
     const entry = await this.resolveEntry(srcPhysical)
-    await this.client.copy(entry.id, await this.pathToId(dstDir), entry.isDir)
+    await this.client.copy(
+      entry.id,
+      await this.pathToId(parentOf(dstPhysical)),
+      entry.isDir,
+    )
     this.pathCache.clear()
   }
 

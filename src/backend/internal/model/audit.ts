@@ -103,11 +103,14 @@ export async function logAudit(
     auditLogs = auditLogs.slice(-MAX_MEMORY_LOGS)
   }
 
-  // 异步持久化到 KV（不阻塞主流程）
+  // A-44：必须 await。历史实现既不 await 也没挂 waitUntil，Workers/EdgeOne
+  // 在响应返回后可能直接取消该 Promise，审计记录随机丢失。
   if (env) {
-    persistAuditLogToKV(log, env).catch((err) => {
+    try {
+      await persistAuditLogToKV(log, env)
+    } catch (err) {
       console.warn("[Audit] Failed to persist log to KV:", err)
-    })
+    }
   }
   // 控制台输出（开发环境）
   if (isDevelopment(env)) {

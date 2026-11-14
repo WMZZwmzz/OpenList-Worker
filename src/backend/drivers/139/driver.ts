@@ -232,18 +232,33 @@ export class Yun139Driver implements StorageDriver {
   }
 
   async rename(
-    virtualPath: string,
+    _virtualPath: string,
     physicalPath: string,
     newName: string,
   ): Promise<void> {
-    const item = await this.get(virtualPath, physicalPath)
-    if (!item.sign) {
-      throw new Error(
-        `[139] entry "${item.name}" has no id in the listing; cannot rename it`,
-      )
+    // A-53：不能调用 get()——文件分支会额外请求 /file/getDownloadUrl 并跟随
+    // 跳转，rename 因此多打一次下载接口、易触发限流。直接列父目录找 ID。
+    const clean = this.cleanPath(physicalPath)
+    const name = clean.substring(clean.lastIndexOf("/") + 1)
+    const dirPath = clean.substring(0, clean.lastIndexOf("/")) || "/"
+    const catalogId = await this.resolveCatalogId(dirPath)
+    const disk = await this.client.listFiles(catalogId)
+
+    const folder = disk.folders.find((f) =>
+      this.nameEquals(f.catalogName, name),
+    )
+    if (folder) {
+      await this.client.rename(folder.catalogID, newName, true)
+      return
     }
-    // legacy 账号文件/目录走不同端点，重命名需要把 is_dir 一并传下去
-    await this.client.rename(item.sign, newName, item.is_dir)
+    const file = disk.files.find((f) => this.nameEquals(f.contentName, name))
+    if (file && file.contentID) {
+      await this.client.rename(file.contentID, newName, false)
+      return
+    }
+    throw new Error(
+      `[139] entry "${name}" is missing from the listing or has no id; cannot rename it`,
+    )
   }
 
   async remove(

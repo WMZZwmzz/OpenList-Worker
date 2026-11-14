@@ -447,10 +447,13 @@ publicRouter.get("/settings", async (c) => {
     check_update: "false",
 
     // --- Auth ---
-    allow_guest: "true",
+    // A-01：默认关闭游客访问（guest 账号默认 disabled），与上游 Go 一致。
+    allow_guest: "false",
     webauthn_login_enabled: "false",
     sso_login_enabled: "false",
     sso_compatibility_mode: "false",
+    // A-52：LDAP 后端尚未实现。保留字段以兼容前端契约，但恒为 false，
+    // 不允许把该开关打开。
     ldap_login_enabled: "false",
 
     // --- Display ---

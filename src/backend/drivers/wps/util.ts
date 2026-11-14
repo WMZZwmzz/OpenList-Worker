@@ -136,7 +136,10 @@ export class WpsApiClient {
     const files: WpsFileInfo[] = []
     let nextOffset = 0
 
-    for (let i = 0; i < 50; i++) {
+    // A-56：历史实现最多 50 页且无提示，大目录被静默截断。改为继续翻页，
+    // 达到硬上限（1000 页）时显式报错，避免用户以为目录就这么多内容。
+    let exhausted = false
+    for (let i = 0; i < 1000; i++) {
       const url = this.driveUrl(`/api/v5/groups/${groupId}/files`)
       const res = await this.request<WpsFilesResp>(url, {
         params: {
@@ -150,9 +153,15 @@ export class WpsApiClient {
       }
 
       if (res.next_offset === -1 || res.next_offset === undefined) {
+        exhausted = true
         break
       }
       nextOffset = res.next_offset
+    }
+    if (!exhausted) {
+      throw new Error(
+        "[WPS] directory listing exceeded the 1000-page safety limit; result would be truncated",
+      )
     }
 
     return files

@@ -57,11 +57,19 @@ import {
   getDisableIndex,
   resolveCacheExpiration,
 } from "../internal/driver/storageopts"
-import { parseZip, extractZipEntry, ZipArchive } from "../internal/archive/zip"
+import {
+  parseZip,
+  extractZipEntry,
+  ZipArchive,
+  MAX_ZIP_ENTRY_BYTES,
+} from "../internal/archive/zip"
 import { assertSafeUrl, getTrustedHosts } from "../pkg/http"
 import { invalidatePaths } from "../internal/cache"
 import { seedRouter, torrentLegacyRouter } from "./seed"
 import { r2CanSignDirectUpload } from "../drivers/r2/driver"
+
+/** A-28：正在执行 complete 的会话 id，防并发重复收尾。 */
+const multipartCompletingInFlight = new Set<string>()
 
 /**
  * 该路径所属存储是否禁止目录列表（对齐 Go handles.FsList 的 DisableIndex 判断）。
@@ -1295,19 +1303,25 @@ fsRouter.put("/form", async (c) => {
   if (await deniedByMetaWriteAcl(c, user, [reqPath])) return permissionDenied(c)
   const requestContext = getStorageRequestContext(c)
   const maxUpload = getUploadSizeLimit(c, false)
-  // F-013：`c.req.formData()` 会把整个 multipart 请求体缓冲进内存，之后再判
-  // 文件大小等于没有上限（router.ts 的 jsonBodyGuard 明确跳过 multipart）。
-  // 解析前先按 Content-Length 预检（multipart 边界与分片头留 64KiB 余量），
-  // 超限直接 413，不再进入 formData()。
-  const declaredLength = parseInt(c.req.header("Content-Length") || "0", 10)
-  if (
-    Number.isFinite(declaredLength) &&
-    declaredLength > maxUpload + 64 * 1024
-  ) {
-    return tooLargeResponse(c, maxUpload)
-  }
+  // A-18：只按 Content-Length 预检时，chunked（无 Content-Length）或伪造偏小
+  // 长度的 multipart 仍会被 c.req.formData() 整体缓冲进内存。这里改为边读边
+  // 计数（multipart 边界/头部留 64KiB 余量），再解析已受限的 buffer。
+  const limitedBody = await readBodyWithinLimit(c, false, maxUpload + 64 * 1024)
+  if (!limitedBody.ok) return tooLargeResponse(c, maxUpload)
   try {
-    const form = await c.req.formData()
+    const contentType = c.req.header("Content-Type") || ""
+    let form: FormData
+    try {
+      form = await new Response(
+        limitedBody.buffer as unknown as BodyInit,
+        { headers: { "content-type": contentType } },
+      ).formData()
+    } catch {
+      return c.json(
+        { code: 400, message: "invalid multipart form data", data: null },
+        400,
+      )
+    }
     const file = form.get("file")
     if (!file || typeof file === "string") {
       return c.json(
@@ -1534,7 +1548,7 @@ fsRouter.post("/batch_rename", async (c) => {
 fsRouter.post("/regex_rename", async (c) => {
   const user = await getUserFromContext(c)
   if (!canRename(user)) return permissionDenied(c)
-  const { src_dir, src_name_regex, new_name_regex } = await c.req
+  const { src_dir, src_name_regex, new_name_regex, password } = await c.req
     .json()
     .catch(() => ({}))
   if (!src_name_regex) {
@@ -1559,8 +1573,12 @@ fsRouter.post("/regex_rename", async (c) => {
     )
   }
   let srcRegex: RegExp
+  let srcRegexGlobal: RegExp
   try {
     srcRegex = new RegExp(src_name_regex)
+    // A-61：与 Go ReplaceAllString 对齐，必须做全局替换（历史实现无 g，
+    // 只替换每个文件名的第一处匹配）。
+    srcRegexGlobal = new RegExp(src_name_regex, "g")
   } catch {
     return c.json(
       { code: 400, message: "src_name_regex is not a valid regex", data: null },
@@ -1568,16 +1586,38 @@ fsRouter.post("/regex_rename", async (c) => {
     )
   }
   try {
+    // A-61：列目录前必须校验目录读 ACL（密码 / read_users），
+    // 历史实现只校验写权限，密码目录的文件名可被正则批量读出并改名。
+    if (await deniedByMetaReadAcl(c, user, dirPath, String(password || ""))) {
+      return permissionDenied(c)
+    }
     const { content } = await listItems(dirPath, requestContext)
+    let renamed = 0
+    const failed: Array<{ name: string; error: string }> = []
     for (const item of content) {
-      if (!item.is_dir && srcRegex.test(item.name)) {
-        const newName = item.name.replace(srcRegex, new_name_regex || "")
+      if (item.is_dir || !srcRegex.test(item.name)) continue
+      const newName = item.name.replace(srcRegexGlobal, new_name_regex || "")
+      const fullPath = `${dirPath}/${item.name}`.replace(/\/{2,}/g, "/")
+      try {
         validateFileName(newName)
-        const fullPath = `${dirPath}/${item.name}`.replace(/\/{2,}/g, "/")
         if (await deniedByMetaWriteAcl(c, user, [fullPath]))
           return permissionDenied(c)
         await renameItem(fullPath, newName, requestContext)
+        renamed++
+      } catch (e: any) {
+        // A-61：单条失败不再静默中断，返回明确的部分完成结果。
+        failed.push({ name: item.name, error: safeErrorMessage(e) })
       }
+    }
+    if (failed.length > 0) {
+      return c.json(
+        {
+          code: 500,
+          message: `regex_rename partially completed: ${renamed} renamed, ${failed.length} failed`,
+          data: { renamed, failed },
+        },
+        500,
+      )
     }
     return c.json({ code: 200, message: "success", data: null })
   } catch (e: any) {
@@ -2069,6 +2109,16 @@ fsRouter.post("/multipart/complete", async (c) => {
     )
   }
 
+  // A-28：并发 complete 必须在进入异步收尾前互斥。否则两个请求都通过状态
+  // 检查、都调用驱动完成，失败的一方还会把已删除的会话「复活」成 failed。
+  if (multipartCompletingInFlight.has(session.upload_id)) {
+    return c.json(
+      { code: 409, message: "upload completion already in progress", data: null },
+      409,
+    )
+  }
+  multipartCompletingInFlight.add(session.upload_id)
+
   const requestContext = getStorageRequestContext(c)
   try {
     const resolved = await resolvePath(
@@ -2106,10 +2156,15 @@ fsRouter.post("/multipart/complete", async (c) => {
     }
     return c.json({ code: 200, message: "success", data: mpSnapshot(session) })
   } catch (e: any) {
-    session.state = "failed_permanent"
-    session.error = safeErrorMessage(e)
-    putSession(session)
+    // A-28：会话已被成功路径删除时不得再写回（否则「复活」为失败态）。
+    if (getSession(session.upload_id)) {
+      session.state = "failed_permanent"
+      session.error = safeErrorMessage(e)
+      putSession(session)
+    }
     return c.json({ code: 500, message: safeErrorMessage(e), data: null }, 500)
+  } finally {
+    multipartCompletingInFlight.delete(session.upload_id)
   }
 })
 
@@ -2499,8 +2554,12 @@ fsRouter.post("/archive/decompress", async (c) => {
             400,
           )
         }
-        totalBytes += Number(entry.size) || 0
-        if (totalBytes > maxTotalBytes) {
+        // A-19：总预算必须按**实际解压字节**累计。中心目录里的 size 由归档
+        // 作者控制，声明 1 字节、实际 deflate 膨胀到 64MB 的条目可以逐条
+        // 耗尽单条上限并绕过总预算。这里把剩余预算传给 extractZipEntry，
+        // 解压后再按真实长度累计。
+        const remainingBudget = maxTotalBytes - totalBytes
+        if (remainingBudget <= 0) {
           return c.json(
             { code: 400, message: `archive expands beyond the ${maxTotalBytes} byte limit`, data: null },
             400,
@@ -2521,7 +2580,18 @@ fsRouter.post("/archive/decompress", async (c) => {
           )
           continue
         }
-        const content = await extractZipEntry(bytes, entry)
+        const content = await extractZipEntry(
+          bytes,
+          entry,
+          Math.min(MAX_ZIP_ENTRY_BYTES, remainingBudget),
+        )
+        totalBytes += content.byteLength
+        if (totalBytes > maxTotalBytes) {
+          return c.json(
+            { code: 400, message: `archive expands beyond the ${maxTotalBytes} byte limit`, data: null },
+            400,
+          )
+        }
         await putItem(targetPath, Buffer.from(content), getStorageRequestContext(c))
         count++
       }

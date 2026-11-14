@@ -56,6 +56,16 @@ const dbWith = (
       base_path: "/",
       disabled: false,
     },
+    {
+      // A-62：分享创建者必须是拥有 SHARE 权限位的普通用户
+      id: 2,
+      username: "sharer",
+      password: "xxx",
+      role: 0,
+      permission: 16384,
+      base_path: "/",
+      disabled: false,
+    },
   ],
   storages: [
     {
@@ -158,7 +168,7 @@ test("fs/get: 分享分支 raw_url 对特殊文件名逐段编码，且可直接
         {
           id: "f016share",
           files: ["/local/100%.txt", "/local/a#b.txt"],
-          creator: "guest",
+          creator: "sharer",
           pwd: "",
           disabled: false,
         },

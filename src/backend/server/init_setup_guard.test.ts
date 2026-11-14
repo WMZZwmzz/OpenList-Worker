@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 import { Hono } from "hono"
 import { setupRouter } from "./router"
+import { __resetDbCacheForTest } from "../internal/model/db"
 
 /**
  * 初始化流程回归测试（对应 issue #62）。
@@ -112,6 +113,9 @@ test("init/setup：读取持久化后端失败时必须拒绝（不得用空壳�
 })
 
 test("init_status：配置 ADMIN_PASS 时，安装页轮询即可完成初始化", async () => {
+  // 每个用例使用独立 env；模块级快照需要显式复位，否则会命中上一个用例
+  // 已初始化的库（A-02 修复后 ADMIN_PASS 不再每次重置已初始化密码）。
+  __resetDbCacheForTest()
   const env: any = kvEnv({ ADMIN_PASS: "auto-init-pass" })
 
   const res = await buildApp().request(

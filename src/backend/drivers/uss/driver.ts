@@ -344,7 +344,9 @@ export class UssDriver implements StorageDriver {
     const header = op === "move" ? "X-Upyun-Move-Source" : "X-Upyun-Copy-Source"
     // F-476：官方格式为 "/<bucket>/<source_to_file>"（如 /upyun/foo/source.jpg），
     // srcKey 不含 bucket 段，必须显式拼上，否则服务端解析不到源文件。
-    const source = `/${this.addition.bucket}/${srcKey}`
+    // A-37：源 key 必须与 URL 一样逐段编码：中文/空格会让 fetch 直接抛
+    // TypeError，`#`/`?` 则会被服务端按不同语义截断。
+    const source = `/${this.addition.bucket}/${encodeKeyPath(srcKey)}`
     const res = await fetch(`${this.apiBase}/${encodeKeyPath(dstKey)}`, {
       method: "PUT",
       headers: { Authorization: this.authHeader, [header]: source },

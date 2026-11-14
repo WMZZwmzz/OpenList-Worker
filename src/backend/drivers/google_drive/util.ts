@@ -239,7 +239,20 @@ export class GoogleDriveClient {
     )
   }
 
-  public getDownloadUrl(fileId: string): string {
+  public getDownloadUrl(fileId: string, mimeType = ""): string {
+    // A-60：Google 原生 Docs/Sheets/Slides 不支持 alt=media（必 403），
+    // 必须走 /export 并指定导出格式。
+    if (String(mimeType).startsWith("application/vnd.google-apps.")) {
+      const exportMime =
+        mimeType === "application/vnd.google-apps.spreadsheet"
+          ? "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+          : mimeType === "application/vnd.google-apps.presentation"
+            ? "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            : mimeType === "application/vnd.google-apps.drawing"
+              ? "image/png"
+              : "application/pdf"
+      return `${GDRIVE_API}/files/${fileId}/export?mimeType=${encodeURIComponent(exportMime)}`
+    }
     return (
       `${GDRIVE_API}/files/${fileId}` +
       `?includeItemsFromAllDrives=true&supportsAllDrives=true&alt=media&acknowledgeAbuse=true`

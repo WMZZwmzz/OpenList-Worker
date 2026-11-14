@@ -28,7 +28,22 @@ export class YandexApiClient {
     this.onTokenRefreshed = onTokenRefreshed
   }
 
+  /**
+   * A-59：并发 401 必须共享同一次刷新。Yandex 的 refresh_token 是轮换的，
+   * 每个请求各自刷新会让先完成的那次令牌被后一次作废。
+   */
+  private refreshInFlight: Promise<void> | null = null
+
   async refreshToken(): Promise<void> {
+    if (!this.refreshInFlight) {
+      this.refreshInFlight = this.doRefreshToken().finally(() => {
+        this.refreshInFlight = null
+      })
+    }
+    return this.refreshInFlight
+  }
+
+  private async doRefreshToken(): Promise<void> {
     if (this.addition.use_online_api !== false) {
       const apiUrl =
         this.addition.api_url_address ||

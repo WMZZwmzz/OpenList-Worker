@@ -17,7 +17,8 @@
 const requiredEnvVars = [
   {
     name: 'JWT_SECRET',
-    minLength: 32,
+    // 与应用实现保持一致（后端只要求非空/>=16；32+ 仍是推荐值）。
+    minLength: 16,
     description: 'JWT 签名 / 数据加密 / 定时任务 密钥',
     generateCommand: 'openssl rand -hex 32'
   }

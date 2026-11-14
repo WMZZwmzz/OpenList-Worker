@@ -65,6 +65,8 @@ export interface ColumnDef {
   unique?: boolean
   /** 是否可空（主键默认为不可空）。 */
   nullable?: boolean
+  /** 可能超过 64KB 的大文本列（MySQL 下映射为 LONGTEXT，A-73）。 */
+  large?: boolean
 }
 
 /** 表定义。 */
@@ -131,7 +133,7 @@ export const TABLES: Record<DdlTableName, TableDef> = {
       { name: "cache_expiration", type: "number", nullable: true },
       { name: "custom_cache_policies", type: "string", nullable: true },
       { name: "status", type: "string", nullable: true },
-      { name: "addition", type: "string", nullable: true },
+      { name: "addition", type: "string", nullable: true, large: true },
       { name: "remark", type: "string", nullable: true },
       { name: "modified", type: "date", nullable: true },
       { name: "disabled", type: "bool", nullable: true },
@@ -164,8 +166,15 @@ export const TABLES: Record<DdlTableName, TableDef> = {
       { name: "sso_id", type: "string", nullable: true },
       { name: "authn", type: "string", nullable: true },  // WebAuthn credentials JSON
       { name: "allow_ldap", type: "bool", nullable: true },
+      // A-05：SSH 公钥与 2FA 恢复码是 user 对象上的真实业务字段。
+      // 历史 SQL schema 缺少这两列，entityToRow 按固定列投影时会静默丢弃，
+      // 重启后 SSH 公钥/恢复码全部消失（功能级数据丢失）。
+      { name: "ssh_keys", type: "json", nullable: true },
+      { name: "otp_backup_codes", type: "json", nullable: true },
       // TS 特有：密码更新时间（Go 用 pwd_ts/pwd_hash/salt 内部字段，json:"-" 不落 API）
       { name: "pwd_update_at", type: "date", nullable: true },
+      // token/session 版本号（改密、关闭 2FA 后旧令牌立即失效）
+      { name: "token_epoch", type: "number", nullable: true },
     ],
   },
 
@@ -242,8 +251,13 @@ export const TABLES: Record<DdlTableName, TableDef> = {
       { name: "high_privilege", type: "bool", nullable: true },
       { name: "permissions", type: "json", nullable: true },
       { name: "entry_url", type: "string", nullable: true },
-      { name: "script_content", type: "string", nullable: true },
-      { name: "style_content", type: "string", nullable: true },
+      { name: "script_content", type: "string", nullable: true, large: true },
+      { name: "style_content", type: "string", nullable: true, large: true },
+      // A-05：插件完整性与来源字段，缺列会让安装后校验/审计信息丢失。
+      { name: "script_sha256", type: "string", nullable: true },
+      { name: "style_sha256", type: "string", nullable: true },
+      { name: "installed_by", type: "string", nullable: true },
+      { name: "installed_from", type: "string", nullable: true },
       { name: "config_schema", type: "json", nullable: true },
       { name: "config_values", type: "json", nullable: true },
       { name: "target_hooks", type: "json", nullable: true },
@@ -438,6 +452,11 @@ function sqlType(
       // SQLite 对 TEXT 主键/唯一索引没有该限制，保持原样。
       if (dialect === "mysql" && keyColumn) {
         return `VARCHAR(${MYSQL_KEY_VARCHAR_LENGTH})`
+      }
+      // A-73：MySQL 的 TEXT 上限 64KB。插件脚本等明确可能超限的列用
+      // LONGTEXT；其余普通字符串列保持 TEXT（不无谓收紧兼容性）。
+      if (dialect === "mysql" && col.large) {
+        return "LONGTEXT"
       }
       return "TEXT"
     default:

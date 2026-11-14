@@ -21,7 +21,6 @@ import {
 } from "../pkg/permission"
 import {
   canAccess,
-  canRead as canReadMeta,
   canWrite as canWriteMeta,
   canWriteContentBypassUserPerms,
   getNearestMeta,
@@ -40,6 +39,11 @@ import { buildWebDavPropfindResponse } from "../internal/webdav/webdav"
 import { safeErrorMessage } from "../pkg/errs"
 import { encodeDownloadPath } from "../pkg/path"
 import { readBodyWithinLimit } from "../pkg/upload-limit"
+import {
+  getSignExpiresIn,
+  needDownloadSign,
+  signDownloadPath,
+} from "../pkg/sign"
 
 /**
  * WebDAV 协议服务（挂载于 /dav/*）。
@@ -435,10 +439,21 @@ webdavRouter.all("/*", async (c) => {
         // 端点前缀（/p 还是 /d）与路径编码都由 getItem 决定（见
         // op/storage.ts resolveRawUrlPrefix）：/p 受 Go canProxy() 限制，未开启
         // 代理的存储会 403 proxy not allowed，因此不能在这里硬编码 /p。
-        return c.redirect(
-          rawUrl || `/api/d${encodeDownloadPath(actualPath)}`,
-          302,
-        )
+        // A-17：/d 与 /p 是公开下载端点，签名策略开启（sign_all /
+        // link_expiration）或路径受 read_users/encrypt 保护时，raw 端点会
+        // 拒绝无签名请求。此前 302 丢弃签名，WebDAV 下载在受限目录必然 401。
+        let target = rawUrl || `/api/d${encodeDownloadPath(actualPath)}`
+        if (await needDownloadSign(c, actualPath)) {
+          const sign = await signDownloadPath(
+            c,
+            actualPath,
+            await getSignExpiresIn(c),
+          )
+          if (sign) {
+            target += `${target.includes("?") ? "&" : "?"}sign=${encodeURIComponent(sign)}`
+          }
+        }
+        return c.redirect(target, 302)
       }
 
       case "PUT": {
@@ -503,6 +518,12 @@ webdavRouter.all("/*", async (c) => {
         if (src.name !== dst.name && !canRename(user)) {
           return c.text("Forbidden", 403)
         }
+        // A-03：MOVE 同时是「源读取 + 源删除 + 目标写入」，必须与 GET/PUT 一样
+        // 校验源的目录级读 ACL（meta 密码 + read_users）。历史实现只看写权限，
+        // 知道路径的用户可把受密码保护目录中的文件直接移到公开目录后下载。
+        if (await deniedByMetaRead(c, user, actualPath, metaPassword)) {
+          return metaForbidden(c)
+        }
         if (
           (await deniedByMetaWrite(c, user, src.dir, false)) ||
           (await deniedByMetaWrite(c, user, dst.dir, false))
@@ -522,15 +543,11 @@ webdavRouter.all("/*", async (c) => {
         const src = splitPath(actualPath)
         const dst = splitPath(dest)
         // 对齐 Go webdav/file.go copyFiles：COPY 权限位 + 源目录可读
-        // （read_users 白名单）+ 目标目录 meta 写判定
+        // （read_users 白名单 + meta 密码）+ 目标目录 meta 写判定
         if (!canCopy(user)) return c.text("Forbidden", 403)
-        let srcMeta: Meta | null = null
-        try {
-          srcMeta = await getNearestMeta(src.dir, c.env)
-        } catch {
-          srcMeta = null
-        }
-        if (!canReadMeta(user, srcMeta, src.dir)) {
+        // A-03：对源**自身路径**做完整读判定。历史实现只对 src.dir 调 canReadMeta，
+        // 既忽略 meta.password，也漏掉了「文件自身所在目录」的最近 meta。
+        if (await deniedByMetaRead(c, user, actualPath, metaPassword)) {
           return metaForbidden(c)
         }
         if (await deniedByMetaWrite(c, user, dst.dir, false)) {

@@ -404,14 +404,16 @@ export class Cloud189Driver implements StorageDriver {
 
   async move(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
     const budget = this.newBudget()
     const { file, isDir } = await this.resolveFile(srcPhysical, budget)
-    const dstParts = String(dstDir).split("/").filter(Boolean)
+    // A-08：使用目标项的物理路径推导父目录（dstDir 含挂载前缀）。
+    const dstParts = String(dstPhysical).split("/").filter(Boolean)
+    dstParts.pop()
     const targetParentId = await this.resolveFolderId(
       "/" + dstParts.join("/"),
       budget,
@@ -422,14 +424,16 @@ export class Cloud189Driver implements StorageDriver {
 
   async copy(
     _srcDir: string,
-    dstDir: string,
+    _dstDir: string,
     _names: string[],
     srcPhysical: string,
-    _dstPhysical: string,
+    dstPhysical: string,
   ): Promise<void> {
     const budget = this.newBudget()
     const { file, isDir } = await this.resolveFile(srcPhysical, budget)
-    const dstParts = String(dstDir).split("/").filter(Boolean)
+    // A-08：同上，目标目录取物理路径的父目录。
+    const dstParts = String(dstPhysical).split("/").filter(Boolean)
+    dstParts.pop()
     const targetParentId = await this.resolveFolderId(
       "/" + dstParts.join("/"),
       budget,

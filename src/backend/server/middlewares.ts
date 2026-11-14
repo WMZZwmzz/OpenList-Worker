@@ -22,6 +22,27 @@ import { isOtpPendingPayload } from "../pkg/otp-pending"
 let cachedJwtSecret: string | null = null
 let jwtSecretByEnv = new WeakMap<object, string>()
 /**
+ * A-65：部分平台每个请求都新建 env 对象，WeakMap 永远命中不了，每请求都要
+ * 回源读取密钥（持久化不可用时甚至每请求生成新钥匙）。再按「稳定配置指纹」
+ * 缓存一层：同一部署的多个 env 实例共享同一把密钥。
+ */
+let jwtSecretByFingerprint = new Map<string, string>()
+
+function jwtEnvFingerprint(env: any): string | null {
+  if (!env || typeof env !== "object") return null
+  const parts = [
+    env.JWT_SECRET,
+    env.DB_DRIVER,
+    env.DB_FORMAT,
+    env.__requestOrigin,
+    env.MYSQL_URLS,
+    env.MYSQL_HOST,
+    env.MYSQL_NAME,
+  ]
+  if (parts.every((v) => v === undefined || v === null || v === "")) return null
+  return parts.map((v) => String(v ?? "")).join("|")
+}
+/**
  * 配置了过短 JWT_SECRET 且无法持久化时，为同一份弱配置生成一把进程内稳定的
  * 强随机密钥。绝不把短密钥本身当签名密钥；进程重启会换钥（此时应配置
  * JWT_SECRET 或可持久化后端）。
@@ -32,12 +53,19 @@ const JWT_SECRET_KV_KEY = "openlist_jwt_secret"
 /** 记录某个 env 的密钥，并更新进程级 last-known 值（无 env 对象时的兜底）。 */
 function rememberJwtSecret(env: any, secret: string): void {
   if (env && typeof env === "object") jwtSecretByEnv.set(env, secret)
+  const fp = jwtEnvFingerprint(env)
+  if (fp) jwtSecretByFingerprint.set(fp, secret)
   cachedJwtSecret = secret
 }
 
 /** 读取某个 env 的缓存密钥；没有 env 对象时退回进程级 last-known 值。 */
 function readCachedJwtSecret(env: any): string | null {
-  if (env && typeof env === "object") return jwtSecretByEnv.get(env) ?? null
+  if (env && typeof env === "object") {
+    const byEnv = jwtSecretByEnv.get(env)
+    if (byEnv) return byEnv
+    const fp = jwtEnvFingerprint(env)
+    return fp ? (jwtSecretByFingerprint.get(fp) ?? null) : null
+  }
   return cachedJwtSecret
 }
 
@@ -56,6 +84,7 @@ export function resetJwtSecretCache(): void {
   cachedJwtSecret = null
   // WeakMap 无法逐项清空，整体替换即可（旧条目随 env 一起被 GC）。
   jwtSecretByEnv = new WeakMap<object, string>()
+  jwtSecretByFingerprint = new Map<string, string>()
   weakSecretStableRandom.clear()
 }
 

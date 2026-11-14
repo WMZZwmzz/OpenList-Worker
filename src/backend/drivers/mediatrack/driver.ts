@@ -121,15 +121,8 @@ export class MediatrackDriver implements StorageDriver {
     const found = files.find((f) => f.title === name)
 
     if (!found) {
-      return {
-        name,
-        size: 0,
-        is_dir: false,
-        modified: new Date().toISOString(),
-        sign: "",
-        type: 0,
-        raw_url: "",
-      }
+      // A-24：不存在必须报错，不能伪造 0 字节文件。
+      throw new Error(`[MediaTrack] item not found: ${clean}`)
     }
 
     const isDir = !found.file

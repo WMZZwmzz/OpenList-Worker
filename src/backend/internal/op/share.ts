@@ -1,6 +1,7 @@
 import { getDb, saveDb } from "../model/db"
 import { canonicalVirtualPath, decodePathFully } from "../../pkg/path"
 import { clientIpFromContext } from "../../pkg/client-ip"
+import { can, PermissionBit } from "../../pkg/permission"
 
 /**
  * Share path resolution for /@s/{shareId}/... (frontend browsing)
@@ -57,6 +58,10 @@ function constantTimeEqual(a: string, b: string): boolean {
  * 失败记账，否则一枚提取码可以在几分钟内被穷举完。
  */
 const PWD_MAX_FAILS = 8
+// A-20：拿不到可信客户端标识时使用「全局桶」，阈值放宽到 20 次/10 分钟：
+// 既避免历史实现「完全不限流、可无限爆破」，也降低攻击者故意输错锁死所有
+// 匿名用户输入提取码的可用性影响。
+const PWD_MAX_FAILS_UNTRUSTED = 20
 const PWD_WINDOW_MS = 10 * 60 * 1000
 const pwdFailures = new Map<string, { count: number; until: number }>()
 
@@ -64,14 +69,14 @@ function pwdFailureKey(shareId: string, clientKey?: string): string {
   return `${shareId}|${clientKey || "unknown"}`
 }
 
-function isPwdLocked(key: string): boolean {
+function isPwdLocked(key: string, maxFails: number = PWD_MAX_FAILS): boolean {
   const rec = pwdFailures.get(key)
   if (!rec) return false
   if (Date.now() > rec.until) {
     pwdFailures.delete(key)
     return false
   }
-  return rec.count >= PWD_MAX_FAILS
+  return rec.count >= maxFails
 }
 
 function bumpPwdFailure(key: string): void {
@@ -135,6 +140,19 @@ export async function resolveShare(
   const share = (db.shares || []).find((s: any) => s.id === shareId)
   if (!share) return { ok: false, error: "share not found" }
   if (share.disabled) return { ok: false, error: "share has been disabled" }
+  // A-62：创建者被禁用或已失去分享权限后，旧分享必须立即失效。
+  // 对齐 Go SharingDB.Usable() 的 CanShare 校验。
+  if (share.creator) {
+    const creator = (db.users || []).find(
+      (u: any) => u.username === share.creator,
+    )
+    if (!creator || creator.disabled) {
+      return { ok: false, error: "share creator is unavailable" }
+    }
+    if (!can(creator, PermissionBit.SHARE)) {
+      return { ok: false, error: "share creator is no longer allowed to share" }
+    }
+  }
   if (share.expires) {
     const expiresAt = new Date(share.expires)
     // 无法解析的过期时间按「已过期」处理（fail-closed）：否则写入一个格式不符
@@ -150,24 +168,25 @@ export async function resolveShare(
   ) {
     return { ok: false, error: "share access count exceeded" }
   }
-  // S-3：只有**可信来源**才参与口令失败锁定。
-  //
-  // 历史缺陷：clientKey 拿不到时退化成 "unknown"，所有匿名访问者共享同一个
-  // 计数器 —— 攻击者故意输错 8 次即可让所有人 10 分钟内无法输入提取码
-  // （纯可用性 DoS）。登录侧的做法是「IP 不可信时关闭 IP 维度」，这里对齐。
+  // A-20：IP 不可信（自托管未配置 TRUST_PROXY_HEADERS / CF-Connecting-IP）时，
+  // 历史实现直接跳过全部锁定，4~6 位提取码可被无限爆破；注释声称的
+  // 「退化为全局限流」并未实现。现在所有来源都参与计数：拿不到客户端标识时
+  // 使用 "unknown" 全局桶，达到阈值同样锁定（代价是可能被短暂 DoS，但远好于
+  // 提取码被穷举）。
   const trustedSource = !!clientKey && clientKey !== "unknown"
-  const pwdKey = pwdFailureKey(shareId, clientKey)
-  if (share.pwd && trustedSource && isPwdLocked(pwdKey)) {
+  const pwdKey = pwdFailureKey(shareId, trustedSource ? clientKey : "unknown")
+  const maxFails = trustedSource ? PWD_MAX_FAILS : PWD_MAX_FAILS_UNTRUSTED
+  if (share.pwd && isPwdLocked(pwdKey, maxFails)) {
     return { ok: false, error: "too many wrong passwords, please try later" }
   }
   if (
     share.pwd &&
     !constantTimeEqual(String(share.pwd), String(password ?? ""))
   ) {
-    if (trustedSource) bumpPwdFailure(pwdKey)
+    bumpPwdFailure(pwdKey)
     return { ok: false, error: "wrong password" }
   }
-  if (share.pwd && trustedSource) pwdFailures.delete(pwdKey)
+  if (share.pwd) pwdFailures.delete(pwdKey)
   if (!share.files || share.files.length === 0) {
     return { ok: false, error: "share is empty" }
   }
@@ -237,12 +256,30 @@ export async function resolveShare(
     return { ok: true, share, virtualList: true }
   }
 
-  // Single-file share: one file has no sub-paths, so trailing segments are
-  // always suspicious — reject instead of concatenating them.
+  // A-04：单条路径分享既可能是文件也可能是目录。
+  // 历史实现把「一条 files」一律当成单文件分享，rest 非空就直接拒绝，导致
+  // 目录分享只能浏览第一层，任何子目录/子文件都 400/404（核心功能回归）。
+  // 与上游 Go GetSharingUnwrapPath 对齐：Join(files[0], rest) 后仍做 containment。
   if (share.files.length === 1) {
-    if (rest.length > 0) return { ok: false, error: "path not found in share" }
-    const single = normalize(share.files[0])
-    if (!withinCreatorRoot(single))
+    const root = normalize(share.files[0])
+    if (!withinShare(root) || !withinCreatorRoot(root))
+      return { ok: false, error: "path not found in share" }
+    // 只有目录分享才允许子路径；单文件分享的任意尾随段都必须拒绝。
+    if (rest.length > 0) {
+      let rootIsDir = false
+      try {
+        const { getItem } = await import("./storage")
+        const { item } = await getItem(root, { env: envCtx })
+        rootIsDir = !!item?.is_dir
+      } catch {
+        rootIsDir = false
+      }
+      if (!rootIsDir) {
+        return { ok: false, error: "path not found in share" }
+      }
+    }
+    const single = normalize([root, ...rest].join("/"))
+    if (!withinShare(single) || !withinCreatorRoot(single))
       return { ok: false, error: "path not found in share" }
     await recordAccess()
     return { ok: true, share, realPath: single }

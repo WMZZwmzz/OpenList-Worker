@@ -44,6 +44,10 @@ on:
 permissions:
   contents: read
 
+# A-47：前端版本必须固定，否则每次构建拉取 registry 的 latest，产物不可复现。
+env:
+  FRONTEND_VERSION: "4.2.6"
+
 concurrency:
   group: build-verify-${{ github.ref }}
   cancel-in-progress: true
@@ -87,11 +91,23 @@ jobs:
       - name: Dependency audit gate
         run: pnpm audit --audit-level=high --prod
 
+      # A-47：CI 必须覆盖类型检查与测试。此前只跑依赖审计 + 构建，
+      # 类型错误与测试回归都可以合入。
+      - name: Type check
+        run: pnpm exec tsc -p tsconfig.json --noEmit
+
+      - name: Run tests
+        run: pnpm exec tsx --test "src/**/*.test.ts" "tests/**/*.test.ts"
+
       - name: Fetch official frontend dist
         run: node scripts/fetch-frontend.mjs
 
       - name: Build edge/serverless artifacts
         run: node scripts/build-edge.mjs
+
+      # A-47：验证 wrangler 入口（worker.ts）确实可打包，防止只有 build-edge 通过。
+      - name: Verify Workers bundle (dry run)
+        run: pnpm exec wrangler deploy --dry-run --outdir /tmp/wrangler-dry-run
 
       - name: Verify artifacts exist
         run: |

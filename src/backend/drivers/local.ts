@@ -40,12 +40,11 @@ export class LocalDriver implements StorageDriver {
     if (!fs || !path)
       throw new Error("LocalDriver is not supported in Edge Runtime")
     await this.guard(physicalPath)
-    let files: any[] = []
-    try {
-      files = await fs.readdir(physicalPath, { withFileTypes: true })
-    } catch (e) {
-      return []
-    }
+    // A-70：读目录失败必须上抛。历史实现吞成空目录，权限/IO 错误被伪装成
+    // 「目录为空」，用户以为文件丢了。
+    let files: any[] = await fs.readdir(physicalPath, {
+      withFileTypes: true,
+    })
     // 软链条目：解析后仍必须在根目录内，越界的一律不列出（否则光是列目录
     // 就能探出 `ln -s / root/etc` 之类的穿透点）。只有软链需要额外一次
     // realpath，普通条目仍走 Promise.all 并行 stat。
@@ -65,14 +64,19 @@ export class LocalDriver implements StorageDriver {
     }
     const items: FileItem[] = await Promise.all(
       files.map(async (file: any) => {
-        const isDir = file.isDirectory()
+        // A-70：软链→目录必须按目录处理（lstat 的 isDirectory() 对软链为
+        // false），否则会被当成文件下载并报 EISDIR。使用 stat 跟随软链。
+        let isDir = file.isDirectory()
         let size = 0
         let mtime = new Date()
         try {
           const stat = await fs.stat(path.join(physicalPath, file.name))
+          isDir = !!stat.isDirectory()
           size = stat.size
           mtime = stat.mtime
-        } catch (_) {}
+        } catch (_) {
+          // 断链：保留 lstat 判定（非目录即按文件列出）
+        }
         return {
           name: file.name,
           size: isDir ? 0 : size,

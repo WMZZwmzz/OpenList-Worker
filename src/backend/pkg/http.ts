@@ -438,6 +438,68 @@ export function assertSafeUrl(
 }
 
 /**
+ * A-27：在静态校验之外再做一次 DNS 解析，拒绝解析到内网/元数据地址的域名。
+ *
+ * 仅 Node 运行时可用（Workers/ESA 无 dns 模块）；解析与 fetch 之间仍有
+ * TOCTOU 窗口，但能挡住「公网域名解析到 127.0.0.1 / 169.254.169.254」这类
+ * 常见 SSRF 手法。
+ */
+export async function assertSafeUrlWithDns(
+  urlStr: string,
+  context = "Request",
+  allowHosts?: ReadonlySet<string> | string[],
+): Promise<void> {
+  assertSafeUrl(urlStr, context, allowHosts)
+  if (
+    typeof process === "undefined" ||
+    process.release?.name !== "node"
+  ) {
+    return
+  }
+  let host = ""
+  try {
+    host = new URL(urlStr).hostname
+      .toLowerCase()
+      .replace(/^\[/, "")
+      .replace(/\]$/, "")
+      .replace(/\.+$/, "")
+  } catch {
+    return
+  }
+  if (!host) return
+  // IP 字面量已由 isSafeUrl 覆盖；白名单主机由管理员显式信任。
+  if (
+    host.includes(":") ||
+    /^\d{1,3}(\.\d{1,3}){3}$/.test(host) ||
+    (allowHosts && new Set(allowHosts).has(host))
+  ) {
+    return
+  }
+  try {
+    const dns = await import("node:dns/promises")
+    const records = await dns.lookup(host, { all: true })
+    if (!records.length) {
+      throw new Error("no DNS records")
+    }
+    for (const rec of records) {
+      const literal =
+        rec.family === 6 ? `http://[${rec.address}]/` : `http://${rec.address}/`
+      if (!isSafeUrl(literal)) {
+        throw new Error(
+          `${context} blocked: hostname ${host} resolves to restricted address ${rec.address}`,
+        )
+      }
+    }
+  } catch (err: any) {
+    if (String(err?.message || err).includes("blocked")) throw err
+    // 解析失败时 fail-closed：无法证明目标安全就不发起请求。
+    throw new Error(
+      `${context} blocked: DNS resolution failed for ${host} (${err?.message || err})`,
+    )
+  }
+}
+
+/**
  * 校验第三方 3xx 的 `Location`：解析为绝对地址并做一次 SSRF 断言。
  *
  * 为什么需要：驱动/网关返回 302 时，跟随重定向的是**服务端**（fetch redirect:

@@ -842,7 +842,9 @@ export const defaultDb = {
       role: 1,
       permission: 0,
       base_path: "/",
-      disabled: false,
+      // A-01：对齐上游 Go（internal/bootstrap/data/user.go）—— guest 默认禁用。
+      // 历史上默认启用会让全新部署在添加存储后对匿名者开放全部文件读取/下载。
+      disabled: true,
       sso_id: "",
       allow_ldap: false,
       pwd_update_at: new Date().toISOString(),
@@ -1363,12 +1365,18 @@ const loadDb = async (envCtx?: any) => {
       err?.message || err,
     )
     dbLastLoadError = String(err?.message || err)
-    dbTrusted = false
+    // A-14：读取失败时**不要**丢弃 last-known-good 快照，也不要把 dbTrusted
+    // 清成 false —— 否则下面「memoryDb && dbTrusted」永不成立，一次 KV/D1
+    // 抖动就会把全站变成「未初始化」默认空库，诱导管理员重新初始化并覆盖
+    // 真实数据。快照可信度沿用上一次成功读取的结果；冷启动失败时它本来就是
+    // false，仍由 saveDb 的写前守卫拦截。
   }
 
-  // 只有在此前已经成功读取过（同一 isolate 内的可信快照）时，才允许继续使用内存库。
+  // 只有在此前已经成功读取过（同一 isolate 内的快照）时，才允许继续使用内存库。
   // 若从未成功读取过，则返回的只是「不可信空壳」，saveDb 会在落盘前将其拦截。
-  if (memoryDb && dbTrusted) {
+  // 用 dbSnapshotLoaded 而非 dbTrusted：最终一致后端（KV）的快照不可写回，
+  // 但它仍然是真实数据，读取失败时继续服务远好于回退到空壳。
+  if (memoryDb && (dbTrusted || dbSnapshotLoaded)) {
     ensureDefaultSettings(memoryDb)
     ensureDefaultStorages(memoryDb)
     ensureDefaultShares(memoryDb)
@@ -1444,7 +1452,8 @@ export const getDb = async (envCtx?: any) => {
 // 改动。密钥统一取 JWT_SECRET（签名与加密共用）。
 //
 // 与历史实现的差别：
-//   - **默认不加密**（DB_CIPHER=none）。加密是可选能力，而不是强制行为。
+//   - **默认加密**（DB_CIPHER=aes-256-gcm，见 pkg/crypto.ts 的
+//     DEFAULT_DB_CIPHER）。显式设置 DB_CIPHER=none 可关闭加密。
 //   - 算法由 DB_CIPHER 选择，见 pkg/crypto.ts 的 DbCipher：
 //       aes-256-gcm（HKDF，低成本，推荐） / aes-256-gcm-pbkdf2（历史 envelope）
 //       / aes-256-cbc-hmac（Encrypt-then-MAC）
@@ -2469,7 +2478,7 @@ export const saveDb = async (
     const fieldCipher =
       cipher === "none" ? null : await resolveFieldCipher(activeEnv)
     if (cipher === "none" && !plaintextAtRestWarned && !sealKeyMissingWarned) {
-      // 默认不加密是刻意的设计（见本文件「静态加密」注释块），但默认值不等于
+      // 显式 DB_CIPHER=none 是刻意关闭加密（见本文件「静态加密」注释块），但关闭不等于
       // 安全：明文落盘时口令哈希、otp_secret、驱动密钥都能被读到存储的人拿走。
       // 这里只提示一次，避免每次写库都刷屏。
       plaintextAtRestWarned = true

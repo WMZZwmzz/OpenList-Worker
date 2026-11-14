@@ -73,6 +73,13 @@ export class OnedriveSharelinkDriver implements StorageDriver {
       throw new Error(`File not found: ${clean}`)
     }
 
+    // A-39：条目缺少 @content.downloadUrl 时不能回退到「整个分享根」的
+    // 下载地址——用户会下到错误内容（分享里任意文件/打包流）。
+    if (!found.is_folder && !found.download_url) {
+      throw new Error(
+        `Download URL unavailable for share item: ${clean} (the share API did not return @content.downloadUrl)`,
+      )
+    }
     return {
       name: found.name,
       size: found.size || 0,
@@ -80,9 +87,7 @@ export class OnedriveSharelinkDriver implements StorageDriver {
       modified: found.modified || new Date().toISOString(),
       sign: found.id || found.name,
       type: calcFileType(found.name, found.is_folder),
-      raw_url:
-        found.download_url ||
-        this.client.getDirectDownloadLink(this.addition.url),
+      raw_url: found.download_url || "",
     }
   }
 
@@ -95,9 +100,13 @@ export class OnedriveSharelinkDriver implements StorageDriver {
       throw new Error(`Cannot get link for folder: ${physicalPath}`)
     }
 
-    const url =
-      item.raw_url || this.client.getDirectDownloadLink(this.addition.url)
-    return { url }
+    // A-39：同 get，绝不回退到分享根地址。
+    if (!item.raw_url) {
+      throw new Error(
+        `Download URL unavailable for share item: ${physicalPath}`,
+      )
+    }
+    return { url: item.raw_url }
   }
 
   async mkdir(virtualPath: string, physicalPath: string): Promise<void> {

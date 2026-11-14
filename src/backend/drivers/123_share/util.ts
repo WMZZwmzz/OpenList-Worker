@@ -164,7 +164,8 @@ export class Pan123ShareApiClient {
     const files: Pan123ShareFileInfo[] = []
     let page = 1
 
-    while (true) {
+    // A-55：页数硬上限，避免异常服务端导致无限翻页。
+    while (page <= 1000) {
       const res = await this.request<Pan123ShareFilesResp>(
         `${this.mainApi}/share/get`,
         {

@@ -4,7 +4,7 @@
  * 用途：部署前确认「数据格式 / 驱动 / 存储 / JWT 密钥」是否就绪，
  * 或复现「初始化后登录失败」类问题。
  *
- *   node scripts/env-check.mjs
+ *   pnpm exec tsx scripts/env-check.mjs
  */
 const MOD = "../src/backend/"
 

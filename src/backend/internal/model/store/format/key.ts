@@ -154,6 +154,31 @@ export const keyFormat: FormatAdapter = {
       return null
     }
 
+    // A-15：DB_FORMAT 从 map 切到 key 时，INIT_MARK 里存的是整库 JSON 快照
+    // （map 格式的 "openlist_config"），而不是时间戳标记。历史实现只判断
+    // 「标记存在」，于是返回一个 users/storages/settings 全空的库，随后 save
+    // 把标记改写成时间戳，旧的整库数据永久不可达。这里识别并直接沿用该快照，
+    // 下一次 save 会把它拆分写入各表键。
+    const markText = String(mark).trim()
+    if (markText.startsWith("{")) {
+      try {
+        const legacy = JSON.parse(markText)
+        if (legacy && typeof legacy === "object" && !Array.isArray(legacy)) {
+          const out: Record<string, any> = {}
+          for (const table of TABLE_NAMES) {
+            const value = (legacy as any)[table]
+            out[table] = Array.isArray(value) ? value : []
+          }
+          return out
+        }
+      } catch (err) {
+        throw new Error(
+          `[keyFormat] INIT_MARK looks like a map-format snapshot but is not valid JSON; ` +
+            `refusing to treat it as empty. Cause: ${(err as Error)?.message || String(err)}`,
+        )
+      }
+    }
+
     const grouped = groupKeysByTable(allKeys)
 
     const out: Record<string, any> = {}

@@ -148,7 +148,39 @@ async function readDbSnapshot(env) {
       return parsed
     }
   } catch {
-    // 不是整库 JSON（key 格式的标记键等）：无法复核
+    // 可能是 key 格式的时间戳初始化标记，下面按 users_ 前缀重建
+  }
+
+  // A-34：DB_FORMAT=key 时 openlist_config 只是时间戳标记，历史实现直接
+  // 返回 null → epoch 复核被跳过（fail-open），改密/关闭 2FA 后的旧 token
+  // 仍可读整库与密钥。这里按 users_ 前缀回读用户表，恢复 epoch 校验。
+  if (/^\d+$/.test(String(raw).trim())) {
+    const kv = resolveKv(env)
+    if (!kv || typeof kv.list !== "function") return null
+    let keys
+    try {
+      const listed = await kv.list({ prefix: "users_" })
+      keys = (listed?.keys || [])
+        .map((k) => (typeof k === "string" ? k : k?.name))
+        .filter(Boolean)
+    } catch {
+      return null
+    }
+    if (!keys || keys.length === 0) return null
+    const users = []
+    for (const key of keys.slice(0, 50)) {
+      const text = await readKvText(env, key)
+      if (!text) continue
+      try {
+        users.push(JSON.parse(text))
+      } catch {
+        // 单条损坏不影响其余用户的 epoch 复核
+      }
+    }
+    if (users.length === 0) return null
+    const snapshot = { users }
+    dbSnapshotCache = { ts: now, db: snapshot }
+    return snapshot
   }
   return null
 }

@@ -98,14 +98,31 @@ export class BunnyStorageDriver implements StorageDriver {
     }
   }
 
+  /**
+   * A-36：Bunny Storage 列表接口默认每页 1000 条，必须按 page 翻页。
+   * 历史实现只请求第一页，第 1001 条之后的条目「看不到也打不开」。
+   */
+  private async listAllObjects(parentPath: string): Promise<BunnyObject[]> {
+    const perPage = 1000
+    const out: BunnyObject[] = []
+    for (let page = 1; page <= 1000; page++) {
+      const base = storageURL(this.addition, parentPath, true)
+      const url = `${base}${base.includes("?") ? "&" : "?"}page=${page}&perPage=${perPage}`
+      const res = await fetch(url, {
+        headers: { AccessKey: this.addition.access_key },
+      })
+      await handleBunnyError(res)
+      const items = (await res.json()) as BunnyObject[]
+      if (!Array.isArray(items) || items.length === 0) break
+      out.push(...items)
+      if (items.length < perPage) break
+    }
+    return out
+  }
+
   async list(virtualPath: string, physicalPath: string): Promise<FileItem[]> {
     const parentPath = cleanObjectPath(physicalPath)
-    const url = storageURL(this.addition, parentPath, true)
-    const res = await fetch(url, {
-      headers: { AccessKey: this.addition.access_key },
-    })
-    await handleBunnyError(res)
-    const items = (await res.json()) as BunnyObject[]
+    const items = await this.listAllObjects(parentPath)
 
     const filtered = items.filter((item) => {
       if (!item.ObjectName) return false
@@ -141,12 +158,8 @@ export class BunnyStorageDriver implements StorageDriver {
     }
 
     const parentPath = clean.split("/").slice(0, -1).join("/") || "/"
-    const parentUrl = storageURL(this.addition, parentPath, true)
-    const res = await fetch(parentUrl, {
-      headers: { AccessKey: this.addition.access_key },
-    })
-    await handleBunnyError(res)
-    const items = (await res.json()) as BunnyObject[]
+    // A-36：必须翻完所有页再按名匹配，否则第 2 页之后的文件直接 object not found。
+    const items = await this.listAllObjects(parentPath)
     const found = items.find((i) => i.ObjectName === name)
     if (!found) throw new Error("object not found")
 

@@ -88,6 +88,11 @@ export async function search(
 
   const matches: SearchResultItem[] = []
   const enforceAcl = opts.user !== undefined
+  // A-21：搜索结果同样受用户 base_path 约束（Go 检查 IsSubPath(user.BasePath,
+  // node.Parent)）。内部调用不传 user 时保持原有行为。
+  const basePath = String(opts.user?.base_path || "/").replace(/\/+$/, "") || "/"
+  const withinBasePath = (p: string): boolean =>
+    basePath === "/" || p === basePath || p.startsWith(basePath + "/")
 
   async function walk(dirPath: string, depth: number) {
     if (depth > maxDepth || matches.length >= maxResults) return
@@ -99,16 +104,6 @@ export async function search(
     } catch {
       // If listing this branch fails (e.g. storage offline), continue search elsewhere
       return
-    }
-
-    // 与 Go 一致：meta 取「父目录」的最近 meta，再对子项自身路径做判定
-    let dirMeta: Meta | null = null
-    if (enforceAcl) {
-      try {
-        dirMeta = await getNearestMeta(dirPath, env)
-      } catch {
-        dirMeta = null
-      }
     }
 
     // 本目录下由存储挂载合并出的虚拟目录名（F-092）。
@@ -134,14 +129,21 @@ export async function search(
       const subPath =
         dirPath === "/" ? `/${item.name}` : `${dirPath}/${item.name}`
 
-      // meta 访问控制：密码保护 / read_users 白名单覆盖的内容不出现在搜索
-      // 结果里。历史缺陷：搜索完全跳过 meta 判定——实测直连被密码保护而
-      // 被拒的目录，其文件名/大小仍能被搜出来（信息泄露）。
-      if (
-        enforceAcl &&
-        !canAccess(opts.user!, dirMeta, subPath, opts.password || "")
-      ) {
-        continue
+      // A-21：meta 必须按**节点自身路径**判定（Go: metaPath = node.Path）。
+      // 历史实现统一使用父目录的最近 meta，导致目录节点本身（例如 /secret
+      // 设置了密码、但 p_sub=false）被当成父目录内可见的子项搜出来，子文件
+      // 也随之泄露。同时补上 base_path 约束。
+      if (enforceAcl) {
+        if (!withinBasePath(dirPath) || !withinBasePath(subPath)) continue
+        let itemMeta: Meta | null = null
+        try {
+          itemMeta = await getNearestMeta(subPath, env)
+        } catch {
+          itemMeta = null
+        }
+        if (!canAccess(opts.user!, itemMeta, subPath, opts.password || "")) {
+          continue
+        }
       }
 
       // 调用方的可见性过滤（hide 规则等）：不可见的条目既不作为结果返回，也不

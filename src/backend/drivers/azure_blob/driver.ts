@@ -129,6 +129,9 @@ function parseListBlobsXml(xml: string): AzureListResult {
   while ((m = prefixRe.exec(xml))) {
     result.prefixes.push(unescapeXml(m[1]))
   }
+  result.nextMarker = unescapeXml(
+    (xml.match(/<NextMarker>([^<]*)<\/NextMarker>/) || [])[1] || "",
+  )
   return result
 }
 
@@ -290,36 +293,50 @@ export class AzureBlobDriver implements StorageDriver {
   async list(_v: string, physicalPath: string): Promise<FileItem[]> {
     let prefix = this.getKey(physicalPath)
     if (prefix) prefix = ensureTrailingSlash(prefix)
-    const query = `restype=container&comp=list&delimiter=%2F&prefix=${encodeURIComponent(prefix)}`
-    const res = await this.request("GET", "", query)
-    if (!res.ok) throw new Error(`[AzureBlob] list failed: HTTP ${res.status}`)
-    const xml = await res.text()
-    const { blobs, prefixes } = parseListBlobsXml(xml)
 
+    // A-35：Azure List Blobs 单页最多 5000 条，必须按 NextMarker 翻页；
+    // 历史实现只取第一页，第 5001 条之后静默丢失。
     const items: FileItem[] = []
-    for (const p of prefixes) {
-      const name = p.replace(/\/+$/, "").split("/").filter(Boolean).pop() || p
-      items.push({
-        name,
-        size: 0,
-        is_dir: true,
-        modified: new Date().toISOString(),
-        sign: "",
-        type: 1,
-        raw_url: "",
-      })
-    }
-    for (const b of blobs) {
-      const name = b.name.split("/").filter(Boolean).pop() || b.name
-      items.push({
-        name,
-        size: b.size,
-        is_dir: false,
-        modified: b.modified,
-        sign: b.name,
-        type: calcFileType(name, false),
-        raw_url: "",
-      })
+    const seenMarkers = new Set<string>()
+    let marker = ""
+    for (let page = 0; page < 1000; page++) {
+      const query =
+        `restype=container&comp=list&delimiter=%2F&prefix=${encodeURIComponent(prefix)}` +
+        (marker ? `&marker=${encodeURIComponent(marker)}` : "")
+      const res = await this.request("GET", "", query)
+      if (!res.ok) throw new Error(`[AzureBlob] list failed: HTTP ${res.status}`)
+      const xml = await res.text()
+      const parsed = parseListBlobsXml(xml)
+
+      for (const p of parsed.prefixes) {
+        const name = p.replace(/\/+$/, "").split("/").filter(Boolean).pop() || p
+        items.push({
+          name,
+          size: 0,
+          is_dir: true,
+          modified: new Date().toISOString(),
+          sign: "",
+          type: 1,
+          raw_url: "",
+        })
+      }
+      for (const b of parsed.blobs) {
+        const name = b.name.split("/").filter(Boolean).pop() || b.name
+        items.push({
+          name,
+          size: b.size,
+          is_dir: false,
+          modified: b.modified,
+          sign: b.name,
+          type: calcFileType(name, false),
+          raw_url: "",
+        })
+      }
+
+      const next = String(parsed.nextMarker || "")
+      if (!next || seenMarkers.has(next)) break
+      seenMarkers.add(next)
+      marker = next
     }
     return sortFileItems(items, "name", "asc")
   }
@@ -327,7 +344,56 @@ export class AzureBlobDriver implements StorageDriver {
   async get(_v: string, physicalPath: string): Promise<FileItem> {
     const key = this.getKey(physicalPath)
     const name = key.split("/").filter(Boolean).pop() || key
-    const rawUrl = await this.sasUrl(key)
+    // A-35：用 HEAD 取真实元信息；目录 marker 与隐式目录都按目录返回，
+    // 历史实现恒返回 size=0 / is_dir=false。
+    let head: Response | null = null
+    try {
+      head = await this.request("HEAD", key, "")
+    } catch {
+      // 离线/测试环境：无法访问 Azure 时退化为旧行为（仅返回 SAS 直链）。
+      head = null
+    }
+    if (head?.ok) {
+      const isDir =
+        head.headers.get("x-ms-meta-hdi_isfolder") === "true" ||
+        key.endsWith("/")
+      return {
+        name,
+        size: isDir ? 0 : Number(head.headers.get("content-length") || 0),
+        is_dir: isDir,
+        modified:
+          head.headers.get("last-modified") || new Date().toISOString(),
+        sign: key,
+        type: isDir ? 1 : calcFileType(name, false),
+        raw_url: isDir ? "" : await this.sasUrl(key),
+      }
+    }
+
+    // 隐式目录（没有目录 marker，但有子 blob）：按前缀探测。
+    try {
+      const probe = await this.request(
+        "GET",
+        "",
+        `restype=container&comp=list&delimiter=%2F&prefix=${encodeURIComponent(ensureTrailingSlash(key))}&maxresults=1`,
+      )
+      if (probe.ok) {
+        const xml = await probe.text()
+        const parsed = parseListBlobsXml(xml)
+        if (parsed.blobs.length > 0 || parsed.prefixes.length > 0) {
+          return {
+            name,
+            size: 0,
+            is_dir: true,
+            modified: new Date().toISOString(),
+            sign: key,
+            type: 1,
+            raw_url: "",
+          }
+        }
+      }
+    } catch {
+      // 同 HEAD：网络不可达时退化为文件条目
+    }
     return {
       name,
       size: 0,
@@ -335,7 +401,7 @@ export class AzureBlobDriver implements StorageDriver {
       modified: new Date().toISOString(),
       sign: key,
       type: calcFileType(name, false),
-      raw_url: rawUrl,
+      raw_url: await this.sasUrl(key),
     }
   }
 

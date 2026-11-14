@@ -117,7 +117,12 @@ export class ProtonDriveClient {
       ).toString()
       url += (url.includes("?") ? "&" : "?") + q
     }
-    return this.request(url, { method: options.method, body: options.body })
+    // A-13：文件操作全部走 requestAPI，而它此前不处理 401，AccessToken 过期后
+    // list/get/上传/删除会永久 401，只有重建驱动才能恢复。这里统一 401 刷新重试。
+    return this.requestWithRetry(url, {
+      method: options.method,
+      body: options.body,
+    })
   }
 
   // ---------- authentication ----------
@@ -199,6 +204,9 @@ export class ProtonDriveClient {
     this.setAuth(out.AccessToken, out.RefreshToken || this.refreshToken, out.UID || this.uid)
   }
 
+  /** 并发 401 只触发一次刷新，避免轮换 refresh_token 互相作废。 */
+  private refreshInFlight: Promise<void> | null = null
+
   /** Automatically refresh once on 401 and retry. */
   private async requestWithRetry(
     url: string,
@@ -208,7 +216,12 @@ export class ProtonDriveClient {
       return await this.request(url, options)
     } catch (e: any) {
       if (String(e.message).includes("401") && this.refreshToken) {
-        await this.refresh()
+        if (!this.refreshInFlight) {
+          this.refreshInFlight = this.refresh().finally(() => {
+            this.refreshInFlight = null
+          })
+        }
+        await this.refreshInFlight
         return this.request(url, options)
       }
       throw e

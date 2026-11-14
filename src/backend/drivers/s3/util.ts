@@ -649,8 +649,11 @@ export class S3Client {
     }
 
     const resp = await this.fetch("PUT", url, null, extraHeaders)
-    if (!resp.ok) {
-      const text = await resp.text().catch(() => "")
+    // A-09：AWS 允许 CopyObject 以 200 OK 返回错误体（<Error>...</Error>）。
+    // 只看 HTTP 状态会把失败当成功，调用方随后 deleteObject(src) 造成静默
+    // 数据丢失。成功响应体必须是 <CopyObjectResult>，出现 <Error> 一律抛错。
+    const text = await resp.text().catch(() => "")
+    if (!resp.ok || /<Error[\s>]/i.test(text)) {
       throw parseS3Error(text, resp.status)
     }
   }
@@ -740,7 +743,12 @@ export class S3Client {
     addFilenameToDisposition = false,
   ): Promise<{ url: string; headers?: Record<string, string> }> {
     const cleanKey = getKey(key, false)
-    const expireSeconds = Math.max(60, Math.floor(signUrlExpireHours * 3600))
+    // A-58：AWS SigV4 预签名有效期上限为 604800 秒（7 天），超出后 AWS/R2
+    // 直接返回 400。历史实现只有下限（60 秒）。
+    const expireSeconds = Math.min(
+      604800,
+      Math.max(60, Math.floor(signUrlExpireHours * 3600)),
+    )
     const rawS3Url = this.getUrl(cleanKey)
 
     if (customHost) {

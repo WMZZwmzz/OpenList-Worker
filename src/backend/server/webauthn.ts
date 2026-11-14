@@ -8,7 +8,11 @@ import {
 } from "./middlewares"
 import { passwordStampOf } from "../pkg/password"
 import { JWT_AUDIENCE, JWT_ISSUER } from "../pkg/permission"
-import { issueOtpPendingToken } from "./auth"
+import {
+  checkUserOtp,
+  issueOtpPendingToken,
+  verifyUserPassword,
+} from "./auth"
 
 /**
  * WebAuthn / Passkey 登录。
@@ -412,9 +416,13 @@ function originAllowed(origin: string, rpId: string, c: any): boolean {
   if (!origin) return false
   try {
     const o = new URL(origin)
-    if (o.hostname === rpId) return true
-    // 覆盖自定义端口/域名：与当前请求同源也放行
-    return o.host === new URL(c.req.url).host
+    const req = new URL(c.req.url)
+    // A-40：必须同时比较 scheme。历史实现只比 host，http:// 与 https://
+    // 同域会被视为同一来源（降级/中间人场景）。
+    if (o.hostname === rpId) {
+      return o.protocol === "https:" || o.hostname === "localhost"
+    }
+    return o.origin === req.origin
   } catch {
     return false
   }
@@ -757,10 +765,25 @@ webauthnRouter.post("/webauthn_finish_registration", async (c) => {
 
     // 2. 解析 attestationObject
     const attObj = b64urlDecode(body.response?.attestationObject || "")
-    const { publicKey, aaguid, credentialId, signCount } = await parseAttestation(attObj)
+    const { authData, publicKey, aaguid, credentialId, signCount } =
+      await parseAttestation(attObj)
+    // A-40：注册同样必须校验 rpIdHash（历史实现只在登录时校验）。
+    const expectedRpHash = new Uint8Array(
+      await crypto.subtle.digest(
+        "SHA-256",
+        new TextEncoder().encode(rpId),
+      ),
+    )
+    if (
+      b64urlEncode(authData.slice(0, 32)) !== b64urlEncode(expectedRpHash)
+    ) {
+      return c.json({ code: 400, message: "rpId hash mismatch", data: null }, 400)
+    }
 
     // 3. 保存 credential（JWK 公钥，便于 finish_login 时重建 CryptoKey）
-    const rawId = body.id || b64urlEncode(credentialId)
+    // A-40：credentialId 必须取自 attestationObject，不能信任客户端 body.id
+    // （历史实现允许 body.id 覆盖，等于可以用任意 id 登记一把真实公钥）。
+    const rawId = b64urlEncode(credentialId)
     const credRecord = {
       id: rawId,
       publicKey: await crypto.subtle.exportKey("jwk", publicKey),
@@ -777,6 +800,29 @@ webauthnRouter.post("/webauthn_finish_registration", async (c) => {
     if (!dbUser) {
       return c.json({ code: 401, message: "Unauthorized", data: null }, 401)
     }
+
+    // A-40：注册 Passkey 属于持久化凭据变更，必须二次认证。否则仅凭一枚
+    // 被窃取的 7 天会话 JWT 就能静默植入攻击者自己的凭据，改密/踢线也无法撤销。
+    const confirmPassword = String(body.password || "")
+    const passwordOk =
+      confirmPassword.length > 0 &&
+      (await verifyUserPassword(dbUser, confirmPassword))
+    let otpOk = false
+    if (!passwordOk && dbUser.otp_secret && (body.otp_code || body.code)) {
+      otpOk = (await checkUserOtp(dbUser, body, c, db)).ok
+    }
+    if (!passwordOk && !otpOk) {
+      return c.json(
+        {
+          code: 400,
+          message:
+            "re-authentication required: provide your current password (or 2FA code) to register a passkey",
+          data: null,
+        },
+        400,
+      )
+    }
+
     if (!dbUser.webauthn_credentials) dbUser.webauthn_credentials = []
     dbUser.webauthn_credentials.push(credRecord)
     await saveDb(db, c.env)

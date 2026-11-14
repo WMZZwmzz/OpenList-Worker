@@ -130,7 +130,10 @@ function verifySsoStateCookie(c: any, state: string): boolean {
       .split(";")
       .map((p) => p.trim())
       .find((p) => p.startsWith(`${SSO_STATE_COOKIE}=`))
-    if (!hit) return true // 无本 cookie 的旧标签页：退回 IP 绑定
+    // A-41：浏览器带了 Cookie 头但没有本应用的 state cookie，说明这是一次
+    // 跨站构造的回调（例如攻击者把自己的 state 链接发给受害者），必须拒绝。
+    // 历史实现这里返回 true，state 双提交形同虚设 → 登录 CSRF。
+    if (!hit) return false
     return hit.slice(SSO_STATE_COOKIE.length + 1) === state
   } catch {
     return true

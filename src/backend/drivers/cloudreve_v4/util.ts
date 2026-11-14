@@ -112,6 +112,9 @@ export class ClientCloudreve {
   async listFiles(uri: string): Promise<CloudreveFile[]> {
     const all: CloudreveFile[] = []
     let nextToken = ""
+    // A-54：重复 token 保护 + 页数上限，避免服务端异常时无限翻页。
+    const seenTokens = new Set<string>()
+    let pages = 0
     const cleanUri = uri === "/" ? "/" : uri
     do {
       const params: Record<string, string> = {
@@ -125,7 +128,12 @@ export class ClientCloudreve {
       const qs = new URLSearchParams(params).toString()
       const resp = await this.request<CloudreveListResp>("GET", `/file?${qs}`)
       if (resp?.files) all.push(...resp.files)
-      nextToken = resp?.pagination?.next_token || ""
+      const next = resp?.pagination?.next_token || ""
+      if (next && seenTokens.has(next)) break
+      if (next) seenTokens.add(next)
+      nextToken = next
+      pages++
+      if (pages > 1000) break
     } while (nextToken)
     return all
   }

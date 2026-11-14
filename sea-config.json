@@ -1,4 +1,4 @@
 {
-  "main": "dist/server.js",
+  "main": "dist-server/api/[...route].js",
   "output": "dist/sea-prep.blob"
 }
